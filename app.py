@@ -5,18 +5,18 @@ import json
 import plotly.express as px
 
 # --- 1. 基本設定 ---
-st.set_page_config(page_title="Kyushu Towa SFA", layout="wide")
+st.set_page_config(page_title="Kyushu Towa SFA Dashboard", layout="wide")
 pd.set_option("styler.render.max_elements", 2000000)
 
 # --- 2. ビジネスデザインCSS ---
 st.markdown("""
 <style>
-    .main-header { background-color: #003366; padding: 1rem; color: white; text-align: center; border-radius: 8px; margin-bottom: 2rem; }
+    .main-header { background-color: #003366; padding: 1.5rem; color: white; text-align: center; border-radius: 8px; margin-bottom: 2rem; }
     .stMetric { background-color: white; border: 1px solid #ddd; padding: 15px; border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. 認証・データ取得 ---
+# --- 3. データ取得 ---
 @st.cache_resource
 def get_client():
     info = json.loads(st.secrets["gcp_service_account"]["json_key"])
@@ -25,90 +25,77 @@ def get_client():
 @st.cache_data(ttl=600)
 def load_data():
     client = get_client()
-    query = "SELECT * FROM `salesdb-479915.sales_data.v_sales_performance_for_python`"
+    # 2026年1月を表示させるため、年月でソート
+    query = "SELECT * FROM `salesdb-479915.sales_data.v_sales_performance_for_python` ORDER BY `年月` ASC"
     df = client.query(query).to_dataframe()
     
-    # 重複列の削除
+    # 重複列の削除（念のため）
     df = df.loc[:, ~df.columns.duplicated()].copy()
     
-    # --- 列名の自動マッピング（Oh No 回避の要） ---
-    # SQLで定義した display_xxx があれば優先、なければ既存の列を探す
-    col_map = {
-        'display_product_name': ['品名', '商品名'],
-        'display_month': ['年月', '売上月'],
-        'display_staff_name': ['担当社員名', '担当者'],
-        'display_amount': ['販売金額', '実績金額']
-    }
-    
-    for final_name, candidates in col_map.items():
-        if final_name not in df.columns:
-            for c in candidates:
-                if c in df.columns:
-                    df[final_name] = df[c]
-                    break
-            if final_name not in df.columns:
-                df[final_name] = "N/A" # 最悪、空文字を入れてクラッシュを防ぐ
-
     # 2026/01を正しく並べるための処理
-    df['display_month'] = df['display_month'].astype(str).str.replace('-', '/')
+    df['売上月'] = df['年月'].astype(str).str.replace('-', '/')
     
-    # 型変換
-    df['display_amount'] = pd.to_numeric(df['display_amount'], errors='coerce').fillna(0)
+    # 数値変換
+    df['販売金額'] = pd.to_numeric(df['販売金額'], errors='coerce').fillna(0)
     df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0)
     
     return df
 
-# --- 4. メイン表示 ---
-st.markdown('<div class="main-header"><h1>九州東和薬品 販売実績分析</h1></div>', unsafe_allow_html=True)
+# --- 4. メイン画面 ---
+st.markdown('<div class="main-header"><h1>九州東和薬品　販売実績分析システム</h1></div>', unsafe_allow_html=True)
 
 try:
     df = load_data()
 except Exception as e:
-    st.error(f"深刻なエラーが発生しました。SQLの列名を確認してください。: {e}")
+    st.error(f"Oh No! エラーが発生しました。SQLを実行してビューを更新してください。: {e}")
     st.stop()
 
 if not df.empty:
     with st.sidebar:
-        st.header("🔎 フィルタ")
-        # 担当者名寄せ（古賀さんの統一が必要な場合はここで処理）
-        df['display_staff_name'] = df['display_staff_name'].replace(['優一郎', '古賀優一朗'], '古賀優一郎')
+        st.markdown("### 🔍 分析フィルタ")
+        # ★ここが重要：SQLで作った「正規担当者名」だけをリストに使う
+        tantosha_list = ['全 担当者'] + sorted(df['正規担当者名'].unique().tolist())
+        sel_t = st.selectbox("担当者名", tantosha_list)
         
-        t_list = ['全て'] + sorted(df['display_staff_name'].unique().tolist())
-        sel_t = st.selectbox("担当者", t_list)
+        target_df = df if sel_t == '全 担当者' else df[df['正規担当者名'] == sel_t]
+        c_list = ['全 得意先'] + sorted(target_df['得意先名'].unique().tolist())
+        sel_c = st.selectbox("得意先名", c_list)
         
-        f_df = df if sel_t == '全て' else df[df['display_staff_name'] == sel_t]
-        c_list = ['全て'] + sorted(f_df['得意先名'].unique().tolist())
-        sel_c = st.selectbox("得意先", c_list)
-        
-        kw = st.text_input("キーワード検索 (ユニークコード/商品名)")
+        kw = st.text_input("商品名・ユニークコードで検索")
 
     # フィルタリング
-    display_df = f_df.copy()
-    if sel_c != '全て': display_df = display_df[display_df['得意先名'] == sel_c]
-    if kw: display_df = display_df[display_df['display_product_name'].str.contains(kw, na=False) | display_df['ユニークコード'].astype(str).str.contains(kw, na=False)]
+    f_df = target_df.copy()
+    if sel_c != '全 得意先': f_df = f_df[f_df['得意先名'] == sel_c]
+    if kw: 
+        f_df = f_df[f_df['商品名'].str.contains(kw, na=False) | f_df['ユニークコード'].astype(str).str.contains(kw, na=False)]
 
     # --- 5. サマリー ---
     c1, c2, c3 = st.columns(3)
-    c1.metric("販売金額 累計", f"¥{display_df['display_amount'].sum():,.0f}")
-    c2.metric("販売数量 合計", f"{display_df['数量'].sum():,.0f}")
-    c3.metric("対象得意先数", f"{display_df['得意先名'].nunique():,} 軒")
+    with c1: st.metric("販売金額 累計", f"¥{f_df['販売金額'].sum():,.0f}")
+    with c2: st.metric("販売数量 合計", f"{f_df['数量'].sum():,.0f}")
+    with c3: st.metric("対象得意先数", f"{f_df['得意先名'].nunique():,} 軒")
 
-    # --- 6. 推移グラフ（2026/01対応） ---
-    st.markdown("### 📈 月別トレンド")
-    monthly = display_df.groupby('display_month')['display_amount'].sum().reset_index().sort_values('display_month')
-    st.plotly_chart(px.line(monthly, x='display_month', y='display_amount', markers=True), use_container_width=True)
+    # --- 6. トレンド（2026/01対応） ---
+    st.markdown("### 📈 月別トレンド分析")
+    monthly = f_df.groupby('売上月')['販売金額'].sum().reset_index().sort_values('売上月')
+    st.plotly_chart(px.area(monthly, x='売上月', y='販売金額', color_discrete_sequence=['#003366']), use_container_width=True)
 
     # --- 7. 詳細ピボット ---
-    st.markdown("### 📋 販売詳細")
+    st.markdown("### 📋 詳細明細一覧")
+    mode = st.radio("表示モード:", ["販売金額", "数量"], horizontal=True)
+    
+    # 2026/01を最後にするための並び順固定
+    month_order = sorted(f_df['売上月'].unique().tolist())
     
     pivot = pd.pivot_table(
-        display_df, 
-        index=['得意先名', 'display_product_name', '包装単位'], 
-        columns='display_month', 
-        values='display_amount', 
+        f_df, 
+        index=['得意先名', '商品名', '包装単位'], 
+        columns='売上月', 
+        values=mode, 
         aggfunc='sum', 
         fill_value=0
     )
+    pivot = pivot.reindex(columns=month_order)
     pivot['期間合計'] = pivot.sum(axis=1)
     
     st.dataframe(
@@ -117,4 +104,4 @@ if not df.empty:
     )
 
 else:
-    st.warning("データがありません。")
+    st.info("データがありません。")
