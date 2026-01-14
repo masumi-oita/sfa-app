@@ -5,7 +5,7 @@ import json
 import plotly.express as px
 
 # --- 1. ページ設定 ---
-st.set_page_config(page_title="九州東和薬品 売上データ", page_icon="💊", layout="wide")
+st.set_page_config(page_title="九州東和薬品 最強売上検索", page_icon="💊", layout="wide")
 
 # --- カスタムCSS ---
 st.markdown("""
