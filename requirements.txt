@@ -1,4 +1,5 @@
 streamlit
 pandas
 google-cloud-bigquery
-db-dtypes
+pandas-gbq
+plotly
