@@ -3,3 +3,4 @@ pandas
 google-cloud-bigquery
 pandas-gbq
 plotly
+matplotlib
