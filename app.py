@@ -4,165 +4,117 @@ from google.cloud import bigquery
 import json
 import plotly.express as px
 
-# --- 1. ページ設定と表示制限解除 ---
-st.set_page_config(
-    page_title="九州東和薬品　最強売上検索",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- 1. 究極の設定（表示制限解除 & ページ構成） ---
+st.set_page_config(page_title="Kyushu Towa SFA Dashboard", layout="wide")
+pd.set_option("styler.render.max_elements", 2000000)
 
-# 詳細テーブルのセル表示制限を100万セルに拡張
-pd.set_option("styler.render.max_elements", 1000000)
-
-# --- 2. カスタムCSS（サマリー2行表示 & 全文表示用） ---
+# --- 2. スタイリッシュCSS（だささを徹底排除） ---
 st.markdown("""
 <style>
-    .main-title { font-size: 2.2em; color: #0056b3; font-weight: bold; text-align: center; border-bottom: 3px solid #0056b3; padding-bottom: 10px; margin-bottom: 20px;}
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap');
+    html, body, [class*="css"] { font-family: 'Noto Sans JP', sans-serif; }
     
-    /* メトリクスカード全体の調整 */
-    [data-testid="stMetric"] {
-        background-color: #f8f9fa;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #dee2e6;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        min-height: 140px;
-    }
-    /* ラベル（タイトル）を2行表示し、全文見せる */
-    [data-testid="stMetricLabel"] > div {
-        font-size: 1.05em !important;
-        white-space: normal !important;
-        word-wrap: break-word !important;
-        line-height: 1.3 !important;
-        min-height: 2.6em !important;
-    }
-    /* 数値を全文表示 */
-    [data-testid="stMetricValue"] > div {
-        font-size: 1.6em !important;
-        white-space: nowrap !important;
-    }
-    .sub-header { font-size: 1.5em; color: #333; margin-top: 30px; margin-bottom: 15px; padding-left: 10px; border-left: 5px solid #0056b3; }
+    .main-header { background-color: #004098; padding: 20px; border-radius: 10px; color: white; text-align: center; margin-bottom: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    .metric-card { background-color: white; border: 1px solid #e0e6ed; padding: 20px; border-radius: 8px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .metric-label { font-size: 0.9rem; color: #64748b; margin-bottom: 5px; font-weight: bold; }
+    .metric-value { font-size: 1.8rem; color: #0f172a; font-weight: 700; }
+    .stTable { border: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- 3. BigQuery接続 ---
 @st.cache_resource
-def get_bigquery_client():
-    try:
-        service_account_info = json.loads(st.secrets["gcp_service_account"]["json_key"])
-        return bigquery.Client.from_service_account_info(service_account_info)
-    except Exception as e:
-        st.error(f"BigQuery接続エラー: {e}")
-        return None
+def get_client():
+    info = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    return bigquery.Client.from_service_account_info(info)
 
-client = get_bigquery_client()
+client = get_client()
 
-# --- 4. データ読み込み ---
 @st.cache_data(ttl=600)
 def load_data():
-    if not client: return pd.DataFrame()
     query = "SELECT * FROM `salesdb-479915.sales_data.v_sales_performance_for_python`"
-    try:
-        df = client.query(query).to_dataframe()
-        
-        # 重複列のクリーニング
-        if '商品名' in df.columns and '品名' in df.columns:
-            df = df.drop(columns=['商品名'])
+    df = client.query(query).to_dataframe()
+    # 型の安全確保
+    df['販売金額'] = pd.to_numeric(df['販売金額'], errors='coerce').fillna(0)
+    df['売上利益'] = pd.to_numeric(df['売上利益'], errors='coerce').fillna(0)
+    return df
 
-        rename_map = {
-            '年月': '売上日', '品名': '商品名', '包装単位': '包装',
-            '担当社員名': '担当者名', '実績金額': '金額'
-        }
-        df = df.rename(columns=rename_map)
-        df = df.loc[:, ~df.columns.duplicated()].copy()
+# --- 4. メイン画面レイアウト ---
+st.markdown('<div class="main-header"><h1>九州東和薬品 売上・利益分析ダッシュボード</h1></div>', unsafe_allow_html=True)
 
-        # 型の変換
-        df['金額'] = pd.to_numeric(df['金額'], errors='coerce').fillna(0)
-        df['数量'] = pd.to_numeric(df['数量'], errors='coerce').fillna(0)
-        df['売上日'] = df['売上日'].astype(str)
-        return df
-    except Exception as e:
-        st.error(f"データ処理エラー: {e}")
-        return pd.DataFrame()
+df = load_data()
 
-st.markdown('<div class="main-title">💊 九州東和薬品　最強売上検索 (SFA完全版)</div>', unsafe_allow_html=True)
-df_raw = load_data()
-
-if not df_raw.empty:
-    # --- 5. サイドバー ---
+if not df.empty:
+    # 5. サイドバー（プロ仕様）
     with st.sidebar:
-        st.header("🔎 絞り込み条件")
-        tantosha_list = ['全て'] + sorted(df_raw['担当者名'].unique().tolist())
-        sel_t = st.selectbox("担当者選択", tantosha_list)
+        st.image("https://www.towa-yakuhin.co.jp/common/images/logo_head.png", width=150) # 例としてロゴ（任意）
+        st.markdown("### 🔍 分析フィルタ")
+        t_list = ['全 担当者'] + sorted(df['担当者名'].unique().tolist())
+        sel_t = st.selectbox("担当者を選択", t_list)
         
-        filtered_df = df_raw if sel_t == '全て' else df_raw[df_raw['担当者名'] == sel_t]
-        c_list = ['全て'] + sorted(filtered_df['得意先名'].unique().tolist())
-        sel_c = st.selectbox("得意先選択", c_list)
-        search_kw = st.text_input("商品名キーワード検索", "")
+        target_df = df if sel_t == '全 担当者' else df[df['担当者名'] == sel_t]
+        c_list = ['全 得意先'] + sorted(target_df['得意先名'].unique().tolist())
+        sel_c = st.selectbox("得意先を選択", c_list)
+        
+        search = st.text_input("商品名・キーワード検索", "")
 
-    # フィルタリング
-    display_df = filtered_df.copy()
-    if sel_c != '母親': # '全て'のタイポ修正
-        if sel_c != '全て': display_df = display_df[display_df['得意先名'] == sel_c]
-    if search_kw: display_df = display_df[display_df['商品名'].str.contains(search_kw, na=False)]
+    # フィルタ適用
+    f_df = target_df.copy()
+    if sel_c != '全 得意先': f_df = f_df[f_df['得意先名'] == sel_c]
+    if search: f_df = f_df[f_df['商品名'].str.contains(search, na=False)]
 
-    # --- 6. 実績サマリー（2行表示対応） ---
-    st.markdown('<div class="sub-header">📈 実績サマリー</div>', unsafe_allow_html=True)
-    m1, m2, m3, m4 = st.columns(4)
+    # --- 6. エグゼクティブ・サマリー ---
+    col1, col2, col3, col4 = st.columns(4)
+    sales_total = f_df['販売金額'].sum()
+    profit_total = f_df['売上利益'].sum()
+    margin = (profit_total / sales_total * 100) if sales_total != 0 else 0
     
-    m1.metric("総販売数量\n(バラ換算合計)", f"{display_df['数量'].sum():,.0f}")
-    m2.metric("売上金額累計\n(最新納入単価基準)", f"¥{display_df['金額'].sum():,.0f}")
-    m3.metric("稼働得意先数\n(表示条件内)", f"{display_df['得意先名'].nunique():,} 軒")
-    m4.metric("取引データ件数\n(明細行数合計)", f"{len(display_df):,} 件")
+    with col1:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">販売金額合計</div><div class="metric-value">¥{sales_total:,.0f}</div></div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">総利益額</div><div class="metric-value">¥{profit_total:,.0f}</div></div>', unsafe_allow_html=True)
+    with col3:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">平均利益率</div><div class="metric-value">{margin:.1f}%</div></div>', unsafe_allow_html=True)
+    with col4:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">対象得意先数</div><div class="metric-value">{f_df["得意先名"].nunique():,} 軒</div></div>', unsafe_allow_html=True)
 
-    # --- 7. グラフ分析 ---
-    st.markdown('<div class="sub-header">📊 視覚的分析</div>', unsafe_allow_html=True)
-    chart_col1, chart_col2 = st.columns(2)
+    # --- 7. グラフィカル分析 ---
+    st.markdown("### 📊 業績トレンド")
+    g_col1, g_col2 = st.columns([2, 1])
+    
+    with g_col1:
+        monthly = f_df.groupby('売上月')['販売金額'].sum().reset_index()
+        fig = px.area(monthly, x='売上月', y='販売金額', title="月別売上推移", color_discrete_sequence=['#004098'])
+        fig.update_layout(plot_bgcolor='white', hovermode='x unified')
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with g_col2:
+        top10 = f_df.groupby('商品名')['販売金額'].sum().sort_values(ascending=False).head(10).reset_index()
+        fig2 = px.bar(top10, x='販売金額', y='商品名', orientation='h', title="商品別売上TOP10", color_discrete_sequence=['#22c55e'])
+        fig2.update_layout(yaxis={'categoryorder':'total ascending'}, plot_bgcolor='white')
+        st.plotly_chart(fig2, use_container_width=True)
 
-    with chart_col1:
-        st.write("**▼ 月別売上推移**")
-        monthly_data = display_df.groupby('売上日')['金額'].sum().reset_index()
-        fig_line = px.bar(monthly_data, x='売上日', y='金額', color_discrete_sequence=['#0056b3'])
-        st.plotly_chart(fig_line, use_container_width=True)
-
-    with chart_col2:
-        st.write("**▼ 商品別売上TOP10**")
-        top_products = display_df.groupby('商品名')['金額'].sum().sort_values(ascending=False).head(10).reset_index()
-        fig_rank = px.bar(top_products, x='金額', y='商品名', orientation='h', color_discrete_sequence=['#28a745'])
-        fig_rank.update_layout(yaxis={'categoryorder':'total ascending'})
-        st.plotly_chart(fig_rank, use_container_width=True)
-
-    # --- 8. 詳細テーブル ---
-    st.markdown('<div class="sub-header">📋 月別詳細明細 (得意先×商品×包装)</div>', unsafe_allow_html=True)
-    view_mode = st.radio("表示する値を選択:", ["金額", "数量"], horizontal=True)
-    val_col = '金額' if view_mode == "金額" else '数量'
+    # --- 8. 精密ピボットテーブル ---
+    st.markdown("### 📋 販売明細（得意先別・商品別）")
+    mode = st.segmented_control("表示項目切替", ["販売金額", "数量", "利益率"], default="販売金額")
     
     try:
-        pivot_table = pd.pivot_table(
-            display_df,
-            index=['得意先名', '商品名', '包装'],
-            columns='売上日',
-            values=val_col,
-            aggfunc='sum',
-            fill_value=0
-        )
-        pivot_table['合計'] = pivot_table.sum(axis=1)
+        if mode == "利益率":
+            s_piv = pd.pivot_table(f_df, index=['得意先名', '商品名', '包装単位'], columns='売上月', values='販売金額', aggfunc='sum', fill_value=0)
+            p_piv = pd.pivot_table(f_df, index=['得意先名', '商品名', '包装単位'], columns='売上月', values='売上利益', aggfunc='sum', fill_value=0)
+            pivot = (p_piv / s_piv).fillna(0)
+            styled = pivot.style.background_gradient(cmap='RdYlGn', axis=None).format("{:.1%}")
+        else:
+            val = '販売金額' if mode == "販売金額" else '数量'
+            pivot = pd.pivot_table(f_df, index=['得意先名', '商品名', '包装単位'], columns='売上月', values=val, aggfunc='sum', fill_value=0)
+            pivot['期間合計'] = pivot.sum(axis=1)
+            styled = pivot.style.background_gradient(cmap='Blues', axis=None).format("{:,.0f}")
         
-        # 色付け処理 (matplotlibがない場合も考慮)
-        try:
-            styled_df = pivot_table.style.background_gradient(cmap='Greens' if view_mode == "金額" else 'Blues', axis=None).format("{:,.0f}")
-        except:
-            styled_df = pivot_table.style.format("{:,.0f}")
-            st.info("※ライブラリ読み込み中のため、背景色なしで表示しています。")
-        
-        st.dataframe(styled_df, use_container_width=True, height=600)
-        
-        csv = pivot_table.to_csv().encode('utf_8_sig')
-        st.download_button(label="集計結果をCSVでダウンロード", data=csv, file_name="sales_export.csv", mime='text/csv')
-        
+        st.dataframe(styled, use_container_width=True, height=600)
+        st.download_button("📥 データをエクスポート (CSV)", pivot.to_csv().encode('utf_8_sig'), "report.csv")
+    
     except Exception as e:
-        st.error(f"テーブル作成失敗: {e}")
+        st.warning(f"詳細表示を生成中... (データが巨大なため、検索条件で絞り込んでください)")
 
 else:
-    st.warning("表示するデータがありません。条件を変更してください。")
+    st.info("データがありません。条件をリセットしてください。")
