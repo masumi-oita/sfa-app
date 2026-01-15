@@ -1,123 +1,98 @@
 import streamlit as st
-from google.cloud import bigquery
-from google.oauth2 import service_account
 import pandas as pd
 import plotly.express as px
 import json
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
-# --- 1. 認証 & 爆速サマリーデータの読み込み ---
+# --- データロード ---
 @st.cache_data(ttl=600)
 def load_data():
-    try:
-        key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
-        scopes = [
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/bigquery"
-        ]
-        credentials = service_account.Credentials.from_service_account_info(key_dict, scopes=scopes)
-        client = bigquery.Client(credentials=credentials, project=key_dict["project_id"])
-        
-        with st.status("🚀 統合分析データをロード中...", expanded=False) as status:
-            # 年度列を含む集計済みテーブルを読み込む
-            query = "SELECT * FROM `salesdb-479915.sales_data.t_sales_summary_materialized`"
-            df = client.query(query).to_dataframe()
-            status.update(label="✅ ロード完了", state="complete")
-        return df
-    except Exception as e:
-        st.error(f"データ取得失敗: {e}")
-        return pd.DataFrame()
+    key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    credentials = service_account.Credentials.from_service_account_info(key_dict)
+    client = bigquery.Client(credentials=credentials, project=key_dict["project_id"])
+    query = "SELECT * FROM `salesdb-479915.sales_data.t_sales_summary_materialized`"
+    return client.query(query).to_dataframe()
 
-# --- アプリ基本設定 ---
-st.set_page_config(page_title="Kyushu Towa SFA Dashboard", layout="wide")
-df_raw = load_data()
+st.set_page_config(page_title="Kyushu Towa Strategic SFA", layout="wide")
+df = load_data()
 
-if not df_raw.empty:
-    # --- 2. データ補完 & エリア定義 ---
-    df_raw["支店名"] = df_raw["支店名"].fillna("本部")
-    df_raw["担当社員名"] = df_raw["担当社員名"].fillna("未割当")
+if not df.empty:
+    # フィルタ設定
+    st.sidebar.title("🎮 モード選択")
+    mode = st.sidebar.radio("表示切替", ["管理者モード", "営業員モード"])
     
-    oita_branches = ["大分", "別府", "中津", "佐伯"]
-    df_raw["エリア"] = df_raw["支店名"].apply(
-        lambda x: "大分エリア" if any(b in x for b in oita_branches) else "熊本エリア"
-    )
-
-    # --- 3. サイドバー：モード切替 & フィルタ ---
-    st.sidebar.title("🎮 表示設定")
-    view_mode = st.sidebar.radio("モード切替", ["管理者モード（全社・エリア）", "営業員モード（個人分析）"])
-
-    df_filtered = df_raw.copy()
-
-    if view_mode == "管理者モード（全社・エリア）":
-        st.title("🏛️ 管理者ダッシュボード")
-        selected_areas = st.sidebar.multiselect("エリア選択", options=["大分エリア", "熊本エリア"], default=["大分エリア", "熊本エリア"])
-        df_filtered = df_filtered[df_filtered["エリア"].isin(selected_areas)]
-        
-        selected_branches = st.sidebar.multiselect("支店絞り込み", options=sorted(df_filtered["支店名"].unique()))
-        if selected_branches:
-            df_filtered = df_filtered[df_filtered["支店名"].isin(selected_branches)]
+    # 共通フィルタ
+    if mode == "管理者モード":
+        st.title("🏛️ 管理者・全体戦略ダッシュボード")
+        df_view = df.copy()
     else:
-        st.title("🏃 営業員ドリルダウン")
-        target_staff = st.sidebar.selectbox("担当者を選択", options=sorted(df_raw["担当社員名"].unique()))
-        df_filtered = df_filtered[df_filtered["担当社員名"] == target_staff]
+        target_staff = st.sidebar.selectbox("担当者選択", sorted(df["担当社員名"].unique()))
+        st.title(f"🏃 {target_staff} 担当分析")
+        df_view = df[df["担当社員名"] == target_staff]
 
-    # --- 4. 年度別パフォーマンス分析（新機能） ---
-    st.header("📅 年度別サマリー")
-    df_fy = df_filtered.groupby("年度")[["売上額", "粗利額"]].sum().reset_index().sort_values("年度")
-    
-    if len(df_fy) > 0:
-        latest_fy = df_fy.iloc[-1]
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"{latest_fy['年度']}年度 売上計", f"¥{latest_fy['売上額']:,.0f}")
-        c3.metric(f"{latest_fy['年度']}年度 粗利計", f"¥{latest_fy['粗利額']:,.0f}")
+    # --- 1. メインKPI ---
+    col1, col2, col3 = st.columns(3)
+    sales = df_view["売上額"].sum()
+    profit = df_view["粗利額"].sum()
+    col1.metric("選択範囲 売上", f"¥{sales:,.0f}")
+    col2.metric("総粗利", f"¥{profit:,.0f}")
+    col3.metric("粗利率", f"{(profit/sales*100):.1f}%" if sales != 0 else "0%")
+
+    # --- 2. 【新機能】アラート分析（売上減少・失注） ---
+    st.divider()
+    tab_alert, tab_rank, tab_trend = st.tabs(["⚠️ 要注意アラート", "🏆 ランキング", "📈 時系列"])
+
+    with tab_alert:
+        c1, c2 = st.columns(2)
         
-        if len(df_fy) > 1:
-            prev_fy = df_fy.iloc[-2]
-            yoy_growth = (latest_fy['売上額'] / prev_fy['売上額'] - 1) * 100
-            c2.metric("前年度比（売上）", f"{yoy_growth:+.1f}%", delta=f"¥{latest_fy['売上額'] - prev_fy['売上額']:,.0f}")
-    
-    # --- 5. メインビジュアル（タブ形式で機能整理） ---
-    tab_fy, tab_trend, tab_portfolio = st.tabs(["📊 年度推移", "📈 月次トレンド", "🎯 得意先分析"])
+        with c1:
+            st.subheader("🛑 売上減少が激しい得意先 (YoY)")
+            # 今年度と前年度の比較
+            yoy_cust = df_view.groupby(["年度", "得意先名"])["売上額"].sum().unstack(level=0)
+            if len(yoy_cust.columns) >= 2:
+                current_fy = yoy_cust.columns[-1]
+                prev_fy = yoy_cust.columns[-2]
+                yoy_cust["差分"] = yoy_cust[current_fy].fillna(0) - yoy_cust[prev_fy].fillna(0)
+                declining = yoy_cust[yoy_cust["差分"] < 0].sort_values("差分").head(10)
+                st.dataframe(declining[["差分"]].style.format("¥{:,.0f}"), use_container_width=True)
+            else:
+                st.info("比較可能な2年分以上のデータがありません")
 
-    with tab_fy:
-        st.subheader("年度別売上推移")
-        fig_fy = px.bar(df_fy, x="年度", y="売上額", text_auto='.3s', color="年度", color_discrete_sequence=px.colors.qualitative.Set2)
-        st.plotly_chart(fig_fy, use_container_width=True)
+        with c2:
+            st.subheader("📉 失注・不採用品目")
+            # 昨年度は売上があったが、今年度ゼロの商品を特定
+            lost_items = df_view.groupby(["年度", "商品名"])["売上額"].sum().unstack(level=0)
+            if len(lost_items.columns) >= 2:
+                lost_items["今年度売上"] = lost_items[lost_items.columns[-1]].fillna(0)
+                lost_items["昨年度売上"] = lost_items[lost_items.columns[-2]].fillna(0)
+                # 昨年度 > 0 且つ 今年度 == 0
+                churn = lost_items[(lost_items["昨年度売上"] > 0) & (lost_items["今年度売上"] == 0)]
+                st.dataframe(churn[["昨年度売上"]].sort_values("昨年度売上", ascending=False).head(10), use_container_width=True)
+            else:
+                st.info("分析に必要な年度データが不足しています")
+
+    with tab_rank:
+        c1, c2 = st.columns(2)
+        if mode == "管理者モード":
+            with c1:
+                st.subheader("売上額 Top 10 (全社)")
+                st.bar_chart(df_view.groupby("商品名")["売上額"].sum().sort_values(ascending=False).head(10))
+            with c2:
+                st.subheader("粗利額 Top 10 (全社)")
+                st.bar_chart(df_view.groupby("商品名")["粗利額"].sum().sort_values(ascending=False).head(10))
+        else:
+            with c1:
+                st.subheader("担当先 売上ランキング")
+                st.dataframe(df_view.groupby("得意先名")["売上額"].sum().sort_values(ascending=False).head(10))
+            with c2:
+                st.subheader("担当先 利益ランキング")
+                st.dataframe(df_view.groupby("得意先名")["粗利額"].sum().sort_values(ascending=False).head(10))
 
     with tab_trend:
-        st.subheader("24ヶ月間の売上推移")
-        trend = df_filtered.groupby(["売上月", "データ区分"])["売上額"].sum().reset_index()
-        fig_trend = px.line(trend, x="売上月", y="売上額", color="データ区分", markers=True)
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-    with tab_portfolio:
-        if view_mode == "管理者モード（全社・エリア）":
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("エリア別 粗利構成")
-                fig_area = px.pie(df_filtered.groupby("エリア")["粗利額"].sum().reset_index(), values="粗利額", names="エリア", hole=0.4)
-                st.plotly_chart(fig_area, use_container_width=True)
-            with col_b:
-                st.subheader("支店別ランキング")
-                fig_branch = px.bar(df_filtered.groupby("支店名")["粗利額"].sum().sort_values(ascending=False).reset_index(), x="支店名", y="粗利額", color="粗利額")
-                st.plotly_chart(fig_branch, use_container_width=True)
-        else:
-            st.subheader("担当得意先ポートフォリオ")
-            cust_df = df_filtered.groupby("得意先名")[["売上額", "粗利額"]].sum().reset_index()
-            cust_df["粗利率"] = (cust_df["粗利額"] / cust_df["売上額"] * 100)
-            fig_cust = px.scatter(cust_df, x="売上額", y="粗利率", size="粗利額", hover_name="得意先名", color="粗利率", color_continuous_scale="RdYlGn")
-            st.plotly_chart(fig_cust, use_container_width=True)
-
-    # --- 6. 戦略品分析 ---
-    st.divider()
-    st.subheader("💊 戦略品フラグ別 粗利構成")
-    strat_df = df_filtered.groupby("戦略品フラグ")["粗利額"].sum().reset_index()
-    fig_strat = px.bar(strat_df, x="戦略品フラグ", y="粗利額", color="戦略品フラグ", text_auto='.2s')
-    st.plotly_chart(fig_strat, use_container_width=True)
-
-    # --- 7. データ詳細 ---
-    with st.expander("詳細データの確認（サマリー）"):
-        st.dataframe(df_filtered, use_container_width=True)
+        st.subheader("月次売上推移")
+        trend = df_view.groupby(["売上月", "データ区分"])["売上額"].sum().reset_index()
+        st.plotly_chart(px.line(trend, x="売上月", y="売上額", color="データ区分", markers=True), use_container_width=True)
 
 else:
-    st.warning("BigQueryからデータが取得できません。")
+    st.warning("BigQueryのテーブルを確認してください")
