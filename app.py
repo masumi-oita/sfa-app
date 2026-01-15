@@ -5,18 +5,23 @@ import pandas as pd
 import plotly.express as px
 import json
 
-# --- 1. 認証 & データ読み込み（進捗表示 + 権限踏襲） ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=86400) # 1日キャッシュ
 def load_data():
     try:
         key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
-        scopes = [
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/bigquery"
-        ]
+        scopes = ["https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/bigquery"]
         credentials = service_account.Credentials.from_service_account_info(key_dict, scopes=scopes)
         client = bigquery.Client(credentials=credentials, project=key_dict["project_id"])
+        
+        with st.status("⚡ 高速テーブルからデータを読み込み中...", expanded=True) as status:
+            # 参照先をビュー(v_...)から、作成したテーブル(t_...)に変更
+            query = "SELECT * FROM `salesdb-479915.sales_data.t_sales_performance_materialized` ORDER BY `売上日` DESC"
+            df = client.query(query).to_dataframe()
+            status.update(label="✅ ロード完了", state="complete")
+        return df
+    except Exception as e:
+        st.error(f"ロード失敗: {e}")
+        return pd.DataFrame()
         
         # 読み込みの進捗を可視化（フリーズ対策）
         with st.status("📦 データ集計中...", expanded=True) as status:
