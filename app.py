@@ -22,20 +22,17 @@ PROJECT_ID = "salesdb-479915"
 BQ_LOCATION = "asia-northeast1"
 
 @st.cache_resource
-def get_bq_client() -> bigquery.Client:
-    sa_json_str = st.secrets["gcp_service_account"]["json_key"]
-    sa_info = json.loads(sa_json_str)
-
-    creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
+def get_bq_client():
+    # Streamlit secrets からサービスアカウント鍵を読む
+    key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    credentials = service_account.Credentials.from_service_account_info(key_dict)
 
     return bigquery.Client(
-        project=sa_info.get("project_id", PROJECT_ID),
-        credentials=creds,
+        project=key_dict.get("project_id", PROJECT_ID),
+        credentials=credentials,
         location=BQ_LOCATION,
     )
+
 
 
 def bq_query_df(sql: str) -> pd.DataFrame:
