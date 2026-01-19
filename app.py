@@ -1,103 +1,68 @@
 import json
-import os
 import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from datetime import datetime
-
-st.set_page_config(page_title="SFA Debug", layout="wide")
+from google.api_core.exceptions import BadRequest
 
 PROJECT_ID = "salesdb-479915"
 BQ_LOCATION = "asia-northeast1"
 
-st.title("SFA Debug（エラー特定モード）")
+st.set_page_config(page_title="SFA Debug", layout="wide")
+st.title("SFA Debug（SQLエラー特定用）")
 
 # -----------------------------
-# 1. 環境変数チェック
+# BigQuery Client
 # -----------------------------
-st.subheader("① 環境変数チェック")
-
-env_keys = [
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "GOOGLE_CLOUD_PROJECT",
-    "GCLOUD_PROJECT",
-]
-
-env_status = {k: os.getenv(k) for k in env_keys}
-st.json(env_status)
-
-# -----------------------------
-# 2. secrets 読み取りチェック
-# -----------------------------
-st.subheader("② Streamlit secrets 読み取り")
-
-try:
+@st.cache_resource
+def get_bq_client():
     key_dict = json.loads(st.secrets["gcp_service_account"]["json_key"])
-    st.success("secrets 読み取り OK")
-    st.json({k: ("***MASKED***" if "key" in k else v) for k, v in key_dict.items()})
-except Exception as e:
-    st.error("secrets 読み取り失敗")
-    st.exception(e)
-    st.stop()
-
-# -----------------------------
-# 3. BigQuery Client 生成
-# -----------------------------
-st.subheader("③ BigQuery Client 生成")
-
-try:
-    credentials = service_account.Credentials.from_service_account_info(key_dict)
-
-    client = bigquery.Client(
-        project=key_dict.get("project_id", PROJECT_ID),
-        credentials=credentials,
+    creds = service_account.Credentials.from_service_account_info(key_dict)
+    return bigquery.Client(
+        project=PROJECT_ID,
+        credentials=creds,
         location=BQ_LOCATION,
     )
 
-    st.success("BigQuery Client 生成 OK")
-    st.write("client.project =", client.project)
-    st.write("client.location =", client.location)
-    st.write("credentials =", type(credentials).__name__)
-
-except Exception as e:
-    st.error("BigQuery Client 生成失敗")
-    st.exception(e)
-    st.stop()
+client = get_bq_client()
 
 # -----------------------------
-# 4. SELECT 1 テスト
+# SQL 入力
 # -----------------------------
-st.subheader("④ SELECT 1 テスト")
-
-try:
-    df = client.query("SELECT 1 AS ok").to_dataframe(
-        create_bqstorage_client=False
-    )
-    st.success("SELECT 1 成功")
-    st.dataframe(df)
-
-except Exception as e:
-    st.error("SELECT 1 失敗")
-    st.exception(e)
-    st.stop()
+st.subheader("① 実行したいSQLを貼る")
+sql = st.text_area(
+    "SQL",
+    height=200,
+    placeholder="SELECT * FROM `salesdb-479915.sales_data.adoption_unpivoted` LIMIT 10"
+)
 
 # -----------------------------
-# 5. CURRENT_DATE テスト
+# Dry-run
 # -----------------------------
-st.subheader("⑤ CURRENT_DATE テスト")
+st.subheader("② Dry-run（実行せず検証）")
+if st.button("Dry-run 実行"):
+    try:
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        job = client.query(sql, job_config=job_config)
+        st.success("✅ Dry-run OK（SQL構文・列・型は成立）")
+        st.write({
+            "bytes_processed": job.total_bytes_processed,
+            "bytes_billed": job.total_bytes_billed,
+        })
+    except BadRequest as e:
+        st.error("❌ Dry-run 失敗（ここが原因）")
+        st.code(e.message)
+        st.stop()
 
-try:
-    df = client.query(
-        'SELECT CURRENT_DATE("Asia/Tokyo") AS today'
-    ).to_dataframe(create_bqstorage_client=False)
-
-    st.success("日付取得 成功")
-    st.dataframe(df)
-
-except Exception as e:
-    st.error("日付取得 失敗")
-    st.exception(e)
-    st.stop()
-
-st.success("🎉 ここまで全て通過 → BigQuery/認証/ネットワークは完全に正常です")
+# -----------------------------
+# 実行（LIMIT必須）
+# -----------------------------
+st.subheader("③ 実行（LIMIT必須）")
+if st.button("実行"):
+    try:
+        df = client.query(sql).to_dataframe(create_bqstorage_client=False)
+        st.success("✅ 実行成功")
+        st.dataframe(df)
+    except BadRequest as e:
+        st.error("❌ 実行時エラー")
+        st.code(e.message)
