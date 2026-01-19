@@ -13,21 +13,18 @@ st.set_page_config(page_title="SFA", layout="wide")
 # -----------------------------
 # BigQuery client (ONLY ONE WAY)
 # -----------------------------
+import json
+import streamlit as st
+from google.cloud import bigquery
+from google.oauth2 import service_account
+
+PROJECT_ID = "salesdb-479915"
+BQ_LOCATION = "asia-northeast1"
+
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    # Secrets: [gcp_service_account].json_key という1本のJSON文字列を想定
-    try:
-        sa_json_str = st.secrets["gcp_service_account"]["json_key"]
-    except Exception:
-        st.error("Streamlit Secrets に [gcp_service_account].json_key がありません。")
-        st.stop()
-
-    try:
-        sa_info = json.loads(sa_json_str)
-    except Exception as e:
-        st.error("Secrets の json_key が JSON として読めません（TOMLの貼り方/改行/クォートを確認）。")
-        st.exception(e)
-        st.stop()
+    sa_json_str = st.secrets["gcp_service_account"]["json_key"]
+    sa_info = json.loads(sa_json_str)
 
     creds = service_account.Credentials.from_service_account_info(
         sa_info,
@@ -39,6 +36,7 @@ def get_bq_client() -> bigquery.Client:
         credentials=creds,
         location=BQ_LOCATION,
     )
+
 
 def bq_query_df(sql: str) -> pd.DataFrame:
     """BigQuery実行は必ずここを通す（TransportError封じ）"""
