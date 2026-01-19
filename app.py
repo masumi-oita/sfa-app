@@ -1,214 +1,66 @@
-# ============================================================
-# SFA Sales Intelligence App
-# ============================================================
-
+import json
 import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
-from datetime import date
+from google.oauth2 import service_account
 
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
 PROJECT_ID = "salesdb-479915"
-TABLE_SALES = "sales_data.v_sales_merged_2y_plus_month"
+BQ_LOCATION = "asia-northeast1"
 
-LOOKBACK_DAYS_NEW = 365   # 新規納品判定（YJ×得意先）
+st.set_page_config(page_title="SFA", layout="wide")
 
-st.set_page_config(
-    page_title="SFA Sales Intelligence",
-    layout="wide"
-)
-
-# ------------------------------------------------------------
-# BigQuery Client
-# ------------------------------------------------------------
 @st.cache_resource
-def get_bq_client():
-    return bigquery.Client(project=PROJECT_ID)
+def get_bq_client() -> bigquery.Client:
+    # Secretsにjson_keyがある前提
+    if "gcp_service_account" not in st.secrets or "json_key" not in st.secrets["gcp_service_account"]:
+        st.error("Streamlit Secrets に [gcp_service_account].json_key が見つかりません。")
+        st.stop()
 
-# ------------------------------------------------------------
-# Load Sales Data
-# ------------------------------------------------------------
-@st.cache_data(ttl=3600)
-def load_sales_data():
+    sa_json_str = st.secrets["gcp_service_account"]["json_key"]
+
+    try:
+        sa_info = json.loads(sa_json_str)
+    except Exception as e:
+        st.error("Secrets の json_key が JSON としてパースできません。TOMLの貼り方（改行/ダブルクォート）を確認してください。")
+        st.exception(e)
+        st.stop()
+
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+
+    return bigquery.Client(
+        project=sa_info.get("project_id", PROJECT_ID),
+        credentials=creds,
+        location=BQ_LOCATION,
+    )
+
+def bq_health_check():
     client = get_bq_client()
+    try:
+        df = client.query("SELECT 1 AS ok").to_dataframe(create_bqstorage_client=False)
+        return int(df.iloc[0]["ok"]) == 1
+    except Exception as e:
+        st.error("BigQuery 接続に失敗しました（Secrets/権限/プロジェクト/ロケーションを確認）。")
+        st.exception(e)
+        st.stop()
 
-    query = f"""
+@st.cache_data(ttl=3600)
+def load_any_table_example():
+    # まずは接続確認できる簡単な例
+    client = get_bq_client()
+    q = f"""
     SELECT
-      customer_code,
-      customer_name,
-      sales_date,
-      yj_code,
-      unique_code_yj,
-      ingredient,
-      product_name,
-      efficacy_category,
-      quantity,
-      sales_amount,
-      gross_profit
-    FROM `{PROJECT_ID}.{TABLE_SALES}`
+      CURRENT_DATE("Asia/Tokyo") AS today
     """
+    return client.query(q).to_dataframe(create_bqstorage_client=False)
 
-    df = client.query(query).to_dataframe()
-    return df
+st.title("SFA")
 
-# ------------------------------------------------------------
-# New Delivery Flag (YJ × 得意先)
-# ------------------------------------------------------------
-def add_new_delivery_flag(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["sales_date"] = pd.to_datetime(df["sales_date"])
+with st.spinner("BigQuery 接続確認中..."):
+    ok = bq_health_check()
+st.success("BigQuery 接続OK")
 
-    last_sale = (
-        df.groupby(["customer_code", "yj_code"])["sales_date"]
-        .max()
-        .reset_index()
-        .rename(columns={"sales_date": "last_sales_date"})
-    )
-
-    df = df.merge(last_sale, on=["customer_code", "yj_code"], how="left")
-
-    today = pd.Timestamp(date.today())
-    df["is_new_delivery"] = (
-        (today - df["last_sales_date"]).dt.days > LOOKBACK_DAYS_NEW
-    )
-
-    return df
-
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-st.title("📊 SFA 営業支援ダッシュボード")
-
-with st.spinner("売上データ読込中..."):
-    df_sales = load_sales_data()
-
-if df_sales.empty:
-    st.warning("データがありません")
-    st.stop()
-
-df_sales = add_new_delivery_flag(df_sales)
-
-# ------------------------------------------------------------
-# Sidebar Filters
-# ------------------------------------------------------------
-st.sidebar.header("🔍 フィルタ")
-
-customers = sorted(df_sales["customer_name"].unique())
-selected_customer = st.sidebar.selectbox(
-    "得意先を選択",
-    customers
-)
-
-df_cust = df_sales[df_sales["customer_name"] == selected_customer]
-
-# ------------------------------------------------------------
-# KPI Summary
-# ------------------------------------------------------------
-st.subheader(f"🏥 {selected_customer} サマリー")
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric(
-    "売上合計",
-    f"¥{df_cust['sales_amount'].sum():,.0f}"
-)
-
-col2.metric(
-    "粗利合計",
-    f"¥{df_cust['gross_profit'].sum():,.0f}"
-)
-
-margin = (
-    df_cust["gross_profit"].sum() / df_cust["sales_amount"].sum()
-    if df_cust["sales_amount"].sum() > 0 else 0
-)
-
-col3.metric(
-    "粗利率",
-    f"{margin:.1%}"
-)
-
-# ------------------------------------------------------------
-# Efficacy Trend (得意先の薬効傾向)
-# ------------------------------------------------------------
-st.subheader("💊 薬効分類別 売上構成")
-
-eff_summary = (
-    df_cust.groupby("efficacy_category", dropna=False)
-    .agg(
-        売上金額=("sales_amount", "sum"),
-        粗利=("gross_profit", "sum")
-    )
-    .sort_values("売上金額", ascending=False)
-    .reset_index()
-)
-
-st.dataframe(eff_summary, use_container_width=True)
-
-# ------------------------------------------------------------
-# Recommendation Logic
-# ------------------------------------------------------------
-st.subheader("🚀 おすすめ未採用品目")
-
-# 得意先が採用している薬効
-adopted_eff = set(df_cust["efficacy_category"].dropna().unique())
-
-# 全社売上（基準）
-df_all = df_sales.copy()
-
-top_products_by_eff = (
-    df_all.groupby(
-        ["efficacy_category", "yj_code", "ingredient", "product_name"]
-    )
-    .agg(
-        全社売上=("sales_amount", "sum"),
-        全社粗利=("gross_profit", "sum")
-    )
-    .reset_index()
-)
-
-# 得意先未採用 × 同薬効
-cust_yj = set(df_cust["yj_code"].unique())
-
-recommend = top_products_by_eff[
-    (top_products_by_eff["efficacy_category"].isin(adopted_eff)) &
-    (~top_products_by_eff["yj_code"].isin(cust_yj))
-].sort_values("全社売上", ascending=False)
-
-# 表示用
-recommend_display = recommend.head(20).rename(columns={
-    "efficacy_category": "薬効分類",
-    "yj_code": "YJコード",
-    "ingredient": "成分",
-    "product_name": "商品名",
-    "全社売上": "全社売上金額",
-    "全社粗利": "全社粗利"
-})
-
-st.dataframe(recommend_display, use_container_width=True)
-
-# ------------------------------------------------------------
-# New Delivery Check
-# ------------------------------------------------------------
-st.subheader("🆕 新規納品候補（1年以上実績なし）")
-
-new_delivery = df_cust[df_cust["is_new_delivery"]]
-
-if new_delivery.empty:
-    st.info("新規納品候補はありません")
-else:
-    new_display = new_delivery[[
-        "product_name",
-        "ingredient",
-        "yj_code",
-        "sales_date"
-    ]].rename(columns={
-        "product_name": "商品名",
-        "ingredient": "成分",
-        "yj_code": "YJコード",
-        "sales_date": "最終販売日"
-    })
-
-    st.dataframe(new_display, use_container_width=True)
+df = load_any_table_example()
+st.dataframe(df, use_container_width=True)
