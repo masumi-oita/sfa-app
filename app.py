@@ -7,13 +7,15 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # ============================================================
-# Strategic Sales Console (FULL / Robust BigQuery Loader)
-# - Reads BigQuery table: sales_history_2year (raw; NO modification)
-# - Fixes BadRequest issues by querying SELECT * and validating columns in Python
-# - New-delivery judge uses ユニークコード_YJ (customer_code × YJ)
+# Strategic Sales Console (FULL)
+# - Base (historical): sales_history_2year  ※過去2年スナップ
+# - Incremental (latest): sales_details_snapshots ※当月分は洗い替え前提
+# ✅ 重複回避方針：当月は「日次テーブルが正」、スナップ側の当月は除外
+#   merged = snapshot(<当月) + incremental(>=当月)
+# - New delivery judge uses ユニークコード_YJ (customer_code × YJ)
 # - FY: April start
 # - Features:
-#   ① FY-to-date sales/profit/margin + last-year comparison (ranking + drilldown)
+#   ① FY-to-date sales/profit/margin + last-year-to-date comparison (ranking + drilldown)
 #   ② New delivery summary (Yesterday/Week/Month/FY) + drilldown
 #   ③ Lost/Growth customer ranking by diff (FY-to-date vs last-year-to-date) + item list
 # ============================================================
@@ -22,8 +24,9 @@ from google.oauth2 import service_account
 # CONFIG
 # ----------------------------
 BQ_PROJECT = "salesdb-479915"
-TABLE_SALES_2Y = f"{BQ_PROJECT}.sales_data.sales_history_2year"
-LOOKBACK_DAYS_NEW = 365  # New delivery: no sales in past 365 days
+TABLE_SNAPSHOT_2Y = f"{BQ_PROJECT}.sales_data.sales_history_2year"           # スナップ（過去2年）
+TABLE_INC = f"{BQ_PROJECT}.sales_data.sales_details_snapshots"              # 日次（当月洗い替え）
+LOOKBACK_DAYS_NEW = 365                                                     # 新規納品：過去365日空白
 
 st.set_page_config(page_title="Strategic Sales Console", layout="wide")
 
@@ -50,6 +53,9 @@ def same_day_last_year(d: date) -> date:
     except ValueError:
         return date(d.year - 1, d.month, 28)
 
+def month_start(d: date) -> date:
+    return d.replace(day=1)
+
 def yen(x) -> str:
     try:
         return f"¥{float(x):,.0f}"
@@ -57,75 +63,169 @@ def yen(x) -> str:
         return ""
 
 # ----------------------------
-# Robust loader (prevents BadRequest from missing columns)
+# Robust parsing (snapshot has 販売日 STRING)
+# ----------------------------
+def safe_parse_date_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip()
+    d1 = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    d2 = pd.to_datetime(s, errors="coerce")
+    return d1.fillna(d2)
+
+# ----------------------------
+# Loader: SNAPSHOT (sales_history_2year)
 # ----------------------------
 @st.cache_data(ttl=300)
-def load_sales_2y():
+def load_snapshot_2y():
     client = get_bq_client()
+    q = f"SELECT * FROM `{TABLE_SNAPSHOT_2Y}`"
 
-    q = f"SELECT * FROM `{TABLE_SALES_2Y}`"
     try:
         df = client.query(q).to_dataframe()
     except Exception as e:
-        # Streamlit Cloud redacts, but str(e) usually contains safe hints
-        st.error("BigQuery query failed (BadRequest/permission/location/etc).")
+        st.error("[SNAPSHOT] BigQuery query failed")
         st.write(str(e))
         st.stop()
 
-    # Required columns (based on your schema)
-    required = ["得意先コード", "得意先名", "商品名", "合計金額", "粗利", "販売日", "YJコード", "ユニークコード_YJ"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        st.error(f"sales_history_2year に必要列が見つかりません: {missing}")
-        st.write("実際に取得できた列名一覧:", list(df.columns))
+    required = ["得意先コード", "得意先名", "合計金額", "粗利", "販売日", "YJコード", "ユニークコード_YJ", "商品名"]
+    miss = [c for c in required if c not in df.columns]
+    if miss:
+        st.error(f"[SNAPSHOT] 必要列不足: {miss}")
+        st.write("取得列:", list(df.columns))
         st.stop()
 
-    # --- Date parse: 販売日 (STRING) supports YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD etc.
-    s = df["販売日"].astype(str).str.strip()
-
-    d1 = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
-    d2 = pd.to_datetime(s, errors="coerce")
-    d = d1.fillna(d2)
-
-    df["売上日"] = d.dt.date
+    df["売上日"] = safe_parse_date_series(df["販売日"]).dt.date
     df = df[df["売上日"].notna()].copy()
 
-    # --- Numeric
     df["売上額"] = pd.to_numeric(df["合計金額"], errors="coerce").fillna(0)
     df["利益"] = pd.to_numeric(df["粗利"], errors="coerce").fillna(0)
 
-    # --- FY & month key
     df["年度"] = df["売上日"].apply(fy_year)
     df["売上月キー"] = pd.to_datetime(df["売上日"]).dt.strftime("%Y-%m")
 
-    # --- keys
     df["得意先コード"] = df["得意先コード"].astype(str)
     df["YJコード"] = df["YJコード"].astype(str)
     df["ユニークコード_YJ"] = df["ユニークコード_YJ"].astype(str)
 
-    # --- margin
     df["利益率"] = df.apply(lambda r: (r["利益"] / r["売上額"]) if r["売上額"] else 0, axis=1)
 
-    # Optional cols used in drilldown (create if absent)
-    for col in ["包装単位", "JANコード"]:
+    # Optional columns for display / compatibility
+    for col in ["包装単位", "JANコード", "商品コード", "ロットNo", "使用期限", "数量", "単価"]:
         if col not in df.columns:
             df[col] = ""
 
     return df
 
+# ----------------------------
+# Loader: INCREMENTAL (sales_details_snapshots) - THIS MONTH ONLY
+# - We do NOT depend on exact schema; rename candidates in Python.
+# ----------------------------
+@st.cache_data(ttl=300)
+def load_incremental_this_month():
+    client = get_bq_client()
+
+    # 当月だけ取る（重さ対策）
+    q = f"""
+    SELECT * FROM `{TABLE_INC}`
+    WHERE CAST(販売日 AS DATE) >= DATE_TRUNC(CURRENT_DATE('Asia/Tokyo'), MONTH)
+    """
+
+    try:
+        df = client.query(q).to_dataframe()
+    except Exception as e:
+        st.error("[INCREMENTAL] BigQuery query failed")
+        st.write(str(e))
+        st.stop()
+
+    # Candidate rename map based on your GAS MERGE SQL
+    rename_map_candidates = {
+        "販売日": "売上日",
+        "得意先コード": "得意先コード",
+        "得意先名": "得意先名",
+        "支店名": "支店名",
+        "担当社員名": "担当社員名",
+        "YJCode": "YJコード",
+        "JAN": "JANコード",
+        "商品コード": "商品コード",
+        "商品名称": "商品名",
+        "包装単位": "包装単位",
+        "販売数量": "数量",
+        "合計金額": "合計金額",
+        "粗利": "粗利",
+        "ロットNo": "ロットNo",
+        "使用期限": "使用期限",
+        "単価": "単価",
+    }
+
+    for src, dst in rename_map_candidates.items():
+        if src in df.columns and dst not in df.columns:
+            df = df.rename(columns={src: dst})
+
+    required = ["得意先コード", "得意先名", "売上日", "YJコード", "数量", "商品名"]
+    miss = [c for c in required if c not in df.columns]
+    if miss:
+        st.error(f"[INCREMENTAL] 必要列不足: {miss}")
+        st.write("取得列:", list(df.columns))
+        st.stop()
+
+    df["売上日"] = pd.to_datetime(df["売上日"], errors="coerce").dt.date
+    df = df[df["売上日"].notna()].copy()
+
+    # numeric
+    df["売上額"] = pd.to_numeric(df.get("合計金額", 0), errors="coerce").fillna(0)
+    df["利益"] = pd.to_numeric(df.get("粗利", 0), errors="coerce").fillna(0)
+
+    # FY / month key
+    df["年度"] = df["売上日"].apply(fy_year)
+    df["売上月キー"] = pd.to_datetime(df["売上日"]).dt.strftime("%Y-%m")
+
+    # keys
+    df["得意先コード"] = df["得意先コード"].astype(str)
+    df["YJコード"] = df["YJコード"].astype(str)
+    df["ユニークコード_YJ"] = df["得意先コード"] + "_" + df["YJコード"]
+
+    df["利益率"] = df.apply(lambda r: (r["利益"] / r["売上額"]) if r["売上額"] else 0, axis=1)
+
+    # Optional columns for compatibility
+    for col in ["包装単位", "JANコード", "商品コード", "ロットNo", "使用期限", "単価"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
+
+# ----------------------------
+# Merge policy (NO DUP):
+# - This month: use incremental (wash-replace)
+# - Snapshot: exclude this-month rows
+# ----------------------------
+@st.cache_data(ttl=300)
+def load_sales_merged():
+    today = datetime.now().date()
+    m0 = month_start(today)
+
+    snap = load_snapshot_2y()
+    snap = snap[snap["売上日"] < m0].copy()  # drop snapshot's this month
+
+    inc = load_incremental_this_month()      # only this month
+
+    merged = pd.concat([snap, inc], ignore_index=True)
+
+    # Optional: extra safety in case inc has duplicates
+    # If you have a better unique key, replace this with that.
+    subset = ["得意先コード", "売上日", "YJコード", "商品コード", "数量", "売上額"]
+    subset = [c for c in subset if c in merged.columns]
+    merged = merged.drop_duplicates(subset=subset, keep="last")
+
+    return merged, len(snap), len(inc)
+
+# ----------------------------
+# New delivery flag by ユニークコード_YJ
+# ----------------------------
 def add_new_delivery_flag_by_unique_yj(df_sales: pd.DataFrame, lookback_days=365) -> pd.DataFrame:
-    """
-    New delivery flag by ユニークコード_YJ:
-      - First appearance => True
-      - If previous sale date gap > lookback_days => True
-    """
     df = df_sales.copy()
     df = df.sort_values(["ユニークコード_YJ", "売上日"])
-
     df["prev_date"] = df.groupby("ユニークコード_YJ")["売上日"].shift(1)
     df["gap_days"] = (pd.to_datetime(df["売上日"]) - pd.to_datetime(df["prev_date"])).dt.days
     df["is_new_delivery"] = df["prev_date"].isna() | (df["gap_days"] > lookback_days)
-
     return df
 
 def summarize(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
@@ -137,12 +237,8 @@ def summarize(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     return g
 
 def add_yj_rep_name(df_yj_agg: pd.DataFrame, df_base: pd.DataFrame) -> pd.DataFrame:
-    """
-    Attach representative 商品名 for each YJコード based on max sales
-    """
     if "YJコード" not in df_yj_agg.columns or "YJコード" not in df_base.columns:
         return df_yj_agg
-
     tmp = df_base.groupby(["YJコード", "商品名"], dropna=False)["売上額"].sum().reset_index()
     rep = tmp.sort_values(["YJコード", "売上額"], ascending=[True, False]).drop_duplicates("YJコード")
     rep = rep.rename(columns={"商品名": "代表商品名"}).drop(columns=["売上額"])
@@ -151,7 +247,7 @@ def add_yj_rep_name(df_yj_agg: pd.DataFrame, df_base: pd.DataFrame) -> pd.DataFr
 # ============================================================
 # MAIN
 # ============================================================
-df_sales = load_sales_2y()
+df_sales, n_snap, n_inc = load_sales_merged()
 df_sales = add_new_delivery_flag_by_unique_yj(df_sales, lookback_days=LOOKBACK_DAYS_NEW)
 
 if df_sales.empty:
@@ -173,7 +269,18 @@ fy1_start = date(fy1, 4, 1)
 fy1_end = same_day_last_year(today)
 
 # ------------------------------------------------------------
-# Sidebar filters (optional)
+# Header: merge status (no-dup by month wash-replace)
+# ------------------------------------------------------------
+st.title("Strategic Sales Console")
+st.caption("当月は sales_details_snapshots（洗い替え）を採用し、sales_history_2year の当月分は除外して重複を防止します。")
+
+c0, c1, c2 = st.columns(3)
+c0.metric("スナップ（当月除外）行数", f"{n_snap:,}")
+c1.metric("当月（洗い替え）行数", f"{n_inc:,}")
+c2.metric("統合後 行数", f"{len(df_sales):,}")
+
+# ------------------------------------------------------------
+# Sidebar filters
 # ------------------------------------------------------------
 st.sidebar.title("🎮 表示設定")
 search_cust = st.sidebar.text_input("得意先検索（部分一致）", "")
@@ -193,7 +300,6 @@ st.header("① 年度内 売上・利益・利益率 / 昨年比較（ランキ�
 df_fy0 = df_view[(df_view["売上日"] >= fy0_start) & (df_view["売上日"] <= fy0_end)].copy()
 df_fy1 = df_view[(df_view["売上日"] >= fy1_start) & (df_view["売上日"] <= fy1_end)].copy()
 
-# KPI
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("売上（今年度内）", yen(df_fy0["売上額"].sum()))
 c2.metric("利益（今年度内）", yen(df_fy0["利益"].sum()))
@@ -240,7 +346,6 @@ with tab_cust:
             use_container_width=True
         )
 
-        # Monthly trend
         trend = dd.groupby(["売上月キー"], dropna=False)["売上額"].sum().reset_index().sort_values("売上月キー")
         st.plotly_chart(px.line(trend, x="売上月キー", y="売上額", title="月次推移（今年度内）"), use_container_width=True)
 
@@ -443,8 +548,6 @@ with tab_gain:
             use_container_width=True
         )
 
-# Footer note
 st.caption(
-    f"注) 新規納品判定は ユニークコード_YJ 単位。直前取引から{LOOKBACK_DAYS_NEW}日超で True（初回も True）。"
-    "FYは4月開始。"
+    f"注) 当月は sales_details_snapshots を洗い替え採用。新規納品判定は ユニークコード_YJ 単位で直前取引から{LOOKBACK_DAYS_NEW}日超を True（初回も True）。FYは4月開始。"
 )
