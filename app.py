@@ -7,38 +7,23 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # ============================================================
-# Strategic Sales Console (Full)
-# - Data: BigQuery sales_history_2year (raw; NO modification)
-# - Key: ユニークコード_YJ (= 得意先コード×YJコード) を新規納品判定に使用
-# - FY: 4月開始（年度 = YEAR(売上日 - 3ヶ月)）
+# Strategic Sales Console (FULL / Robust BigQuery Loader)
+# - Reads BigQuery table: sales_history_2year (raw; NO modification)
+# - Fixes BadRequest issues by querying SELECT * and validating columns in Python
+# - New-delivery judge uses ユニークコード_YJ (customer_code × YJ)
+# - FY: April start
 # - Features:
-#   ① 年度内 売上/利益/利益率 + 昨年比較（ランキング→ドリルダウン）
-#   ② 新規納品サマリー（昨日/週/月/年度）→得意先→品名
-#   ③ 上昇/下降 得意先差額ランキング → 品名一覧（売上/利益差）
-#
-# Optional:
-#   - 薬効(小分類) を表示したい場合は、JAN→薬効小分類名 のマスタを読み込んでJOIN可能
-#   - ここでは「任意」でONにできるようにしています（列名は環境に合わせて設定）
+#   ① FY-to-date sales/profit/margin + last-year comparison (ranking + drilldown)
+#   ② New delivery summary (Yesterday/Week/Month/FY) + drilldown
+#   ③ Lost/Growth customer ranking by diff (FY-to-date vs last-year-to-date) + item list
 # ============================================================
 
 # ----------------------------
-# CONFIG (CHANGE ONLY IF NEEDED)
+# CONFIG
 # ----------------------------
 BQ_PROJECT = "salesdb-479915"
 TABLE_SALES_2Y = f"{BQ_PROJECT}.sales_data.sales_history_2year"
-
-# Optional master mapping for 薬効小分類 (JAN -> 薬効小分類名)
-# 例: VIEW_JAN_MASTER = f"{BQ_PROJECT}.sales_data.vw_dim_base_price_master_final"
-# ただし列名が環境により異なるため、下の SQL をあなたの列名に合わせて調整してください。
-ENABLE_YAKKO = False
-VIEW_JAN_MASTER = f"{BQ_PROJECT}.sales_data.vw_dim_base_price_master_final"
-JAN_MASTER_SQL = f"""
-SELECT
-  -- ↓↓↓ あなたのVIEWの列名に合わせて変更してください（例）
-  jan_code AS JANコード,
-  yakko_small_name AS 薬効小分類名
-FROM `{VIEW_JAN_MASTER}`
-"""
+LOOKBACK_DAYS_NEW = 365  # New delivery: no sales in past 365 days
 
 st.set_page_config(page_title="Strategic Sales Console", layout="wide")
 
@@ -51,7 +36,7 @@ def get_bq_client():
     return bigquery.Client(credentials=credentials, project=key_dict["project_id"])
 
 # ----------------------------
-# Helpers (FY: April start)
+# FY helpers (April start)
 # ----------------------------
 def fy_year(d: date) -> int:
     return d.year if d.month >= 4 else d.year - 1
@@ -63,7 +48,6 @@ def same_day_last_year(d: date) -> date:
     try:
         return date(d.year - 1, d.month, d.day)
     except ValueError:
-        # 2/29 -> 2/28
         return date(d.year - 1, d.month, 28)
 
 def yen(x) -> str:
@@ -73,80 +57,75 @@ def yen(x) -> str:
         return ""
 
 # ----------------------------
-# Loaders
+# Robust loader (prevents BadRequest from missing columns)
 # ----------------------------
 @st.cache_data(ttl=300)
 def load_sales_2y():
     client = get_bq_client()
-    q = f"""
-    WITH src AS (
-      SELECT
-        得意先コード,
-        得意先名,
-        商品コード,
-        商品名,
-        包装単位,
-        JANコード,
-        YJコード,
-        ユニークコード_YJ,
-        合計金額,
-        粗利,
-        販売日
-      FROM `{TABLE_SALES_2Y}`
-    ),
-    dt AS (
-      SELECT
-        *,
-        COALESCE(
-          SAFE.PARSE_DATE('%Y%m%d', 販売日),
-          SAFE.PARSE_DATE('%Y-%m-%d', 販売日),
-          SAFE.PARSE_DATE('%Y/%m/%d', 販売日)
-        ) AS 売上日
-      FROM src
-    )
-    SELECT * FROM dt
-    WHERE 売上日 IS NOT NULL
-    """
-    df = client.query(q).to_dataframe()
 
-    # Types
-    df["売上日"] = pd.to_datetime(df["売上日"]).dt.date
+    q = f"SELECT * FROM `{TABLE_SALES_2Y}`"
+    try:
+        df = client.query(q).to_dataframe()
+    except Exception as e:
+        # Streamlit Cloud redacts, but str(e) usually contains safe hints
+        st.error("BigQuery query failed (BadRequest/permission/location/etc).")
+        st.write(str(e))
+        st.stop()
+
+    # Required columns (based on your schema)
+    required = ["得意先コード", "得意先名", "商品名", "合計金額", "粗利", "販売日", "YJコード", "ユニークコード_YJ"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(f"sales_history_2year に必要列が見つかりません: {missing}")
+        st.write("実際に取得できた列名一覧:", list(df.columns))
+        st.stop()
+
+    # --- Date parse: 販売日 (STRING) supports YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD etc.
+    s = df["販売日"].astype(str).str.strip()
+
+    d1 = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    d2 = pd.to_datetime(s, errors="coerce")
+    d = d1.fillna(d2)
+
+    df["売上日"] = d.dt.date
+    df = df[df["売上日"].notna()].copy()
+
+    # --- Numeric
     df["売上額"] = pd.to_numeric(df["合計金額"], errors="coerce").fillna(0)
     df["利益"] = pd.to_numeric(df["粗利"], errors="coerce").fillna(0)
-    df["利益率"] = df.apply(lambda r: (r["利益"] / r["売上額"]) if r["売上額"] else 0, axis=1)
 
+    # --- FY & month key
     df["年度"] = df["売上日"].apply(fy_year)
     df["売上月キー"] = pd.to_datetime(df["売上日"]).dt.strftime("%Y-%m")
 
-    # keys
+    # --- keys
     df["得意先コード"] = df["得意先コード"].astype(str)
     df["YJコード"] = df["YJコード"].astype(str)
     df["ユニークコード_YJ"] = df["ユニークコード_YJ"].astype(str)
 
-    return df
+    # --- margin
+    df["利益率"] = df.apply(lambda r: (r["利益"] / r["売上額"]) if r["売上額"] else 0, axis=1)
 
-@st.cache_data(ttl=300)
-def load_yakko_master():
-    if not ENABLE_YAKKO:
-        return pd.DataFrame(columns=["JANコード", "薬効小分類名"])
-    client = get_bq_client()
-    try:
-        df = client.query(JAN_MASTER_SQL).to_dataframe()
-        df["JANコード"] = df["JANコード"].astype(str)
-        return df.dropna(subset=["JANコード"]).drop_duplicates("JANコード")
-    except Exception:
-        return pd.DataFrame(columns=["JANコード", "薬効小分類名"])
+    # Optional cols used in drilldown (create if absent)
+    for col in ["包装単位", "JANコード"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df
 
 def add_new_delivery_flag_by_unique_yj(df_sales: pd.DataFrame, lookback_days=365) -> pd.DataFrame:
     """
-    ユニークコード_YJ 単位で新規納品判定。
-    直前取引からlookback_days超なら新規（初回も新規）。
+    New delivery flag by ユニークコード_YJ:
+      - First appearance => True
+      - If previous sale date gap > lookback_days => True
     """
     df = df_sales.copy()
     df = df.sort_values(["ユニークコード_YJ", "売上日"])
+
     df["prev_date"] = df.groupby("ユニークコード_YJ")["売上日"].shift(1)
     df["gap_days"] = (pd.to_datetime(df["売上日"]) - pd.to_datetime(df["prev_date"])).dt.days
     df["is_new_delivery"] = df["prev_date"].isna() | (df["gap_days"] > lookback_days)
+
     return df
 
 def summarize(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
@@ -157,35 +136,27 @@ def summarize(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     g["利益率"] = g.apply(lambda r: (r["利益"] / r["売上"]) if r["売上"] else 0, axis=1)
     return g
 
-def join_yj_label(df: pd.DataFrame) -> pd.DataFrame:
+def add_yj_rep_name(df_yj_agg: pd.DataFrame, df_base: pd.DataFrame) -> pd.DataFrame:
     """
-    YJコードの代表商品名を付与（見やすさのため）
+    Attach representative 商品名 for each YJコード based on max sales
     """
-    if "YJコード" not in df.columns:
-        return df
-    # 代表商品名（売上額最大の名称）
-    tmp = df_sales.groupby(["YJコード", "商品名"], dropna=False)["売上額"].sum().reset_index()
+    if "YJコード" not in df_yj_agg.columns or "YJコード" not in df_base.columns:
+        return df_yj_agg
+
+    tmp = df_base.groupby(["YJコード", "商品名"], dropna=False)["売上額"].sum().reset_index()
     rep = tmp.sort_values(["YJコード", "売上額"], ascending=[True, False]).drop_duplicates("YJコード")
     rep = rep.rename(columns={"商品名": "代表商品名"}).drop(columns=["売上額"])
-    return df.merge(rep, on="YJコード", how="left")
+    return df_yj_agg.merge(rep, on="YJコード", how="left")
 
 # ============================================================
-# Main
+# MAIN
 # ============================================================
 df_sales = load_sales_2y()
+df_sales = add_new_delivery_flag_by_unique_yj(df_sales, lookback_days=LOOKBACK_DAYS_NEW)
+
 if df_sales.empty:
-    st.error("sales_history_2year が空です。BigQueryテーブルを確認してください。")
+    st.error("データが空です。BigQueryテーブルを確認してください。")
     st.stop()
-
-df_sales = add_new_delivery_flag_by_unique_yj(df_sales)
-
-# Optional 薬効(小分類)
-df_yakko = load_yakko_master()
-if ENABLE_YAKKO and not df_yakko.empty:
-    df_sales["JANコード"] = df_sales["JANコード"].astype(str)
-    df_sales = df_sales.merge(df_yakko, on="JANコード", how="left")
-else:
-    df_sales["薬効小分類名"] = None
 
 today = datetime.now().date()
 yesterday = today - timedelta(days=1)
@@ -201,7 +172,9 @@ fy1 = fy0 - 1
 fy1_start = date(fy1, 4, 1)
 fy1_end = same_day_last_year(today)
 
-# Sidebar Filters
+# ------------------------------------------------------------
+# Sidebar filters (optional)
+# ------------------------------------------------------------
 st.sidebar.title("🎮 表示設定")
 search_cust = st.sidebar.text_input("得意先検索（部分一致）", "")
 search_item = st.sidebar.text_input("品名検索（部分一致）", "")
@@ -213,7 +186,7 @@ if search_item.strip():
     df_view = df_view[df_view["商品名"].astype(str).str.contains(search_item.strip(), na=False)]
 
 # ============================================================
-# ① 年度内 売上・利益・利益率 / 昨年比較（ランキング→ドリルダウン）
+# ① FY-to-date Sales/Profit/Margin + YoY compare
 # ============================================================
 st.header("① 年度内 売上・利益・利益率 / 昨年比較（ランキング→ドリルダウン）")
 
@@ -227,7 +200,7 @@ c2.metric("利益（今年度内）", yen(df_fy0["利益"].sum()))
 c3.metric("利益率（今年度内）", f"{(df_fy0['利益'].sum()/df_fy0['売上額'].sum()*100) if df_fy0['売上額'].sum() else 0:.2f}%")
 c4.metric("売上前年差（今年-昨年）", yen(df_fy0["売上額"].sum() - df_fy1["売上額"].sum()))
 
-tab_cust, tab_yj = st.tabs(["🏥 得意先ランキング", "💊 成分（YJ）ランキング"])
+tab_cust, tab_yj = st.tabs(["🏥 得意先ランキング", "💊 YJランキング"])
 
 with tab_cust:
     topn = st.slider("表示件数", 10, 100, 30, key="topn_cust_1")
@@ -243,8 +216,12 @@ with tab_cust:
     st.dataframe(
         show[["得意先名", "売上_今年", "利益_今年", "利益率_今年", "売上_昨年", "売上前年差", "利益前年差"]]
         .style.format({
-            "売上_今年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}", "利益率_今年": "{:.2%}",
-            "売上_昨年": "¥{:,.0f}", "売上前年差": "¥{:,.0f}", "利益前年差": "¥{:,.0f}"
+            "売上_今年": "¥{:,.0f}",
+            "利益_今年": "¥{:,.0f}",
+            "利益率_今年": "{:.2%}",
+            "売上_昨年": "¥{:,.0f}",
+            "売上前年差": "¥{:,.0f}",
+            "利益前年差": "¥{:,.0f}",
         }),
         use_container_width=True
     )
@@ -254,7 +231,7 @@ with tab_cust:
         dd = df_fy0[df_fy0["得意先名"] == sel_c].copy()
         dd_yj = dd.groupby(["YJコード"], dropna=False).agg(売上=("売上額", "sum"), 利益=("利益", "sum")).reset_index()
         dd_yj["利益率"] = dd_yj.apply(lambda r: (r["利益"]/r["売上"]) if r["売上"] else 0, axis=1)
-        dd_yj = join_yj_label(dd_yj).sort_values("売上", ascending=False).head(50)
+        dd_yj = add_yj_rep_name(dd_yj, df_view).sort_values("売上", ascending=False).head(50)
 
         st.subheader(f"🏥 {sel_c}：YJ別 上位50")
         st.dataframe(
@@ -262,6 +239,10 @@ with tab_cust:
             .style.format({"売上": "¥{:,.0f}", "利益": "¥{:,.0f}", "利益率": "{:.2%}"}),
             use_container_width=True
         )
+
+        # Monthly trend
+        trend = dd.groupby(["売上月キー"], dropna=False)["売上額"].sum().reset_index().sort_values("売上月キー")
+        st.plotly_chart(px.line(trend, x="売上月キー", y="売上額", title="月次推移（今年度内）"), use_container_width=True)
 
 with tab_yj:
     topn = st.slider("表示件数", 10, 100, 30, key="topn_yj_1")
@@ -271,15 +252,19 @@ with tab_yj:
     rank = s0.merge(s1, on="YJコード", how="left", suffixes=("_今年", "_昨年")).fillna(0)
     rank["売上前年差"] = rank["売上_今年"] - rank["売上_昨年"]
     rank["利益前年差"] = rank["利益_今年"] - rank["利益_昨年"]
-    rank = join_yj_label(rank)
 
+    rank = add_yj_rep_name(rank, df_view)
     show = rank.sort_values("売上_今年", ascending=False).head(topn)
 
     st.dataframe(
         show[["YJコード", "代表商品名", "売上_今年", "利益_今年", "利益率_今年", "売上_昨年", "売上前年差", "利益前年差"]]
         .style.format({
-            "売上_今年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}", "利益率_今年": "{:.2%}",
-            "売上_昨年": "¥{:,.0f}", "売上前年差": "¥{:,.0f}", "利益前年差": "¥{:,.0f}"
+            "売上_今年": "¥{:,.0f}",
+            "利益_今年": "¥{:,.0f}",
+            "利益率_今年": "{:.2%}",
+            "売上_昨年": "¥{:,.0f}",
+            "売上前年差": "¥{:,.0f}",
+            "利益前年差": "¥{:,.0f}",
         }),
         use_container_width=True
     )
@@ -298,7 +283,7 @@ with tab_yj:
         )
 
 # ============================================================
-# ② 新規納品サマリー（ユニークコード_YJ：過去1年なし）
+# ② New Delivery Summary (by ユニークコード_YJ)
 # ============================================================
 st.divider()
 st.header("② 新規納品サマリー（得意先×YJ：過去1年売上なし）")
@@ -322,21 +307,21 @@ c2.metric("金額（売上）", yen(new_df["売上額"].sum()))
 c3.metric("品目数（YJ数）", f"{new_df['YJコード'].nunique():,}")
 c4.metric("利益率", f"{(new_df['利益'].sum()/new_df['売上額'].sum()*100) if new_df['売上額'].sum() else 0:.2f}%")
 
-with st.expander("ドリルダウン（得意先 → 品名一覧）", expanded=False):
+with st.expander("ドリルダウン（得意先 → 品目一覧）", expanded=False):
     cust_sum = new_df.groupby(["得意先名", "得意先コード"], dropna=False)["売上額"].sum().sort_values(ascending=False).reset_index()
     cust_list = cust_sum["得意先名"].head(200).tolist()
 
     sel = st.selectbox("得意先を選択", ["-- 選択 --"] + cust_list, key="new_dd_cust")
     if sel != "-- 選択 --":
         d = new_df[new_df["得意先名"] == sel].copy()
-        # YJ単位でまとめて見やすく（包装/JANが複数でもYJで統合）
+
         d2 = d.groupby(["YJコード"], dropna=False).agg(
             売上=("売上額", "sum"),
             利益=("利益", "sum"),
-            明細行数=("売上額", "size")
+            明細行数=("売上額", "size"),
         ).reset_index()
         d2["利益率"] = d2.apply(lambda r: (r["利益"]/r["売上"]) if r["売上"] else 0, axis=1)
-        d2 = join_yj_label(d2).sort_values("売上", ascending=False)
+        d2 = add_yj_rep_name(d2, df_view).sort_values("売上", ascending=False)
 
         st.subheader(f"🏥 {sel}：新規納品（YJ別）")
         st.dataframe(
@@ -346,30 +331,26 @@ with st.expander("ドリルダウン（得意先 → 品名一覧）", expanded=
         )
 
 # ============================================================
-# ③ 下降 / 上昇 得意先差額ランキング（今年度内 vs 昨年度同日まで）
+# ③ Lost / Growth customer diff ranking (FY-to-date vs last-year-to-date)
 # ============================================================
 st.divider()
 st.header("③ 下降 / 上昇 得意先差額ランキング（得意先→品目一覧）")
 
-# FY集計（得意先×YJ単位）
 g0 = df_fy0.groupby(["得意先名", "得意先コード", "YJコード"], dropna=False).agg(
     売上_今年=("売上額", "sum"),
-    利益_今年=("利益", "sum")
+    利益_今年=("利益", "sum"),
 ).reset_index()
 
 g1 = df_fy1.groupby(["得意先名", "得意先コード", "YJコード"], dropna=False).agg(
     売上_昨年=("売上額", "sum"),
-    利益_昨年=("利益", "sum")
+    利益_昨年=("利益", "sum"),
 ).reset_index()
 
 m = g0.merge(g1, on=["得意先名", "得意先コード", "YJコード"], how="outer").fillna(0)
 m["売上差"] = m["売上_今年"] - m["売上_昨年"]
 m["利益差"] = m["利益_今年"] - m["利益_昨年"]
+m = add_yj_rep_name(m, df_view)
 
-# 代表商品名を付与
-m = join_yj_label(m)
-
-# 得意先単位の差額ランキング
 cust = m.groupby(["得意先名", "得意先コード"], dropna=False).agg(
     売上差=("売上差", "sum"),
     利益差=("利益差", "sum"),
@@ -387,9 +368,11 @@ with tab_lost:
     st.dataframe(
         loss[["得意先名", "売上差", "利益差", "売上_今年", "利益_今年", "利益率_今年"]]
         .style.format({
-            "売上差": "¥{:,.0f}", "利益差": "¥{:,.0f}",
-            "売上_今年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}",
-            "利益率_今年": "{:.2%}"
+            "売上差": "¥{:,.0f}",
+            "利益差": "¥{:,.0f}",
+            "売上_今年": "¥{:,.0f}",
+            "利益_今年": "¥{:,.0f}",
+            "利益率_今年": "{:.2%}",
         }),
         use_container_width=True
     )
@@ -397,21 +380,21 @@ with tab_lost:
     sel = st.selectbox("下落得意先を選択（品目一覧へ）", ["-- 選択 --"] + loss["得意先名"].tolist(), key="lost_sel")
     if sel != "-- 選択 --":
         dd = m[m["得意先名"] == sel].sort_values("売上差", ascending=True).head(80)
-        cols = ["YJコード", "代表商品名", "売上_昨年", "売上_今年", "売上差", "利益_昨年", "利益_今年", "利益差"]
-        if ENABLE_YAKKO:
-            # 薬効(小分類)は明細側にある場合のみ（ここでは代表商品名中心のため省略）
-            pass
-
         st.subheader(f"🏥 {sel}：下落品目（売上差の小さい順）上位80")
+
         st.dataframe(
-            dd[cols].style.format({
-                "売上_昨年": "¥{:,.0f}", "売上_今年": "¥{:,.0f}", "売上差": "¥{:,.0f}",
-                "利益_昨年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}", "利益差": "¥{:,.0f}"
+            dd[["YJコード", "代表商品名", "売上_昨年", "売上_今年", "売上差", "利益_昨年", "利益_今年", "利益差"]]
+            .style.format({
+                "売上_昨年": "¥{:,.0f}",
+                "売上_今年": "¥{:,.0f}",
+                "売上差": "¥{:,.0f}",
+                "利益_昨年": "¥{:,.0f}",
+                "利益_今年": "¥{:,.0f}",
+                "利益差": "¥{:,.0f}",
             }),
             use_container_width=True
         )
 
-        # 補助チャート（任意）
         st.plotly_chart(
             px.bar(dd.sort_values("売上差", ascending=True).head(30),
                    x="売上差", y="代表商品名", orientation="h",
@@ -426,9 +409,11 @@ with tab_gain:
     st.dataframe(
         gain[["得意先名", "売上差", "利益差", "売上_今年", "利益_今年", "利益率_今年"]]
         .style.format({
-            "売上差": "¥{:,.0f}", "利益差": "¥{:,.0f}",
-            "売上_今年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}",
-            "利益率_今年": "{:.2%}"
+            "売上差": "¥{:,.0f}",
+            "利益差": "¥{:,.0f}",
+            "売上_今年": "¥{:,.0f}",
+            "利益_今年": "¥{:,.0f}",
+            "利益率_今年": "{:.2%}",
         }),
         use_container_width=True
     )
@@ -436,13 +421,17 @@ with tab_gain:
     sel = st.selectbox("上昇得意先を選択（品目一覧へ）", ["-- 選択 --"] + gain["得意先名"].tolist(), key="gain_sel")
     if sel != "-- 選択 --":
         dd = m[m["得意先名"] == sel].sort_values("売上差", ascending=False).head(80)
-        cols = ["YJコード", "代表商品名", "売上_昨年", "売上_今年", "売上差", "利益_昨年", "利益_今年", "利益差"]
-
         st.subheader(f"🏥 {sel}：上昇品目（売上差の大きい順）上位80")
+
         st.dataframe(
-            dd[cols].style.format({
-                "売上_昨年": "¥{:,.0f}", "売上_今年": "¥{:,.0f}", "売上差": "¥{:,.0f}",
-                "利益_昨年": "¥{:,.0f}", "利益_今年": "¥{:,.0f}", "利益差": "¥{:,.0f}"
+            dd[["YJコード", "代表商品名", "売上_昨年", "売上_今年", "売上差", "利益_昨年", "利益_今年", "利益差"]]
+            .style.format({
+                "売上_昨年": "¥{:,.0f}",
+                "売上_今年": "¥{:,.0f}",
+                "売上差": "¥{:,.0f}",
+                "利益_昨年": "¥{:,.0f}",
+                "利益_今年": "¥{:,.0f}",
+                "利益差": "¥{:,.0f}",
             }),
             use_container_width=True
         )
@@ -454,10 +443,8 @@ with tab_gain:
             use_container_width=True
         )
 
-# ============================================================
-# Notes
-# ============================================================
+# Footer note
 st.caption(
-    "注) 新規納品判定は sales_history_2year の ユニークコード_YJ を使用し、"
-    "直前取引から365日超で True（初回も True）。FYは4月開始。"
+    f"注) 新規納品判定は ユニークコード_YJ 単位。直前取引から{LOOKBACK_DAYS_NEW}日超で True（初回も True）。"
+    "FYは4月開始。"
 )
