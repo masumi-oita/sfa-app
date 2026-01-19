@@ -74,45 +74,41 @@ def safe_parse_date_series(s: pd.Series) -> pd.Series:
 # ----------------------------
 # Loader: SNAPSHOT (sales_history_2year)
 # ----------------------------
-@st.cache_data(ttl=300)
-def load_snapshot_2y():
+@st.cache_data(ttl=1800)
+def load_incremental_this_month():
     client = get_bq_client()
-    q = f"SELECT * FROM `{TABLE_SNAPSHOT_2Y}`"
+    q = f"""
+    SELECT
+      CAST(得意先コード AS STRING) AS 得意先コード,
+      得意先名,
+      支店名,
+      担当社員名,
+      CAST(YJCode AS STRING) AS YJコード,
+      CAST(JAN AS STRING) AS JANコード,
+      CAST(商品コード AS STRING) AS 商品コード,
+      商品名称 AS 商品名,
+      包装単位,
+      CAST(販売日 AS DATE) AS 売上日,
+      CAST(販売数量 AS FLOAT64) AS 数量,
+      CAST(合計金額 AS FLOAT64) AS 合計金額,
+      CAST(粗利 AS FLOAT64) AS 粗利,
+      CAST(単価 AS FLOAT64) AS 単価,
+      CAST(ロットNo AS STRING) AS ロットNo,
+      CAST(使用期限 AS STRING) AS 使用期限
+    FROM `{TABLE_INC}`
+    WHERE CAST(販売日 AS DATE) >= DATE_TRUNC(CURRENT_DATE('Asia/Tokyo'), MONTH)
+    """
+    df = client.query(q).to_dataframe(create_bqstorage_client=False)
 
-    try:
-        df = client.query(q).to_dataframe()
-    except Exception as e:
-        st.error("[SNAPSHOT] BigQuery query failed")
-        st.write(str(e))
-        st.stop()
-
-    required = ["得意先コード", "得意先名", "合計金額", "粗利", "販売日", "YJコード", "ユニークコード_YJ", "商品名"]
-    miss = [c for c in required if c not in df.columns]
-    if miss:
-        st.error(f"[SNAPSHOT] 必要列不足: {miss}")
-        st.write("取得列:", list(df.columns))
-        st.stop()
-
-    df["売上日"] = safe_parse_date_series(df["販売日"]).dt.date
-    df = df[df["売上日"].notna()].copy()
-
+    df["売上日"] = pd.to_datetime(df["売上日"]).dt.date
     df["売上額"] = pd.to_numeric(df["合計金額"], errors="coerce").fillna(0)
     df["利益"] = pd.to_numeric(df["粗利"], errors="coerce").fillna(0)
 
     df["年度"] = df["売上日"].apply(fy_year)
     df["売上月キー"] = pd.to_datetime(df["売上日"]).dt.strftime("%Y-%m")
 
-    df["得意先コード"] = df["得意先コード"].astype(str)
-    df["YJコード"] = df["YJコード"].astype(str)
-    df["ユニークコード_YJ"] = df["ユニークコード_YJ"].astype(str)
-
+    df["ユニークコード_YJ"] = df["得意先コード"].astype(str) + "_" + df["YJコード"].astype(str)
     df["利益率"] = df.apply(lambda r: (r["利益"] / r["売上額"]) if r["売上額"] else 0, axis=1)
-
-    # Optional columns for display / compatibility
-    for col in ["包装単位", "JANコード", "商品コード", "ロットNo", "使用期限", "数量", "単価"]:
-        if col not in df.columns:
-            df[col] = ""
-
     return df
 
 # ----------------------------
