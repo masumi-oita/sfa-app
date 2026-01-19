@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
@@ -9,19 +10,22 @@ BQ_LOCATION = "asia-northeast1"
 
 st.set_page_config(page_title="SFA", layout="wide")
 
+# -----------------------------
+# BigQuery client (ONLY ONE WAY)
+# -----------------------------
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    # Secretsにjson_keyがある前提
-    if "gcp_service_account" not in st.secrets or "json_key" not in st.secrets["gcp_service_account"]:
-        st.error("Streamlit Secrets に [gcp_service_account].json_key が見つかりません。")
+    # Secrets: [gcp_service_account].json_key という1本のJSON文字列を想定
+    try:
+        sa_json_str = st.secrets["gcp_service_account"]["json_key"]
+    except Exception:
+        st.error("Streamlit Secrets に [gcp_service_account].json_key がありません。")
         st.stop()
-
-    sa_json_str = st.secrets["gcp_service_account"]["json_key"]
 
     try:
         sa_info = json.loads(sa_json_str)
     except Exception as e:
-        st.error("Secrets の json_key が JSON としてパースできません。TOMLの貼り方（改行/ダブルクォート）を確認してください。")
+        st.error("Secrets の json_key が JSON として読めません（TOMLの貼り方/改行/クォートを確認）。")
         st.exception(e)
         st.stop()
 
@@ -36,31 +40,42 @@ def get_bq_client() -> bigquery.Client:
         location=BQ_LOCATION,
     )
 
-def bq_health_check():
+def bq_query_df(sql: str) -> pd.DataFrame:
+    """BigQuery実行は必ずここを通す（TransportError封じ）"""
     client = get_bq_client()
-    try:
-        df = client.query("SELECT 1 AS ok").to_dataframe(create_bqstorage_client=False)
-        return int(df.iloc[0]["ok"]) == 1
-    except Exception as e:
-        st.error("BigQuery 接続に失敗しました（Secrets/権限/プロジェクト/ロケーションを確認）。")
-        st.exception(e)
-        st.stop()
+    job = client.query(sql)
+    return job.to_dataframe(create_bqstorage_client=False)
+
+# -----------------------------
+# Health check
+# -----------------------------
+@st.cache_data(ttl=600)
+def health_check() -> bool:
+    df = bq_query_df("SELECT 1 AS ok")
+    return int(df.iloc[0]["ok"]) == 1
 
 @st.cache_data(ttl=3600)
-def load_any_table_example():
-    # まずは接続確認できる簡単な例
-    client = get_bq_client()
-    q = f"""
-    SELECT
-      CURRENT_DATE("Asia/Tokyo") AS today
-    """
-    return client.query(q).to_dataframe(create_bqstorage_client=False)
+def load_today() -> pd.DataFrame:
+    return bq_query_df('SELECT CURRENT_DATE("Asia/Tokyo") AS today')
 
+# -----------------------------
+# UI
+# -----------------------------
 st.title("SFA")
 
 with st.spinner("BigQuery 接続確認中..."):
-    ok = bq_health_check()
-st.success("BigQuery 接続OK")
+    try:
+        ok = health_check()
+    except Exception as e:
+        st.error("BigQuery接続で例外が発生しました（右ログの TransportError は“別経路でClient生成”が原因です）。")
+        st.exception(e)
+        st.stop()
 
-df = load_any_table_example()
-st.dataframe(df, use_container_width=True)
+if ok:
+    st.success("BigQuery 接続OK")
+else:
+    st.error("BigQuery 接続NG")
+    st.stop()
+
+df = load_today()
+st.dataframe(df, width="stretch")
