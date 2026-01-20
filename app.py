@@ -20,19 +20,17 @@ VIEW_CONVERSION_MONTH = f"{PROJECT_ID}.{DATASET}.v_new_adoption_conversion_month
 # =========================
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    """
-    Streamlit Secrets に
-    [gcp_service_account]
-    json_key = """{...}"""
-    という形で入っている前提
-    """
+    # Secrets 形式：
+    # [gcp_service_account]
+    # json_key = """{...}"""
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Secrets に gcp_service_account がありません")
+        raise RuntimeError("Secrets に [gcp_service_account] がありません")
 
-    if "json_key" not in st.secrets["gcp_service_account"]:
-        raise RuntimeError("Secrets に json_key がありません")
+    sa_block = st.secrets["gcp_service_account"]
+    if "json_key" not in sa_block:
+        raise RuntimeError("Secrets の [gcp_service_account] に json_key がありません")
 
-    sa_info = json.loads(st.secrets["gcp_service_account"]["json_key"])
+    sa_info = json.loads(sa_block["json_key"])  # ← ここで JSON を dict に戻す
 
     credentials = service_account.Credentials.from_service_account_info(sa_info)
 
@@ -48,20 +46,14 @@ def get_bq_client() -> bigquery.Client:
 @st.cache_data(ttl=600)
 def run_query(sql: str, params=None) -> pd.DataFrame:
     client = get_bq_client()
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=params or []
-    )
+    job_config = bigquery.QueryJobConfig(query_parameters=params or [])
     job = client.query(sql, job_config=job_config)
     return job.result().to_dataframe(create_bqstorage_client=False)
 
 # =========================
 # UI
 # =========================
-st.set_page_config(
-    page_title="New Adoption Dashboard",
-    layout="wide",
-)
-
+st.set_page_config(page_title="New Adoption Dashboard", layout="wide")
 st.title("📊 New Adoption Dashboard")
 st.caption("Target / Realized / Conversion（月次）")
 
@@ -73,21 +65,15 @@ SELECT DISTINCT month_ym
 FROM `{VIEW_TARGET_MONTH}`
 ORDER BY month_ym DESC
 """
-
 months_df = run_query(sql_months)
 
 if months_df.empty:
-    st.error("month_ym が取得できません")
+    st.error("month_ym が取得できません（VIEW_TARGET_MONTH を確認）")
     st.stop()
 
-month_ym = st.selectbox(
-    "month_ym (YYYY-MM)",
-    months_df["month_ym"].tolist()
-)
+month_ym = st.selectbox("month_ym (YYYY-MM)", months_df["month_ym"].tolist())
 
-param_month = [
-    bigquery.ScalarQueryParameter("month_ym", "STRING", month_ym)
-]
+param_month = [bigquery.ScalarQueryParameter("month_ym", "STRING", month_ym)]
 
 # =========================
 # Target KPI
@@ -103,7 +89,6 @@ SELECT
 FROM `{VIEW_TARGET_MONTH}`
 WHERE month_ym = @month_ym
 """
-
 df_target = run_query(sql_target, param_month)
 
 # =========================
@@ -120,7 +105,6 @@ SELECT
 FROM `{VIEW_REALIZED_MONTH}`
 WHERE month_ym = @month_ym
 """
-
 df_realized = run_query(sql_realized, param_month)
 
 # =========================
@@ -138,14 +122,12 @@ SELECT
 FROM `{VIEW_CONVERSION_MONTH}`
 WHERE month_ym = @month_ym
 """
-
 df_conversion = run_query(sql_conversion, param_month)
 
 # =========================
 # KPI Cards
 # =========================
 st.subheader("📌 KPI Summary")
-
 c1, c2, c3, c4 = st.columns(4)
 
 if not df_target.empty:
@@ -160,7 +142,6 @@ if not df_realized.empty:
 # Tables
 # =========================
 st.divider()
-
 col1, col2 = st.columns(2)
 
 with col1:
@@ -172,7 +153,6 @@ with col2:
     st.dataframe(df_realized, use_container_width=True)
 
 st.divider()
-
 st.subheader("③ Conversion（Target → Realized）")
 st.dataframe(df_conversion, use_container_width=True)
 
