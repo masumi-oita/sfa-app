@@ -1,26 +1,21 @@
-import streamlit as st
 import pandas as pd
-import json
+import streamlit as st
+
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, Forbidden, BadRequest
 
 # =========================
 # CONFIG
 # =========================
 PROJECT_ID = "salesdb-479915"
-DATASET = "sales_data"
-BQ_LOCATION = "asia-northeast1"
+DATASET_ID = "sales_data"
 
-# ---- Primary (expected) views ----
-VIEW_TARGET_MONTH_PRIMARY = f"{PROJECT_ID}.{DATASET}.v_target_new_adoption_kpi_month"
-VIEW_REALIZED_MONTH_PRIMARY = f"{PROJECT_ID}.{DATASET}.v_realized_new_adoption_kpi_month"
-VIEW_CONVERSION_MONTH_PRIMARY = f"{PROJECT_ID}.{DATASET}.v_new_adoption_conversion_month"
+# 使うVIEW（あなたの現状に合わせて固定）
+VIEW_UNIFIED_KPI = f"{PROJECT_ID}.{DATASET_ID}.v_new_adoption_kpi_unified"
+VIEW_CUSTOMER_SUMMARY = f"{PROJECT_ID}.{DATASET_ID}.v_new_adoption_customer_summary"
+VIEW_DAILY_DRILL = f"{PROJECT_ID}.{DATASET_ID}.v_new_adoption_daily_drill"
 
-# ---- Fallback views (known to exist in your project history) ----
-VIEW_TARGET_FALLBACK = f"{PROJECT_ID}.{DATASET}.v_target_new_adoption"
-VIEW_REALIZED_FALLBACK = f"{PROJECT_ID}.{DATASET}.v_realized_new_adoption_kpi"
-VIEW_CONVERSION_FALLBACK = f"{PROJECT_ID}.{DATASET}.v_new_adoption_conversion_month"
 
 # =========================
 # BigQuery Client
@@ -28,296 +23,253 @@ VIEW_CONVERSION_FALLBACK = f"{PROJECT_ID}.{DATASET}.v_new_adoption_conversion_mo
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
     """
-    Streamlit Secrets:
+    Streamlit Cloud の Secrets に以下の形式で入っている前提:
     [gcp_service_account]
-    json_key = """{...}"""
+    type = "service_account"
+    project_id = "..."
+    private_key_id = "..."
+    private_key = """-----BEGIN PRIVATE KEY-----
+    ...
+    -----END PRIVATE KEY-----"""
+    client_email = "..."
+    ...
     """
-    if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Secrets に [gcp_service_account] がありません")
-    sa_block = st.secrets["gcp_service_account"]
-    if "json_key" not in sa_block:
-        raise RuntimeError("Secrets の [gcp_service_account] に json_key がありません")
+    sa = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(sa)
+    return bigquery.Client(project=sa.get("project_id", PROJECT_ID), credentials=creds)
 
-    sa_info = json.loads(sa_block["json_key"])
-    credentials = service_account.Credentials.from_service_account_info(sa_info)
 
-    return bigquery.Client(
-        project=PROJECT_ID,
-        credentials=credentials,
-        location=BQ_LOCATION,
-    )
-
-# =========================
-# Helpers
-# =========================
-@st.cache_data(ttl=600)
-def run_query(sql: str, params=None) -> pd.DataFrame:
+@st.cache_data(ttl=600, show_spinner=False)
+def run_query(sql: str) -> pd.DataFrame:
     client = get_bq_client()
-    job_config = bigquery.QueryJobConfig(query_parameters=params or [])
-    job = client.query(sql, job_config=job_config)
+    job = client.query(sql)
     return job.result().to_dataframe(create_bqstorage_client=False)
 
-@st.cache_data(ttl=600)
-def table_exists(full_name: str) -> bool:
+
+def show_bq_error(e: Exception):
+    # Streamlit Cloud は詳細が伏せられるので、ユーザーが見て判断できる最低限を表示
+    st.error("BigQuery 実行でエラーが出ました。")
+    st.code(str(e))
+
+
+# =========================
+# SQL Builders
+# =========================
+def sql_months() -> str:
+    # month / month_ym の揺れ対策：customer_summary 側から取る（あなたの結果に month がある）
+    return f"""
+    SELECT DISTINCT
+      CAST(month AS STRING) AS month_ym
+    FROM `{VIEW_CUSTOMER_SUMMARY}`
+    ORDER BY month_ym DESC
     """
-    BigQuery VIEW/TABLE existence check via INFORMATION_SCHEMA.
-    full_name: "project.dataset.table"
-    """
-    try:
-        project, dataset, table = full_name.split(".")
-    except ValueError:
-        return False
 
-    sql = f"""
-    SELECT 1
-    FROM `{project}.{dataset}.INFORMATION_SCHEMA.TABLES`
-    WHERE table_name = @t
-    LIMIT 1
-    """
-    params = [bigquery.ScalarQueryParameter("t", "STRING", table)]
-    df = run_query(sql, params)
-    return not df.empty
 
-def safe_query(sql: str, params=None, empty_columns=None, context_name="") -> pd.DataFrame:
-    """
-    Execute query safely.
-    If NotFound / errors occur, return empty DF.
-    """
-    try:
-        return run_query(sql, params)
-    except NotFound as e:
-        st.warning(f"NotFound: {context_name}（参照先が存在しない可能性）")
-        st.caption(str(e))
-    except Exception as e:
-        st.error(f"Query error: {context_name}")
-        st.caption(str(e))
-    if empty_columns:
-        return pd.DataFrame(columns=empty_columns)
-    return pd.DataFrame()
+def sql_kpi_month(month_ym: str) -> str:
+    # v_new_adoption_kpi_unified から Target/Realized/Conversion を集計
+    # - yj_code 空白は NO_YJ として扱う（空白は活かす方針は維持しつつ KPI では除外）
+    # - conversion は items と customers の2軸
+    return f"""
+    WITH base AS (
+      SELECT
+        mode,
+        -- month_ym がある前提（あなたの最新結果で month_ym を出している）
+        CAST(month_ym AS STRING) AS month_ym,
+        CAST(customer_code AS STRING) AS customer_code,
+        CAST(yj_code AS STRING) AS yj_code,
+        COALESCE(NULLIF(CAST(yj_code AS STRING), ''), 'NO_YJ') AS yj_code_norm,
+        CAST(sales_amount AS FLOAT64) AS sales_amount,
+        CAST(gross_profit AS FLOAT64) AS gross_profit
+      FROM `{VIEW_UNIFIED_KPI}`
+      WHERE CAST(month_ym AS STRING) = '{month_ym}'
+    ),
+    agg AS (
+      SELECT
+        month_ym,
 
-# =========================
-# Page
-# =========================
-st.set_page_config(page_title="New Adoption Dashboard", layout="wide")
-st.title("📊 New Adoption Dashboard")
-st.caption("Target / Realized / Conversion（月次）")
+        -- TARGET
+        COUNT(DISTINCT IF(mode='target', customer_code, NULL)) AS target_customers,
+        COUNT(DISTINCT IF(mode='target' AND yj_code_norm <> 'NO_YJ', CONCAT(customer_code,'_',yj_code_norm), NULL)) AS target_items,
+        COUNTIF(mode='target' AND yj_code_norm='NO_YJ') AS target_no_yj_rows,
 
-# =========================
-# Resolve views (existence-based)
-# =========================
-view_target_month = VIEW_TARGET_MONTH_PRIMARY if table_exists(VIEW_TARGET_MONTH_PRIMARY) else None
-view_realized_month = VIEW_REALIZED_MONTH_PRIMARY if table_exists(VIEW_REALIZED_MONTH_PRIMARY) else None
-view_conversion_month = (
-    VIEW_CONVERSION_MONTH_PRIMARY if table_exists(VIEW_CONVERSION_MONTH_PRIMARY)
-    else (VIEW_CONVERSION_FALLBACK if table_exists(VIEW_CONVERSION_FALLBACK) else None)
-)
-
-# Provide fallbacks for KPI queries if month views are missing
-view_target_fallback = VIEW_TARGET_FALLBACK if table_exists(VIEW_TARGET_FALLBACK) else None
-view_realized_fallback = VIEW_REALIZED_FALLBACK if table_exists(VIEW_REALIZED_FALLBACK) else None
-
-with st.expander("🔧 Debug: Using Views", expanded=False):
-    st.write({
-        "TARGET_MONTH": view_target_month,
-        "REALIZED_MONTH": view_realized_month,
-        "CONVERSION_MONTH": view_conversion_month,
-        "TARGET_FALLBACK": view_target_fallback,
-        "REALIZED_FALLBACK": view_realized_fallback,
-    })
-
-if view_conversion_month is None:
-    st.error("conversion（月次）VIEW が見つかりません。`v_new_adoption_conversion_month` の存在を確認してください。")
-    st.stop()
-
-# =========================
-# Month selector (from conversion view: most stable)
-# =========================
-sql_months = f"""
-SELECT DISTINCT month_ym
-FROM `{view_conversion_month}`
-ORDER BY month_ym DESC
-"""
-months_df = safe_query(sql_months, context_name="months (from conversion view)", empty_columns=["month_ym"])
-
-if months_df.empty:
-    st.error("month_ym が取得できません。conversion VIEW の列名を確認してください（month_ym）。")
-    st.stop()
-
-month_ym = st.selectbox("month_ym (YYYY-MM)", months_df["month_ym"].tolist())
-param_month = [bigquery.ScalarQueryParameter("month_ym", "STRING", month_ym)]
-
-# =========================
-# Target KPI（月次）
-# =========================
-if view_target_month:
-    sql_target = f"""
-    SELECT
-      month_ym,
-      target_rows,
-      new_customers_cnt,
-      new_items_cnt,
-      no_yj_cnt,
-      no_yj_ratio
-    FROM `{view_target_month}`
-    WHERE month_ym = @month_ym
-    """
-    df_target = safe_query(
-        sql_target, param_month,
-        empty_columns=["month_ym","target_rows","new_customers_cnt","new_items_cnt","no_yj_cnt","no_yj_ratio"],
-        context_name="target KPI month"
+        -- REALIZED
+        COUNT(DISTINCT IF(mode='realized', customer_code, NULL)) AS realized_customers,
+        COUNT(DISTINCT IF(mode='realized', CONCAT(customer_code,'_',yj_code_norm), NULL)) AS realized_items,
+        SUM(IF(mode='realized', sales_amount, 0.0)) AS realized_sales_sum,
+        SUM(IF(mode='realized', gross_profit, 0.0)) AS realized_gp_sum
+      FROM base
+      GROUP BY month_ym
     )
-elif view_target_fallback:
-    # Build month KPI on the fly from v_target_new_adoption
-    sql_target = f"""
     SELECT
       month_ym,
-      COUNT(*) AS target_rows,
-      COUNT(DISTINCT customer_code) AS new_customers_cnt,
-      COUNT(DISTINCT customer_yj_key) AS new_items_cnt,
-      COUNTIF(yj_code_norm = 'NO_YJ') AS no_yj_cnt,
-      SAFE_DIVIDE(COUNTIF(yj_code_norm = 'NO_YJ'), COUNT(*)) AS no_yj_ratio
-    FROM `{view_target_fallback}`
-    WHERE month_ym = @month_ym
-    GROUP BY month_ym
-    """
-    df_target = safe_query(
-        sql_target, param_month,
-        empty_columns=["month_ym","target_rows","new_customers_cnt","new_items_cnt","no_yj_cnt","no_yj_ratio"],
-        context_name="target KPI month (fallback calc)"
-    )
-else:
-    df_target = pd.DataFrame(columns=["month_ym","target_rows","new_customers_cnt","new_items_cnt","no_yj_cnt","no_yj_ratio"])
 
-# =========================
-# Realized KPI（月次）
-# =========================
-if view_realized_month:
-    sql_realized = f"""
-    SELECT
-      month_ym,
+      target_items,
+      target_customers,
+      target_no_yj_rows,
+      SAFE_DIVIDE(target_no_yj_rows, NULLIF(target_items + target_no_yj_rows, 0)) AS target_no_yj_ratio,
+
       realized_items,
       realized_customers,
       realized_sales_sum,
       realized_gp_sum,
-      SAFE_DIVIDE(realized_gp_sum, realized_sales_sum) AS gross_margin
-    FROM `{view_realized_month}`
-    WHERE month_ym = @month_ym
+      SAFE_DIVIDE(realized_gp_sum, NULLIF(realized_sales_sum, 0)) AS realized_gross_margin,
+
+      SAFE_DIVIDE(realized_items, NULLIF(target_items, 0)) AS conversion_items,
+      SAFE_DIVIDE(realized_customers, NULLIF(target_customers, 0)) AS conversion_customers
+    FROM agg
     """
-    df_realized = safe_query(
-        sql_realized, param_month,
-        empty_columns=["month_ym","realized_items","realized_customers","realized_sales_sum","realized_gp_sum","gross_margin"],
-        context_name="realized KPI month"
-    )
-elif view_realized_fallback:
-    # Build month KPI on the fly from v_realized_new_adoption_kpi
-    sql_realized = f"""
+
+
+def sql_customer_summary(month_ym: str, mode: str) -> str:
+    # month の型は 'YYYY-MM' 想定（あなたの結果が 2026-01）
+    return f"""
     SELECT
-      FORMAT_DATE('%Y-%m', sales_date) AS month_ym,
-      COUNT(DISTINCT CONCAT(customer_code, '_', yj_code_norm)) AS realized_items,
-      COUNT(DISTINCT customer_code) AS realized_customers,
-      SUM(sales_amount) AS realized_sales_sum,
-      SUM(gross_profit) AS realized_gp_sum,
-      SAFE_DIVIDE(SUM(gross_profit), SUM(sales_amount)) AS gross_margin
-    FROM `{view_realized_fallback}`
-    WHERE FORMAT_DATE('%Y-%m', sales_date) = @month_ym
-    GROUP BY month_ym
+      mode,
+      CAST(month AS STRING) AS month_ym,
+      customer_code,
+      customer_name,
+      new_items_cnt,
+      sales_amount,
+      gross_profit,
+      gross_margin,
+      first_sales_date_in_month
+    FROM `{VIEW_CUSTOMER_SUMMARY}`
+    WHERE CAST(month AS STRING) = '{month_ym}'
+      AND mode = '{mode}'
+    ORDER BY sales_amount DESC, gross_profit DESC
     """
-    df_realized = safe_query(
-        sql_realized, param_month,
-        empty_columns=["month_ym","realized_items","realized_customers","realized_sales_sum","realized_gp_sum","gross_margin"],
-        context_name="realized KPI month (fallback calc)"
-    )
-else:
-    df_realized = pd.DataFrame(columns=["month_ym","realized_items","realized_customers","realized_sales_sum","realized_gp_sum","gross_margin"])
+
+
+def sql_daily_drill(month_ym: str, customer_code: str | None) -> str:
+    where_customer = ""
+    if customer_code and customer_code != "ALL":
+        where_customer = f" AND CAST(customer_code AS STRING) = '{customer_code}' "
+
+    return f"""
+    SELECT
+      mode,
+      CAST(month AS STRING) AS month_ym,
+      sales_date,
+      customer_code,
+      customer_name,
+      yj_code,
+      sales_amount,
+      gross_profit,
+      gross_margin,
+      quantity,
+      first_sales_date_in_month,
+      ingredient,
+      item_name,
+      product_name,
+      branch_name,
+      staff_name
+    FROM `{VIEW_DAILY_DRILL}`
+    WHERE CAST(month AS STRING) = '{month_ym}'
+      AND mode = 'realized'
+      {where_customer}
+    ORDER BY sales_date DESC, sales_amount DESC, gross_profit DESC
+    """
+
 
 # =========================
-# Conversion（月次）
+# UI
 # =========================
-sql_conversion = f"""
-SELECT
-  month_ym,
-  target_items,
-  target_customers,
-  realized_items,
-  realized_customers,
-  conversion_items,
-  conversion_customers
-FROM `{view_conversion_month}`
-WHERE month_ym = @month_ym
-"""
-df_conversion = safe_query(
-    sql_conversion, param_month,
-    empty_columns=["month_ym","target_items","target_customers","realized_items","realized_customers","conversion_items","conversion_customers"],
-    context_name="conversion month"
-)
+st.set_page_config(page_title="New Adoption Dashboard", layout="wide")
 
-# =========================
-# KPI cards
-# =========================
-st.subheader("📌 KPI Summary")
-c1, c2, c3, c4 = st.columns(4)
+st.title("📊 New Adoption Dashboard")
+st.caption("Target / Realized / Conversion（月次） — BigQuery VIEW 参照のみ")
 
-# Target cards
-if not df_target.empty:
-    c1.metric("Target Items", f"{int(df_target.loc[0,'new_items_cnt']):,}")
-    c2.metric("Target Customers", f"{int(df_target.loc[0,'new_customers_cnt']):,}")
-else:
-    c1.metric("Target Items", "—")
-    c2.metric("Target Customers", "—")
-
-# Realized cards
-if not df_realized.empty:
-    c3.metric("Realized Sales", f"¥{int(df_realized.loc[0,'realized_sales_sum']):,}")
-    gm = df_realized.loc[0, "gross_margin"]
-    c4.metric("Gross Margin", "—" if pd.isna(gm) else f"{gm:.1%}")
-else:
-    c3.metric("Realized Sales", "—")
-    c4.metric("Gross Margin", "—")
-
-# =========================
-# Tables
-# =========================
-st.divider()
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("① Target New（月次）")
-    st.dataframe(df_target, use_container_width=True)
-
-with col2:
-    st.subheader("② Realized New（月次）")
-    st.dataframe(df_realized, use_container_width=True)
-
-st.divider()
-st.subheader("③ Conversion（Target → Realized）")
-st.dataframe(df_conversion, use_container_width=True)
-
-# =========================
-# Extra: derived conversion rate
-# =========================
-st.subheader("📈 Conversion Rate（計算）")
-
-if not df_conversion.empty:
-    row = df_conversion.iloc[0].to_dict()
-    conv_items = row.get("conversion_items")
-    conv_customers = row.get("conversion_customers")
-    tgt_items = row.get("target_items")
-    tgt_customers = row.get("target_customers")
-
-    rate_items = None
-    rate_customers = None
+# ---- Sidebar
+with st.sidebar:
+    st.header("Filters")
     try:
-        if tgt_items and tgt_items != 0:
-            rate_items = float(conv_items) / float(tgt_items)
-        if tgt_customers and tgt_customers != 0:
-            rate_customers = float(conv_customers) / float(tgt_customers)
-    except Exception:
-        pass
+        months_df = run_query(sql_months())
+        months = months_df["month_ym"].dropna().astype(str).tolist()
+    except Exception as e:
+        show_bq_error(e)
+        st.stop()
 
-    c5, c6 = st.columns(2)
-    c5.metric("Items Conversion", "—" if rate_items is None else f"{rate_items:.1%}")
-    c6.metric("Customers Conversion", "—" if rate_customers is None else f"{rate_customers:.1%}")
-else:
-    st.info("conversion のデータがありません。")
+    if not months:
+        st.warning("month_ym が取得できません。VIEW の month 列/データを確認してください。")
+        st.stop()
 
-st.caption("※ BigQuery VIEW を直接参照（OS v1 準拠） / VIEWが無い場合はフォールバック計算で継続表示します。")
+    default_month = months[0]
+    month_ym = st.selectbox("month_ym (YYYY-MM)", options=months, index=0)
+
+# ---- Main
+try:
+    kpi_df = run_query(sql_kpi_month(month_ym))
+except (NotFound, Forbidden, BadRequest) as e:
+    show_bq_error(e)
+    st.stop()
+except Exception as e:
+    show_bq_error(e)
+    st.stop()
+
+if kpi_df.empty:
+    st.warning("KPI が空です。month_ym、または v_new_adoption_kpi_unified の列（month_ym）を確認してください。")
+    st.stop()
+
+k = kpi_df.iloc[0].to_dict()
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Target（品目）", f"{int(k.get('target_items') or 0):,}")
+c2.metric("Target（得意先）", f"{int(k.get('target_customers') or 0):,}")
+c3.metric("Realized（品目）", f"{int(k.get('realized_items') or 0):,}")
+c4.metric("Realized（得意先）", f"{int(k.get('realized_customers') or 0):,}")
+
+c5, c6, c7, c8 = st.columns(4)
+c5.metric("Realized 売上", f"{float(k.get('realized_sales_sum') or 0):,.0f}")
+c6.metric("Realized 粗利", f"{float(k.get('realized_gp_sum') or 0):,.0f}")
+c7.metric("Realized 粗利率", f"{float(k.get('realized_gross_margin') or 0):.3f}")
+c8.metric("転換率（品目 / 得意先）", f"{float(k.get('conversion_items') or 0):.3f} / {float(k.get('conversion_customers') or 0):.3f}")
+
+with st.expander("KPI 生データ（確認用）", expanded=False):
+    st.dataframe(kpi_df, use_container_width=True)
+
+tab1, tab2 = st.tabs(["🏢 得意先サマリー", "📅 日次ドリル（Realized）"])
+
+with tab1:
+    colA, colB = st.columns([1, 3])
+    with colA:
+        mode = st.radio("mode", options=["realized", "target"], horizontal=True)
+
+    try:
+        df_cs = run_query(sql_customer_summary(month_ym, mode))
+    except Exception as e:
+        show_bq_error(e)
+        st.stop()
+
+    st.subheader(f"得意先サマリー（{mode} / {month_ym}）")
+    st.dataframe(df_cs, use_container_width=True)
+
+with tab2:
+    # realized の customer_code を候補に
+    try:
+        df_realized_customers = run_query(f"""
+        SELECT DISTINCT CAST(customer_code AS STRING) AS customer_code, customer_name
+        FROM `{VIEW_CUSTOMER_SUMMARY}`
+        WHERE CAST(month AS STRING) = '{month_ym}'
+          AND mode = 'realized'
+        ORDER BY customer_code
+        """)
+    except Exception as e:
+        show_bq_error(e)
+        st.stop()
+
+    customer_options = ["ALL"]
+    if not df_realized_customers.empty:
+        customer_options += df_realized_customers["customer_code"].astype(str).tolist()
+
+    customer_code = st.selectbox("customer_code（任意）", options=customer_options, index=0)
+
+    try:
+        df_dd = run_query(sql_daily_drill(month_ym, customer_code))
+    except Exception as e:
+        show_bq_error(e)
+        st.stop()
+
+    st.subheader(f"日次ドリル（realized / {month_ym}）")
+    st.dataframe(df_dd, use_container_width=True)
+
+st.caption("※ 参照先：v_new_adoption_kpi_unified / v_new_adoption_customer_summary / v_new_adoption_daily_drill")
