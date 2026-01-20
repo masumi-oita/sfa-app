@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import json
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -19,14 +20,21 @@ VIEW_CONVERSION_MONTH = f"{PROJECT_ID}.{DATASET}.v_new_adoption_conversion_month
 # =========================
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
+    """
+    Streamlit Secrets に
+    [gcp_service_account]
+    json_key = """{...}"""
+    という形で入っている前提
+    """
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError(
-            "Streamlit Secrets に [gcp_service_account] がありません。"
-        )
+        raise RuntimeError("Secrets に gcp_service_account がありません")
 
-    credentials = service_account.Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"])
-    )
+    if "json_key" not in st.secrets["gcp_service_account"]:
+        raise RuntimeError("Secrets に json_key がありません")
+
+    sa_info = json.loads(st.secrets["gcp_service_account"]["json_key"])
+
+    credentials = service_account.Credentials.from_service_account_info(sa_info)
 
     return bigquery.Client(
         project=PROJECT_ID,
@@ -65,6 +73,7 @@ SELECT DISTINCT month_ym
 FROM `{VIEW_TARGET_MONTH}`
 ORDER BY month_ym DESC
 """
+
 months_df = run_query(sql_months)
 
 if months_df.empty:
@@ -140,24 +149,12 @@ st.subheader("📌 KPI Summary")
 c1, c2, c3, c4 = st.columns(4)
 
 if not df_target.empty:
-    c1.metric(
-        "Target Items",
-        f"{int(df_target.loc[0,'new_items_cnt']):,}"
-    )
-    c2.metric(
-        "Target Customers",
-        f"{int(df_target.loc[0,'new_customers_cnt']):,}"
-    )
+    c1.metric("Target Items", f"{int(df_target.loc[0,'new_items_cnt']):,}")
+    c2.metric("Target Customers", f"{int(df_target.loc[0,'new_customers_cnt']):,}")
 
 if not df_realized.empty:
-    c3.metric(
-        "Realized Sales",
-        f"¥{int(df_realized.loc[0,'realized_sales_sum']):,}"
-    )
-    c4.metric(
-        "Gross Margin",
-        f"{df_realized.loc[0,'gross_margin']:.1%}"
-    )
+    c3.metric("Realized Sales", f"¥{int(df_realized.loc[0,'realized_sales_sum']):,}")
+    c4.metric("Gross Margin", f"{df_realized.loc[0,'gross_margin']:.1%}")
 
 # =========================
 # Tables
@@ -179,9 +176,4 @@ st.divider()
 st.subheader("③ Conversion（Target → Realized）")
 st.dataframe(df_conversion, use_container_width=True)
 
-# =========================
-# Footer
-# =========================
-st.caption(
-    "※ BigQuery VIEW を直接参照（Python側で加工なし）｜OS v1 準拠"
-)
+st.caption("※ BigQuery VIEW を直接参照（OS v1 準拠）")
