@@ -28,13 +28,10 @@ def load_credentials():
     creds = service_account.Credentials.from_service_account_info(sa_info)
     return creds
 
-@st.cache_data(ttl=300)
-def run_query_min(creds):
-    client = bigquery.Client(project=PROJECT_ID, credentials=creds)
-    job = client.query("SELECT 1 AS ok")
-    rows = list(job.result())
-    df = pd.DataFrame([dict(r) for r in rows])
-    return df
+@st.cache_data
+def run_query_min(_creds):
+    client = bigquery.Client(credentials=_creds, project=PROJECT_ID)
+    return client.query("SELECT 1 AS ok").to_dataframe()
 
 st.title("BigQuery 接続 診断（Streamlit Secrets / Service Account）")
 
