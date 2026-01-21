@@ -1,6 +1,5 @@
 streamlit
 pandas
 google-cloud-bigquery
-pandas-gbq
-plotly
-matplotlib
+google-auth
+pyarrow
