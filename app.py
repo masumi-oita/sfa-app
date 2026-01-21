@@ -152,7 +152,7 @@ def diag_block():
     try:
         df = run_query("SELECT 1 AS ok")
         st.success("STEP3 OK: クエリ成功")
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
     except Exception as e:
         st.error("STEP3 FAILED")
         st.exception(e)
