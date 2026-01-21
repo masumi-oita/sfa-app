@@ -5,4 +5,3 @@ google-cloud-bigquery>=3.17,<4.0
 google-auth>=2.27,<3.0
 
 db-dtypes>=1.2,<2.0
-pyarrow>=14.0,<17.0
