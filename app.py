@@ -1,7 +1,16 @@
-import os
+# app.py
+# ======================================================================
+# SFA Dashboard (Streamlit) - BigQuery Connected
+# - 売上サマリー（OS①）
+# - 新規納品（Realized）最新担当者別（OS②）
+# - BigQuery 接続診断（Secrets / Service Account）
+# ======================================================================
+
+from __future__ import annotations
+
 import json
-import datetime as dt
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -11,60 +20,75 @@ from google.oauth2 import service_account
 
 
 # =========================
-# Config
+# CONFIG
 # =========================
+TZ = "Asia/Tokyo"
+
+# あなたのプロジェクト/データセット
 PROJECT_ID = "salesdb-479915"
 DATASET = "sales_data"
-VIEW_REALIZED = "jp_new_deliveries_realized_staff_period_summary"  # 作成済みVIEW
 
-DEFAULT_TZ = "Asia/Tokyo"
+# 参照ビュー（存在しているものに合わせて変更）
+# - 売上サマリー用（あなたの棚卸結果で存在：v_sales_fact_fy_norm）
+VIEW_SALES_FACT = f"{PROJECT_ID}.{DATASET}.v_sales_fact_fy_norm"
+
+# - 新規納品 Realized 日次 Fact（あなたが作成済み）
+VIEW_REALIZED_DAILY_FACT = f"{PROJECT_ID}.{DATASET}.v_new_deliveries_realized_daily_fact_all_months"
+
+APP_TITLE = "SFA（Streamlit）— 売上サマリー / 新規納品（Realized）"
+CACHE_TTL_SEC = 300  # 5分
 
 
 # =========================
-# UI
+# Utilities
 # =========================
-st.set_page_config(page_title="SFA | 新規納品（Realized）", layout="wide")
-st.title("新規納品（Realized）— 最新担当者別")
-st.caption("定義：売上事実 × 直近365日未売上（得意先×YJ） → 新規納品として計上（OS②）")
+def now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def safe_df(rows: Iterable[bigquery.table.Row]) -> pd.DataFrame:
+    """pyarrow依存を避けるため、Row iterator を pandas に変換する安全ルート"""
+    rows_list = list(rows)
+    if not rows_list:
+        return pd.DataFrame()
+    return pd.DataFrame([dict(r) for r in rows_list])
+
+
+def bq_params(params: Dict[str, Any]) -> List[bigquery.ScalarQueryParameter]:
+    out: List[bigquery.ScalarQueryParameter] = []
+    for k, v in params.items():
+        # BigQuery の型推論を安定させたいので最低限だけ明示
+        if isinstance(v, int):
+            out.append(bigquery.ScalarQueryParameter(k, "INT64", v))
+        elif isinstance(v, float):
+            out.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
+        else:
+            out.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
+    return out
 
 
 # =========================
-# Helpers: Secrets / Credentials / Client
+# Credentials / Client
 # =========================
-def _get_sa_info_from_secrets() -> Dict[str, Any]:
-    """
-    Streamlit Secrets の [gcp_service_account] を dict で返す
-    """
+def get_sa_info_from_secrets() -> Dict[str, Any]:
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Streamlit Secrets に [gcp_service_account] が見つかりません。")
-
+        raise RuntimeError("Streamlit Secrets に gcp_service_account が存在しません。")
+    # st.secrets は TOML -> dict になっている
     sa = dict(st.secrets["gcp_service_account"])
-    required = [
-        "type", "project_id", "private_key_id", "private_key",
-        "client_email", "client_id", "token_uri"
-    ]
-    missing = [k for k in required if k not in sa or not sa[k]]
-    if missing:
-        raise RuntimeError(f"Secrets の gcp_service_account に不足キーがあります: {missing}")
-
-    # private_key の整形（念のため）
-    # - TOML """ """ の中は改行が実改行である必要あり
-    # - もし \n を含む形で入ってきた場合は復元
-    pk = sa["private_key"]
-    if "\\n" in pk and "\n" not in pk:
-        sa["private_key"] = pk.replace("\\n", "\n")
-
     return sa
 
 
-@st.cache_resource
-def get_credentials() -> service_account.Credentials:
-    """
-    Credentials は resource キャッシュ（hash対象にしない）で保持
-    """
-    sa_info = _get_sa_info_from_secrets()
+def create_credentials() -> service_account.Credentials:
+    sa = get_sa_info_from_secrets()
+
+    # 最低限チェック
+    required = ["type", "project_id", "private_key", "client_email", "token_uri"]
+    missing = [k for k in required if k not in sa or not sa[k]]
+    if missing:
+        raise RuntimeError(f"Service Account Secrets に不足キーがあります: {missing}")
+
     creds = service_account.Credentials.from_service_account_info(
-        sa_info,
+        sa,
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
     return creds
@@ -72,224 +96,347 @@ def get_credentials() -> service_account.Credentials:
 
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    """
-    BigQuery Client も resource キャッシュで保持
-    """
-    creds = get_credentials()
+    creds = create_credentials()
     client = bigquery.Client(project=PROJECT_ID, credentials=creds)
     return client
 
 
 # =========================
-# Helpers: Query (NO to_dataframe)
+# Query Runner (cached)
 # =========================
-@st.cache_data(ttl=300)
-def run_query(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL_SEC)
+def run_query(_sql: str, _params_json: str) -> pd.DataFrame:
     """
-    pyarrow不要ルート：
-      client.query -> job.result() -> rows -> DataFrame
+    st.cache_data で BigQuery結果をキャッシュ
+    - creds/client は cache_resource で保持
+    - cache_data に Credentials を渡さない（Unhashable 回避）
     """
     client = get_bq_client()
+    params = json.loads(_params_json) if _params_json else {}
+    job_config = bigquery.QueryJobConfig(query_parameters=bq_params(params))
 
-    job_config = None
-    if params:
-        bq_params = []
-        for k, v in params.items():
-            # 型は必要最低限で判定（DATE / INT64 / STRING）
-            if isinstance(v, dt.date):
-                bq_params.append(bigquery.ScalarQueryParameter(k, "DATE", v))
-            elif isinstance(v, int):
-                bq_params.append(bigquery.ScalarQueryParameter(k, "INT64", v))
-            else:
-                bq_params.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
-        job_config = bigquery.QueryJobConfig(query_parameters=bq_params)
-
-    job = client.query(sql, job_config=job_config)
-    rows = list(job.result())
-    if not rows:
-        return pd.DataFrame()
-
-    # rows: Row objects
-    cols = rows[0].keys()
-    data = [list(r.values()) for r in rows]
-    return pd.DataFrame(data, columns=cols)
+    job = client.query(_sql, job_config=job_config)
+    rows = job.result()
+    return safe_df(rows)
 
 
-def diag_block():
+# =========================
+# SQL Builders
+# =========================
+def period_date_expr(grain: str) -> str:
+    """
+    BigQuery 用 period_date 式
+    grain: day|week|month|fy
+    """
+    grain = grain.lower()
+    if grain == "day":
+        return "DATE_TRUNC(sales_date, DAY)"
+    if grain == "week":
+        return "DATE_TRUNC(sales_date, WEEK(MONDAY))"
+    if grain == "month":
+        return "DATE_TRUNC(sales_date, MONTH)"
+    if grain == "fy":
+        # FY = 4/1 始まり
+        return """
+        DATE(
+          EXTRACT(YEAR FROM sales_date) - IF(EXTRACT(MONTH FROM sales_date) < 4, 1, 0),
+          4, 1
+        )
+        """
+    raise ValueError("grain must be one of: day, week, month, fy")
+
+
+def build_sales_summary_sql(grain: str) -> str:
+    """
+    売上サマリー（OS①）
+    期待カラム（最低限）:
+      - sales_date (DATE)
+      - branch_name (STRING)  ※無い場合は空文字でもOK
+      - staff_code (INT/STRING) / staff_name (STRING)
+      - customer_code / customer_name
+      - sales_amount (NUMERIC/FLOAT)
+      - gross_profit (NUMERIC/FLOAT)
+      - quantity (NUMERIC/FLOAT)
+    """
+    pexpr = period_date_expr(grain)
+
+    return f"""
+    WITH base AS (
+      SELECT
+        CAST(sales_date AS DATE) AS sales_date,
+        CAST(branch_name AS STRING) AS branch_name,
+        CAST(staff_code AS STRING) AS staff_code,
+        CAST(staff_name AS STRING) AS staff_name,
+        CAST(customer_code AS STRING) AS customer_code,
+        CAST(customer_name AS STRING) AS customer_name,
+        CAST(sales_amount AS FLOAT64) AS sales_amount,
+        CAST(gross_profit AS FLOAT64) AS gross_profit,
+        CAST(quantity AS FLOAT64) AS quantity
+      FROM `{VIEW_SALES_FACT}`
+      WHERE sales_date IS NOT NULL
+    ),
+    agg AS (
+      SELECT
+        {pexpr} AS period_date,
+        branch_name,
+        staff_code,
+        staff_name,
+        SUM(sales_amount) AS sales_sum,
+        SUM(gross_profit) AS gp_sum,
+        SAFE_DIVIDE(SUM(gross_profit), NULLIF(SUM(sales_amount), 0)) AS gross_margin,
+        SUM(quantity) AS qty_sum,
+        COUNT(DISTINCT customer_code) AS customers
+      FROM base
+      GROUP BY period_date, branch_name, staff_code, staff_name
+    ),
+    ranked AS (
+      SELECT
+        *,
+        DENSE_RANK() OVER (ORDER BY period_date DESC) AS period_rank
+      FROM agg
+    )
+    SELECT
+      period_date,
+      branch_name,
+      staff_code,
+      staff_name,
+      customers,
+      sales_sum,
+      gp_sum,
+      gross_margin,
+      qty_sum
+    FROM ranked
+    WHERE period_rank <= @n_periods
+    ORDER BY period_date DESC, branch_name, staff_code
+    """
+
+
+def build_realized_staff_period_sql(grain: str) -> str:
+    """
+    新規納品（Realized）— 最新担当者別（OS②）
+    期待カラム（最低限）:
+      - sales_date (DATE)
+      - branch_name
+      - staff_code / staff_name
+      - customer_code / customer_name
+      - yj_code
+      - sales_amount / gross_profit / quantity
+    """
+    pexpr = period_date_expr(grain)
+
+    return f"""
+    WITH base AS (
+      SELECT
+        CAST(sales_date AS DATE) AS sales_date,
+        CAST(branch_name AS STRING) AS branch_name,
+        CAST(staff_code AS STRING) AS staff_code,
+        CAST(staff_name AS STRING) AS staff_name,
+        CAST(customer_code AS STRING) AS customer_code,
+        CAST(customer_name AS STRING) AS customer_name,
+        CAST(yj_code AS STRING) AS yj_code,
+        CAST(sales_amount AS FLOAT64) AS sales_amount,
+        CAST(gross_profit AS FLOAT64) AS gross_profit,
+        CAST(quantity AS FLOAT64) AS quantity
+      FROM `{VIEW_REALIZED_DAILY_FACT}`
+      WHERE sales_date IS NOT NULL
+    ),
+    agg AS (
+      SELECT
+        {pexpr} AS period_date,
+        branch_name,
+        staff_code,
+        staff_name,
+
+        COUNT(DISTINCT customer_code) AS realized_customers,
+        COUNT(1) AS realized_rows,
+        SUM(sales_amount) AS sales_sum,
+        SUM(gross_profit) AS gp_sum,
+        SAFE_DIVIDE(SUM(gross_profit), NULLIF(SUM(sales_amount), 0)) AS gross_margin,
+        SUM(quantity) AS qty_sum
+      FROM base
+      GROUP BY period_date, branch_name, staff_code, staff_name
+    ),
+    ranked AS (
+      SELECT
+        *,
+        DENSE_RANK() OVER (ORDER BY period_date DESC) AS period_rank
+      FROM agg
+    )
+    SELECT
+      period_date,
+      branch_name,
+      staff_code,
+      staff_name,
+      realized_customers,
+      realized_rows,
+      sales_sum,
+      gp_sum,
+      gross_margin,
+      qty_sum
+    FROM ranked
+    WHERE period_rank <= @n_periods
+    ORDER BY period_date DESC, branch_name, staff_code
+    """
+
+
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+
+with st.sidebar:
+    st.subheader("フィルタ")
+
+    screen_mode = st.radio(
+        "画面モード",
+        ["実データ表示", "診断用"],
+        index=0,
+    )
+
+    st.divider()
+
+    grain = st.selectbox("期間粒度", ["day", "week", "month", "fy"], index=2)
+    n_periods = st.number_input("表示する期間数（最新から）", min_value=1, max_value=120, value=5, step=1)
+
+    st.divider()
+    st.caption("定義")
+    st.caption("新規納品（Realized）＝ 売上事実 × 直近365日未売上（得意先×YJ） → 新規納品として計上（OS②）")
+
+
+tabs = st.tabs(["売上サマリー（OS①）", "新規納品 Realized（OS②）", "接続診断"])
+
+# -------------------------
+# 売上サマリー
+# -------------------------
+with tabs[0]:
+    st.subheader("売上サマリー（担当者別）")
+
+    if screen_mode == "診断用":
+        st.info("診断用モード：クエリと件数確認に重点。")
+
+    sql = build_sales_summary_sql(grain)
+    params = {"n_periods": int(n_periods)}
+
+    with st.expander("（開発用）SQLを表示", expanded=False):
+        st.code(sql, language="sql")
+        st.json(params)
+
+    try:
+        df = run_query(sql, json.dumps(params, ensure_ascii=False))
+        if df.empty:
+            st.warning("表示するデータはありません。")
+        else:
+            # 日本語表示（OS追記：日本語表記）
+            df = df.rename(
+                columns={
+                    "period_date": "期間開始日",
+                    "branch_name": "支店名",
+                    "staff_code": "担当者コード",
+                    "staff_name": "担当者名",
+                    "customers": "得意先数",
+                    "sales_sum": "売上合計",
+                    "gp_sum": "粗利合計",
+                    "gross_margin": "粗利率",
+                    "qty_sum": "数量合計",
+                }
+            )
+            st.dataframe(df, width="stretch", hide_index=True)
+
+    except Exception as e:
+        st.error("BigQueryクエリで失敗しました。ログを確認してください。")
+        st.exception(e)
+
+
+# -------------------------
+# 新規納品 Realized
+# -------------------------
+with tabs[1]:
+    st.subheader("新規納品（Realized）— 最新担当者別")
+    st.caption("定義：売上事実 × 直近365日未売上（得意先×YJ） → 新規納品として計上（OS②）")
+
+    sql = build_realized_staff_period_sql(grain)
+    params = {"n_periods": int(n_periods)}
+
+    with st.expander("（開発用）SQLを表示", expanded=False):
+        st.code(sql, language="sql")
+        st.json(params)
+
+    try:
+        df = run_query(sql, json.dumps(params, ensure_ascii=False))
+        if df.empty:
+            st.warning("表示するデータはありません。")
+        else:
+            df = df.rename(
+                columns={
+                    "period_date": "期間開始日",
+                    "branch_name": "支店名",
+                    "staff_code": "担当者コード",
+                    "staff_name": "担当者名",
+                    "realized_customers": "新規得意先数",
+                    "realized_rows": "新規行数",
+                    "sales_sum": "売上合計",
+                    "gp_sum": "粗利合計",
+                    "gross_margin": "粗利率",
+                    "qty_sum": "数量合計",
+                }
+            )
+            st.dataframe(df, width="stretch", hide_index=True)
+
+    except Exception as e:
+        st.error("BigQueryクエリで失敗しました。ログを確認してください。")
+        st.exception(e)
+
+
+# -------------------------
+# 接続診断
+# -------------------------
+with tabs[2]:
     st.subheader("BigQuery 接続 診断（Streamlit Secrets / Service Account）")
 
-    # STEP0
-    st.write("### STEP0: Secrets 読み取り確認")
-    keys = list(st.secrets.keys())
-    st.write("secrets keys:", keys)
-    st.write("has gcp_service_account:", "gcp_service_account" in st.secrets)
-
-    # STEP1
-    st.write("### STEP1: Credentials 生成")
+    st.write("STEP0: Secrets 読み取り確認")
     try:
-        creds = get_credentials()
+        keys = list(st.secrets.keys())
+        st.write("secrets keys:")
+        st.code(json.dumps(keys, ensure_ascii=False, indent=2))
+        st.write(f"has gcp_service_account: {'gcp_service_account' in st.secrets}")
+        st.success("STEP0 OK: Secrets の読み取りはOK（キー一覧のみ表示）")
+    except Exception as e:
+        st.error("STEP0 FAILED")
+        st.exception(e)
+        st.stop()
+
+    st.write("STEP1: Credentials 生成")
+    try:
+        creds = create_credentials()
+        # 安全のため、表示は最低限（メール/プロジェクトのみ）
         st.success("STEP1 OK: Credentials を生成できました。")
-        st.write("client_email:", getattr(creds, "service_account_email", "N/A"))
-        st.write("project_id:", PROJECT_ID)
+        st.write(f"client_email: {get_sa_info_from_secrets().get('client_email', '')}")
+        st.write(f"project_id: {get_sa_info_from_secrets().get('project_id', '')}")
     except Exception as e:
         st.error("STEP1 FAILED")
         st.exception(e)
-        return
+        st.stop()
 
-    # STEP2
-    st.write("### STEP2: BigQuery Client 生成")
+    st.write("STEP2: BigQuery Client 生成")
     try:
         client = get_bq_client()
         st.success("STEP2 OK: bigquery.Client を生成できました。")
-        st.write("client.project:", client.project)
+        st.write(f"client.project: {client.project}")
     except Exception as e:
         st.error("STEP2 FAILED")
         st.exception(e)
-        return
+        st.stop()
 
-    # STEP3
-    st.write("### STEP3: 最小クエリ（SELECT 1）")
+    st.write("STEP3: 最小クエリ（SELECT 1）")
     try:
-        df = run_query("SELECT 1 AS ok")
+        sql_min = "#standardSQL\nSELECT 1 AS ok"
+        df_min = run_query(sql_min, json.dumps({}, ensure_ascii=False))
         st.success("STEP3 OK: クエリ成功")
-        st.dataframe(df, width="stretch")
+        st.dataframe(df_min, width="content", hide_index=True)
     except Exception as e:
-        st.error("STEP3 FAILED")
+        st.error("STEP3 FAILED: クエリ実行で失敗しました。")
+        st.write("よくある原因：① IAM権限不足(403) ② ネットワーク/TransportError ③ token/SAの不整合")
         st.exception(e)
 
-
-# =========================
-# Sidebar Controls
-# =========================
-st.sidebar.header("フィルタ")
-
-mode = st.sidebar.radio(
-    "画面モード",
-    ["実データ表示", "診断用"],
-    index=0
-)
-
-granularity = st.sidebar.selectbox(
-    "期間粒度",
-    ["day", "week", "month", "fy"],
-    index=2
-)
-
-limit_n = st.sidebar.selectbox(
-    "表示する期間数（最新から）",
-    [5, 10, 20, 60],
-    index=0
-)
-
-# FY開始（月日固定）
-FY_START_MONTH = 4
-FY_START_DAY = 1
-
-
-# =========================
-# Main
-# =========================
-if mode == "診断用":
-    diag_block()
-    st.stop()
-
-
-st.subheader("集計（最新担当者別）")
-
-sql = f"""
-SELECT
-  period,
-  period_date,
-  branch_name,
-  staff_code,
-  staff_name,
-  realized_customers,
-  realized_customer_items,
-  realized_items,
-  realized_rows,
-  sales_sum,
-  gp_sum,
-  gross_margin,
-  qty_sum
-FROM `{PROJECT_ID}.{DATASET}.{VIEW_REALIZED}`
-WHERE period = @period
-QUALIFY ROW_NUMBER() OVER (PARTITION BY period ORDER BY period_date DESC) <= @limit_n
-ORDER BY period_date DESC, sales_sum DESC
-"""
-
-# ↑ QUALIFY は「期間ごとに最新N期間」を切るためのもの。
-# もし BigQuery の仕様/データ形状で期待通りにならない場合は、後で period_date だけ抽出してINに切り替え可能。
-
-params = {"period": granularity, "limit_n": int(limit_n)}
-
-try:
-    df = run_query(sql, params=params)
-except Exception as e:
-    st.error("BigQueryクエリで失敗しました。ログを確認してください。")
-    st.exception(e)
-    st.stop()
-
-if df.empty:
-    st.info("データがありません（期間粒度・期間数を変えてください）。")
-    st.stop()
-
-# 表示用（日本語カラムに寄せる）
-rename_map = {
-    "period": "粒度",
-    "period_date": "期間開始日",
-    "branch_name": "支店名",
-    "staff_code": "担当者コード",
-    "staff_name": "担当者名",
-    "realized_customers": "新規納品_得意先数",
-    "realized_customer_items": "新規納品_得意先×品目数",
-    "realized_items": "新規納品_品目数",
-    "realized_rows": "新規納品_行数",
-    "sales_sum": "売上合計",
-    "gp_sum": "粗利合計",
-    "gross_margin": "粗利率",
-    "qty_sum": "数量合計",
-}
-df_disp = df.rename(columns=rename_map)
-
-# 粗利率を%表示用
-if "粗利率" in df_disp.columns:
-    df_disp["粗利率"] = (df_disp["粗利率"].astype(float) * 100).round(2)
-
-# 主要KPI
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("行数", f"{df_disp['新規納品_行数'].sum():,.0f}")
-col2.metric("売上合計", f"{df_disp['売上合計'].sum():,.0f}")
-col3.metric("粗利合計", f"{df_disp['粗利合計'].sum():,.0f}")
-avg_margin = (df["gp_sum"].sum() / df["sales_sum"].sum()) if df["sales_sum"].sum() else 0
-col4.metric("粗利率（加重）", f"{avg_margin*100:.2f}%")
-
-st.dataframe(df_disp, use_container_width=True)
-
-# 期間別のざっくり集計（同一period_date単位）
-st.subheader("期間別サマリー（期間開始日）")
-sql2 = f"""
-SELECT
-  period_date,
-  SUM(realized_rows) AS realized_rows,
-  SUM(sales_sum) AS sales_sum,
-  SUM(gp_sum) AS gp_sum,
-  SAFE_DIVIDE(SUM(gp_sum), SUM(sales_sum)) AS gross_margin
-FROM `{PROJECT_ID}.{DATASET}.{VIEW_REALIZED}`
-WHERE period = @period
-GROUP BY period_date
-ORDER BY period_date DESC
-LIMIT @limit_n
-"""
-df2 = run_query(sql2, params=params)
-if not df2.empty:
-    df2_disp = df2.rename(columns={
-        "period_date": "期間開始日",
-        "realized_rows": "新規納品_行数",
-        "sales_sum": "売上合計",
-        "gp_sum": "粗利合計",
-        "gross_margin": "粗利率",
-    })
-    df2_disp["粗利率"] = (df2_disp["粗利率"].astype(float) * 100).round(2)
-    st.dataframe(df2_disp, use_container_width=True)
-
-st.caption("※表示は担当者コードをキーにし、画面上は担当者名を表示。日本語カラム表記に統一。")
+    st.caption(f"診断実行: {now_utc_str()}")
