@@ -1,4 +1,6 @@
 import streamlit as st
+st.write("DEPLOY_MARKER: 2026-01-21 11:35 JST")
+import streamlit as st
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
