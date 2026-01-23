@@ -1,4 +1,6 @@
 streamlit
+pandas
 google-cloud-bigquery
 google-auth
-pandas
+pyarrow
+db-dtypes   ← ★これが足りない
