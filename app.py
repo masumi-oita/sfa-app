@@ -1,322 +1,251 @@
-import os
-from datetime import date
-import streamlit as st
-import pandas as pd
-from google.cloud import bigquery
-from google.oauth2 import service_account
+# ============================================================
+# app.py  管理者ダッシュボード（OS v1.4.5 完成形）
+#  - 日本語UI
+#  - 担当者氏名表示（email→氏名）
+#  - FYTD構造 → FYTD MoM → 当月YoY → ドリル
+# ============================================================
 
-# =========================
-# CONFIG
-# =========================
+from __future__ import annotations
+import pandas as pd
+import streamlit as st
+from google.cloud import bigquery
+from typing import Dict, Any, Optional
+import re
+
+# --------------------
+# 基本設定
+# --------------------
 PROJECT_ID = "salesdb-479915"
 DATASET = "sales_data"
 
-# Views you already created
-V_LOGIN_CONTEXT = f"{PROJECT_ID}.{DATASET}.dim_staff_role"
-V_BOTTOM_BY_STAFF = f"{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_bottom_current_month_by_staff"
-V_BOTTOM = f"{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_bottom_current_month"
-V_TOP = f"{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_top_current_month"
-V_UNCOMPARABLE = f"{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_uncomparable_current_month"
-V_SALES_FACT_LOGIN_DAILY = f"{PROJECT_ID}.{DATASET}.v_sales_fact_login_jan_daily"
+BQ = bigquery.Client(project=PROJECT_ID)
 
-# =========================
-# Helpers
-# =========================
-def get_bq_client() -> bigquery.Client:
-    """
-    Streamlit secrets に service_account を置く想定:
-    st.secrets["gcp_service_account"] = {...json...}
-    """
-    if "gcp_service_account" in st.secrets:
-        creds = service_account.Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"]
-        )
-        return bigquery.Client(credentials=creds, project=PROJECT_ID)
-    # fallback: local env (GOOGLE_APPLICATION_CREDENTIALS)
-    return bigquery.Client(project=PROJECT_ID)
+# --------------------
+# VIEW定義
+# --------------------
+V_SYS_MONTH = f"`{PROJECT_ID}.{DATASET}.v_sys_current_month`"
 
+V_ADMIN_ORG_FYTD = f"`{PROJECT_ID}.{DATASET}.v_admin_org_fytd_summary_scoped`"
+V_ADMIN_FYTD_MOM_TOP = f"`{PROJECT_ID}.{DATASET}.v_admin_customer_fytd_mom_top_named_scoped`"
+V_ADMIN_FYTD_MOM_BOTTOM = f"`{PROJECT_ID}.{DATASET}.v_admin_customer_fytd_mom_bottom_named_scoped`"
 
+V_YOY_TOP = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_top_current_month`"
+V_YOY_BOTTOM = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_bottom_current_month`"
+V_YOY_INVALID = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_uncomparable_current_month`"
+
+V_FACT = f"`{PROJECT_ID}.{DATASET}.v_sales_fact_login_jan_daily`"
+V_STAFF_NAME = f"`{PROJECT_ID}.{DATASET}.v_staff_email_name`"
+DIM_ROLE = f"`{PROJECT_ID}.{DATASET}.dim_staff_role`"
+
+# --------------------
+# 共通関数
+# --------------------
 @st.cache_data(ttl=300)
-def bq_query(sql: str, params: dict | None = None) -> pd.DataFrame:
-    client = get_bq_client()
-    job_config = bigquery.QueryJobConfig()
+def qdf(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(k, "STRING", v)
+            for k, v in (params or {}).items()
+        ]
+    )
+    try:
+        return BQ.query(sql, job_config=job_config).result().to_dataframe()
+    except Exception as e:
+        st.warning(f"Query Error: {e}")
+        return pd.DataFrame()
 
-    if params:
-        job_params = []
-        for k, v in params.items():
-            # infer type (string/int/float/date)
-            if isinstance(v, bool):
-                typ = "BOOL"
-            elif isinstance(v, int):
-                typ = "INT64"
-            elif isinstance(v, float):
-                typ = "FLOAT64"
-            elif isinstance(v, date):
-                typ = "DATE"
-            else:
-                typ = "STRING"
-            job_params.append(bigquery.ScalarQueryParameter(k, typ, v))
-        job_config.query_parameters = job_params
 
-    return client.query(sql, job_config=job_config).to_dataframe()
+def yen(x):
+    if pd.isna(x): return ""
+    return f"¥{int(x):,}"
+
+
+def pct(x):
+    if pd.isna(x): return ""
+    return f"{x*100:.1f}%"
 
 
 def get_user_email() -> str:
-    # 1) URL query param: ?user_email=xxx
-    qp = st.query_params
-    if "user_email" in qp and qp["user_email"]:
-        return str(qp["user_email"])
-
-    # 2) session_state
-    if "user_email" in st.session_state and st.session_state["user_email"]:
-        return st.session_state["user_email"]
-
-    # 3) fallback input
-    return ""
+    if "user_email" in st.query_params:
+        return st.query_params["user_email"].lower().strip()
+    return st.text_input("ログインメール（user_email）").lower().strip()
 
 
-@st.cache_data(ttl=300)
-def fetch_roles(user_email: str) -> dict:
-    sql = f"""
-    SELECT
-      login_email,
-      role_admin_view,
-      role_admin_edit,
-      role_sales_view
-    FROM `{V_LOGIN_CONTEXT}`
-    WHERE login_email = @user_email
-    """
-    df = bq_query(sql, {"user_email": user_email})
+def get_staff_name(email: str) -> str:
+    df = qdf(
+        f"""
+        SELECT staff_name_norm
+        FROM {V_STAFF_NAME}
+        WHERE login_email = @email
+        LIMIT 1
+        """,
+        {"email": email}
+    )
     if df.empty:
-        return {
-            "login_email": user_email,
-            "role_admin_view": False,
-            "role_admin_edit": False,
-            "role_sales_view": True,  # salesは一旦True扱い（社内なので）
-            "registered": False,
-        }
-    r = df.iloc[0].to_dict()
-    r["registered"] = True
-    return r
+        return email
+    return df.iloc[0]["staff_name_norm"]
 
 
-@st.cache_data(ttl=300)
-def fetch_current_month() -> str:
-    sql = f"SELECT CAST(MAX(month) AS STRING) AS cur_month FROM `{V_BOTTOM}`"
-    df = bq_query(sql)
-    return df.iloc[0]["cur_month"] if not df.empty else ""
+def get_scope(email: str) -> Dict[str, Any]:
+    df = qdf(
+        f"""
+        SELECT role_tier, area_name, scope_type, scope_branches
+        FROM {DIM_ROLE}
+        WHERE LOWER(login_email)=@email
+        """,
+        {"email": email}
+    )
+    if df.empty:
+        return {}
+    return df.iloc[0].to_dict()
 
 
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="SFA Sales OS", layout="wide")
+# --------------------
+# UI開始
+# --------------------
+st.set_page_config(page_title="管理者ダッシュボード", layout="wide")
+st.title("📊 管理者ダッシュボード（分析用）")
 
-st.title("SFA Sales OS（入口）")
-
-with st.sidebar:
-    st.header("ログイン")
-    user_email = get_user_email()
-    user_email = st.text_input("user_email（メール）", value=user_email, placeholder="okazaki@shinrai8.by-works.com")
-    st.session_state["user_email"] = user_email
-
-    roles = fetch_roles(user_email) if user_email else None
-    if roles:
-        st.caption(f"登録: {'OK' if roles['registered'] else '未登録（暫定）'}")
-        st.write(
-            {
-                "admin_view": bool(roles["role_admin_view"]),
-                "admin_edit": bool(roles["role_admin_edit"]),
-            }
-        )
-
-    st.divider()
-    st.caption("URLで渡す場合：")
-    st.code("?user_email=xxx@shinrai8.by-works.com", language="text")
-
+user_email = get_user_email()
 if not user_email:
-    st.info("左のサイドバーで user_email を入力してください（社内運用の暫定ログイン）。")
     st.stop()
 
-current_month = fetch_current_month()
-st.caption(f"Current month: {current_month}（YoY valid）")
+staff_name = get_staff_name(user_email)
+scope = get_scope(user_email)
 
-is_admin_view = bool(roles and roles.get("role_admin_view"))
-is_admin_edit = bool(roles and roles.get("role_admin_edit"))
+# --------------------
+# ヘッダー
+# --------------------
+sys = qdf(f"SELECT * FROM {V_SYS_MONTH} LIMIT 1")
+current_month = str(sys.iloc[0]["current_month"]) if not sys.empty else "-"
 
-# -------------------------
-# Tabs
-# -------------------------
-tabs = ["担当者入口（下落/伸び/比較不能）", "ドリル（明細）"]
-if is_admin_view:
-    tabs.insert(0, "管理者入口（担当別 下落）")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("対象月", current_month)
+c2.metric("担当者", staff_name)
+c3.metric("ロール", scope.get("role_tier", "-"))
+c4.metric("スコープ", scope.get("area_name", "-"))
 
-tab_objs = st.tabs(tabs)
+st.divider()
 
-# =========================
-# Admin tab
-# =========================
-idx = 0
-if is_admin_view:
-    with tab_objs[idx]:
-        st.subheader("管理者入口：担当別 下落（当月）")
-        st.caption("優先度：粗利差（ABS）→粗利率差→売上差（ABS）")
-
-        limit_n = st.slider("担当あたり表示件数", 5, 30, 10)
-
-        sql = f"""
+# ============================================================
+# A) FYTD 構造サマリー
+# ============================================================
+with st.expander("① 年度累計（FYTD）構造サマリー", expanded=True):
+    df = qdf(
+        f"""
         SELECT *
-        FROM `{V_BOTTOM_BY_STAFF}`
-        """
-        df = bq_query(sql)
+        FROM {V_ADMIN_ORG_FYTD}
+        WHERE viewer_email=@email
+        """,
+        {"email": user_email}
+    )
 
-        if df.empty:
-            st.warning("データがありません。")
-        else:
-            # group by login_email
-            for login_email, g in df.groupby("login_email"):
-                st.markdown(f"### {login_email}")
-                st.dataframe(g.head(limit_n), use_container_width=True)
-                st.divider()
-    idx += 1
+    if df.empty:
+        st.info("FYTDデータはまだありません")
+    else:
+        r = df.iloc[0]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("売上（FYTD）", yen(r["sales_amount_fytd"]))
+        k2.metric("粗利（FYTD）", yen(r["gross_profit_fytd"]))
+        k3.metric("粗利率（FYTD）", pct(r["gross_profit_rate_fytd"]))
+        k4.metric("前年差（売上）", yen(r.get("sales_diff_fytd")))
 
-# =========================
-# Rep tab
-# =========================
-with tab_objs[idx]:
-    st.subheader("担当者入口（自分の担当だけ）")
-    st.caption("下落 / 伸び / 比較不能（前年なし等）")
+# ============================================================
+# B) FYTD MoM（流れ）
+# ============================================================
+with st.expander("② FYTD 前月差（MoM）ランキング", expanded=True):
+    l, r = st.columns(2)
 
-    colA, colB = st.columns([1, 2])
-    with colA:
-        view_choice = st.radio("表示", ["下落（bottom）", "伸び（top）", "比較不能（uncomparable）"], index=0)
+    with l:
+        st.subheader("📉 下落")
+        df = qdf(
+            f"""
+            SELECT 得意先名, 支店名,
+                   sales_amount_fytd AS FYTD売上,
+                   gross_profit_fytd AS FYTD粗利,
+                   sales_diff_mom AS 前月差_売上,
+                   gross_profit_diff_mom AS 前月差_粗利
+            FROM {V_ADMIN_FYTD_MOM_BOTTOM}
+            WHERE viewer_email=@email
+            ORDER BY sales_diff_mom ASC
+            LIMIT 20
+            """,
+            {"email": user_email}
+        )
+        st.dataframe(df, use_container_width=True)
 
-    view_map = {
-        "下落（bottom）": V_BOTTOM,
-        "伸び（top）": V_TOP,
-        "比較不能（uncomparable）": V_UNCOMPARABLE,
-    }
-    view = view_map[view_choice]
+    with r:
+        st.subheader("📈 伸長")
+        df = qdf(
+            f"""
+            SELECT 得意先名, 支店名,
+                   sales_amount_fytd AS FYTD売上,
+                   gross_profit_fytd AS FYTD粗利,
+                   sales_diff_mom AS 前月差_売上,
+                   gross_profit_diff_mom AS 前月差_粗利
+            FROM {V_ADMIN_FYTD_MOM_TOP}
+            WHERE viewer_email=@email
+            ORDER BY sales_diff_mom DESC
+            LIMIT 20
+            """,
+            {"email": user_email}
+        )
+        st.dataframe(df, use_container_width=True)
 
-    sql = f"""
-    SELECT
-      customer_code,
-      customer_name,
-      month,
-      sales_amount,
-      gross_profit,
-      gross_profit_rate,
-      sales_amount_py,
-      gross_profit_py,
-      sales_diff_yoy,
-      gp_diff_yoy,
-      sales_yoy_rate,
-      gp_yoy_rate
-    FROM `{view}`
-    WHERE login_email = @user_email
-    ORDER BY
-      -- view側で並んでいるが、念のため
-      ABS(gp_diff_yoy) DESC,
-      ABS(gp_yoy_rate) DESC,
-      ABS(sales_diff_yoy) DESC
-    LIMIT 2000
-    """
-    df = bq_query(sql, {"user_email": user_email})
+# ============================================================
+# C) 当月 YoY
+# ============================================================
+with st.expander("③ 当月 YoY（前年比較）", expanded=True):
+    tabs = st.tabs(["下落", "伸長", "比較不能"])
 
-    with colB:
-        if df.empty:
-            st.warning("データがありません（担当得意先が未紐付けの可能性）。")
-        else:
-            st.dataframe(df, use_container_width=True, height=520)
+    with tabs[0]:
+        df = qdf(f"SELECT * FROM {V_YOY_BOTTOM}")
+        st.dataframe(df, use_container_width=True)
 
-            st.divider()
-            st.markdown("#### ドリルに送る（customer_code）")
-            selected = st.selectbox("customer_code（上の表からコピーでもOK）", options=[""] + df["customer_code"].dropna().unique().tolist())
-            if selected:
-                st.session_state["drill_customer_code"] = selected
-                st.success(f"drill_customer_code = {selected}")
+    with tabs[1]:
+        df = qdf(f"SELECT * FROM {V_YOY_TOP}")
+        st.dataframe(df, use_container_width=True)
 
-idx += 1
+    with tabs[2]:
+        df = qdf(f"SELECT * FROM {V_YOY_INVALID}")
+        st.dataframe(df, use_container_width=True)
 
-# =========================
-# Drill tab
-# =========================
-with tab_objs[idx]:
-    st.subheader("ドリル（得意先 → 月 → 明細）")
+# ============================================================
+# D) ドリル
+# ============================================================
+with st.expander("④ ドリル（得意先 → 日次）", expanded=True):
+    keyword = st.text_input("得意先名（部分一致）")
+    if keyword:
+        cand = qdf(
+            f"""
+            SELECT DISTINCT customer_code, customer_name
+            FROM {V_FACT}
+            WHERE login_email=@email
+              AND customer_name LIKE CONCAT('%', @kw, '%')
+            LIMIT 50
+            """,
+            {"email": user_email, "kw": keyword}
+        )
+        if not cand.empty:
+            pick = st.selectbox(
+                "得意先選択",
+                cand.apply(lambda r: f"{r.customer_name} ({r.customer_code})", axis=1)
+            )
+            code = re.search(r"\((.+?)\)", pick).group(1)
 
-    customer_code = st.session_state.get("drill_customer_code", "")
-    customer_code = st.text_input("customer_code", value=customer_code)
-
-    if not customer_code:
-        st.info("上のタブで customer_code を選ぶか、ここに入力してください。")
-        st.stop()
-
-    # months available for that customer (login filtered)
-    sql_m = f"""
-    SELECT
-      month,
-      ANY_VALUE(customer_name) AS customer_name,
-      SUM(sales_amount) AS sales_amount,
-      SUM(gross_profit) AS gross_profit,
-      SAFE_DIVIDE(SUM(gross_profit), NULLIF(SUM(sales_amount), 0)) AS gross_profit_rate
-    FROM `{V_SALES_FACT_LOGIN_DAILY}`
-    WHERE login_email = @user_email
-      AND customer_code = @customer_code
-    GROUP BY month
-    ORDER BY month DESC
-    """
-    mdf = bq_query(sql_m, {"user_email": user_email, "customer_code": customer_code})
-
-    if mdf.empty:
-        st.warning("この得意先はあなたの担当ではないか、売上データがありません。")
-        st.stop()
-
-    st.dataframe(mdf, use_container_width=True, height=240)
-
-    month_list = mdf["month"].astype(str).tolist()
-    default_month = month_list[0] if month_list else ""
-    month_pick = st.selectbox("month（YYYY-MM-01）", options=month_list, index=0)
-
-    # item summary inside month
-    sql_i = f"""
-    SELECT
-      yj_code,
-      jan,
-      ANY_VALUE(item_name) AS item_name,
-      ANY_VALUE(pack_unit) AS pack_unit,
-      SUM(quantity) AS qty,
-      SUM(sales_amount) AS sales_amount,
-      SUM(gross_profit) AS gross_profit,
-      SAFE_DIVIDE(SUM(gross_profit), NULLIF(SUM(sales_amount), 0)) AS gross_profit_rate
-    FROM `{V_SALES_FACT_LOGIN_DAILY}`
-    WHERE login_email = @user_email
-      AND customer_code = @customer_code
-      AND month = DATE(@month_pick)
-    GROUP BY yj_code, jan
-    ORDER BY gross_profit DESC, sales_amount DESC
-    """
-    idf = bq_query(sql_i, {"user_email": user_email, "customer_code": customer_code, "month_pick": month_pick})
-    st.markdown("### 品目（JAN/YJ）")
-    st.dataframe(idf, use_container_width=True, height=380)
-
-    st.divider()
-    st.markdown("### 明細（日次）")
-    sql_d = f"""
-    SELECT
-      sales_date,
-      yj_code,
-      jan,
-      item_name,
-      pack_unit,
-      quantity,
-      sales_amount,
-      gross_profit
-    FROM `{V_SALES_FACT_LOGIN_DAILY}`
-    WHERE login_email = @user_email
-      AND customer_code = @customer_code
-      AND month = DATE(@month_pick)
-    ORDER BY sales_date DESC, gross_profit DESC
-    LIMIT 2000
-    """
-    ddf = bq_query(sql_d, {"user_email": user_email, "customer_code": customer_code, "month_pick": month_pick})
-    st.dataframe(ddf, use_container_width=True, height=420)
+            detail = qdf(
+                f"""
+                SELECT sales_date AS 日付,
+                       item_name AS 商品名,
+                       quantity AS 数量,
+                       sales_amount AS 売上,
+                       gross_profit AS 粗利
+                FROM {V_FACT}
+                WHERE login_email=@email
+                  AND customer_code=@code
+                  AND month=DATE(@m)
+                ORDER BY sales_date DESC
+                """,
+                {"email": user_email, "code": code, "m": current_month}
+            )
+            st.dataframe(detail, use_container_width=True)
