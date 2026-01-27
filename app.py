@@ -1,14 +1,13 @@
 # app.py
 # SFA Sales OS (入口) - Admin (Org summary + Top/Bottom) + Drill + Perf Logs
-# - Uses non-scoped views to avoid role/area gating (as requested: 未分類OK・全員統括OK)
+# - Uses non-scoped views to avoid role/area gating (未分類OK・全員統括OK)
 # - Adds check mechanisms: SQL timing, timeout, cache control, query logging, parameterized queries
-# - Designed to be pasted/replaced as-is in your Streamlit repo
+# - FIX: Do NOT mutate st.session_state inside cached functions (StreamlitAPIException)
 
-import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -30,11 +29,11 @@ VIEW_ADMIN_ORG_FYTD = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_org_fytd_summary`"
 VIEW_ADMIN_TOP = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_top_named`"
 VIEW_ADMIN_BOTTOM = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_bottom_named`"
 
-# Drill views (you already have these)
+# Drill views (already exist)
 VIEW_DRILL_CUST_ITEM_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_item_month`"
 VIEW_DRILL_CUST_YJ_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_yj_month`"
 
-DEFAULT_TIMEOUT_SEC = 60  # UI-level timeout target (BQ job can still run; we handle UX)
+DEFAULT_TIMEOUT_SEC = 60
 DEFAULT_LIMIT = 200
 
 st.set_page_config(
@@ -47,7 +46,7 @@ st.set_page_config(
 # STATE / LOGGING
 # =========================
 if "query_logs" not in st.session_state:
-    st.session_state.query_logs = []  # List[dict]
+    st.session_state.query_logs = []
 if "cache_buster" not in st.session_state:
     st.session_state.cache_buster = 0
 
@@ -66,6 +65,20 @@ class QueryResult:
 
 def _now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _enable_perf_log() -> bool:
+    return bool(st.session_state.get("enable_perf_log", True))
+
+
+def _show_sql() -> bool:
+    return bool(st.session_state.get("show_sql", False))
+
+
+def _safe_float_gb(x: Optional[int]) -> float:
+    if not x:
+        return 0.0
+    return float(x) / (1024**3)
 
 
 def log_query(name: str, res: QueryResult):
@@ -89,37 +102,10 @@ def log_query(name: str, res: QueryResult):
 # =========================
 @st.cache_resource(show_spinner=False)
 def get_bq_client() -> bigquery.Client:
-    """
-    Uses st.secrets["gcp_service_account"] if present (recommended).
-    """
     if "gcp_service_account" in st.secrets:
         creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
         return bigquery.Client(project=PROJECT_ID, credentials=creds, location=LOCATION)
-    # fallback: default credentials
     return bigquery.Client(project=PROJECT_ID, location=LOCATION)
-
-
-def _use_bqstorage_api() -> bool:
-    return bool(st.session_state.get("use_bqstorage", False))
-
-
-def _show_sql() -> bool:
-    return bool(st.session_state.get("show_sql", False))
-
-
-def _enable_perf_log() -> bool:
-    return bool(st.session_state.get("enable_perf_log", True))
-
-
-def _cache_key_suffix() -> int:
-    # increments when user hits "キャッシュ無効化"
-    return int(st.session_state.get("cache_buster", 0))
-
-
-def _safe_float_gb(x: Optional[int]) -> float:
-    if not x:
-        return 0.0
-    return float(x) / (1024**3)
 
 
 def run_bq_query(
@@ -128,13 +114,13 @@ def run_bq_query(
     params: Optional[List[bigquery.ScalarQueryParameter]] = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     use_cache: bool = True,
+    use_bqstorage: bool = False,
 ) -> QueryResult:
     """
-    Executes BigQuery SQL with optional query parameters (prevents illegal character / injection).
-    Adds timing + bytes processed + job id.
+    Executes BigQuery SQL with optional query parameters.
+    IMPORTANT: Do not touch st.session_state here if called from cached functions.
     """
     client = get_bq_client()
-
     job_config = bigquery.QueryJobConfig(use_query_cache=use_cache)
     if params:
         job_config.query_parameters = params
@@ -145,13 +131,11 @@ def run_bq_query(
         job = client.query(sql, job_config=job_config)
         job_id = job.job_id
 
-        # We don't hard-cancel BQ job; we use a UI timeout for responsiveness
-        # but still try to fetch within timeout.
         df = job.result(timeout=timeout_sec).to_dataframe(
-            create_bqstorage_client=_use_bqstorage_api()
+            create_bqstorage_client=use_bqstorage
         )
-        elapsed = time.time() - t0
 
+        elapsed = time.time() - t0
         bytes_gb = _safe_float_gb(getattr(job, "total_bytes_processed", None))
         rows = int(len(df))
 
@@ -186,7 +170,9 @@ def run_bq_query(
         return res
 
 
-# Cache layer (data)
+# =========================
+# CACHE LAYER
+# =========================
 @st.cache_data(show_spinner=False, ttl=300)
 def cached_query(
     cache_buster: int,
@@ -197,13 +183,21 @@ def cached_query(
     use_cache: bool,
     use_bqstorage: bool,
 ) -> QueryResult:
-    # Rebuild params objects inside cache function
+    """
+    Cached function MUST NOT modify st.session_state.
+    """
     params: List[bigquery.ScalarQueryParameter] = []
     for ptype, pname, pval in params_tuples:
         params.append(bigquery.ScalarQueryParameter(pname, ptype, pval))
-    # use_bqstorage is read from st.session_state normally, but passed here to bind cache key
-    st.session_state["use_bqstorage"] = use_bqstorage
-    return run_bq_query(name=name, sql=sql, params=params or None, timeout_sec=timeout_sec, use_cache=use_cache)
+
+    return run_bq_query(
+        name=name,
+        sql=sql,
+        params=params or None,
+        timeout_sec=timeout_sec,
+        use_cache=use_cache,
+        use_bqstorage=use_bqstorage,
+    )
 
 
 def query_df(
@@ -213,26 +207,32 @@ def query_df(
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     use_cache: bool = True,
 ) -> QueryResult:
-    """
-    Wrapper that applies st.cache_data if enabled by UI.
-    params: list of tuples (type, name, value) e.g. ("STRING","customer_code","123")
-    """
     params = params or []
     params_tuples = tuple((t, n, v) for (t, n, v) in params)
 
-    if st.session_state.get("disable_data_cache", False):
-        # no cache
+    use_bqstorage = bool(st.session_state.get("use_bqstorage", False))
+    disable_cache = bool(st.session_state.get("disable_data_cache", False))
+    cache_buster = int(st.session_state.get("cache_buster", 0))
+
+    if disable_cache:
         bq_params = [bigquery.ScalarQueryParameter(n, t, v) for (t, n, v) in params]
-        return run_bq_query(name, sql, bq_params or None, timeout_sec=timeout_sec, use_cache=use_cache)
+        return run_bq_query(
+            name=name,
+            sql=sql,
+            params=bq_params or None,
+            timeout_sec=timeout_sec,
+            use_cache=use_cache,
+            use_bqstorage=use_bqstorage,
+        )
 
     return cached_query(
-        _cache_key_suffix(),
+        cache_buster,
         name,
         sql,
         params_tuples,
         timeout_sec,
         use_cache,
-        _use_bqstorage_api(),
+        use_bqstorage,
     )
 
 
@@ -240,10 +240,6 @@ def query_df(
 # UI HELPERS
 # =========================
 def jp_col_rename(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Best-effort Japanese labels for common columns.
-    If your views use different column names, they will still display as-is.
-    """
     mapping = {
         "customer_code": "得意先コード",
         "customer_name": "得意先名",
@@ -269,9 +265,9 @@ def jp_col_rename(df: pd.DataFrame) -> pd.DataFrame:
         "yj_code": "YJコード",
         "jan": "JAN",
         "quantity": "数量",
+        "sales_month": "売上月",
     }
-    cols = {c: mapping.get(c, c) for c in df.columns}
-    return df.rename(columns=cols)
+    return df.rename(columns={c: mapping.get(c, c) for c in df.columns})
 
 
 def render_result_header(name: str, res: QueryResult):
@@ -288,7 +284,7 @@ def render_result_header(name: str, res: QueryResult):
 
 
 # =========================
-# SIDEBAR (Login / Controls)
+# SIDEBAR
 # =========================
 st.sidebar.title("ログイン")
 user_email = st.sidebar.text_input("user_email（メール）", value=st.query_params.get("user_email", ""))
@@ -312,18 +308,19 @@ if c2.button("キャッシュ無効化"):
 st.sidebar.markdown("---")
 st.sidebar.caption("※遅い/固まる時：\n- Storage API ON\n- データキャッシュ無効化 ON\n- SQL表示 ON で原因特定")
 
+
 # =========================
-# HEADER / HEALTH
+# HEADER
 # =========================
 st.title("SFA Sales OS（入口）")
 
-# Current month (sys)
 res_month = query_df(
     name="sys_current_month",
     sql=f"SELECT * FROM {VIEW_SYS_CURRENT_MONTH} LIMIT 1",
     timeout_sec=timeout_sec,
     use_cache=True,
 )
+
 colA, colB, colC, colD = st.columns([1, 2, 1, 1])
 with colA:
     render_result_header("sys_current_month", res_month)
@@ -336,24 +333,19 @@ with colA:
 with colB:
     st.metric("ログイン氏名", user_email if user_email else "（未入力）")
 
-# Role display: per request, treat everyone as HQ_ADMIN (統括). Still show what table says if available.
-role_tier = "HQ_ADMIN"
-area_name = "統括"
+# Requested policy: 未分類OK・全員統括OK（表示上は統括で固定）
 with colC:
-    st.metric("role_tier", role_tier)
+    st.metric("role_tier", "HQ_ADMIN")
 with colD:
-    st.metric("area", area_name)
+    st.metric("area", "統括")
 
 st.markdown("---")
 
-# =========================
-# MAIN TABS
-# =========================
 tab_admin, tab_drill, tab_logs = st.tabs(["管理者入口（分析）", "ドリル（明細）", "計測ログ（遅い原因）"])
 
 
 # =========================
-# ADMIN: FYTD summary + Top/Bottom
+# ADMIN
 # =========================
 with tab_admin:
     st.subheader("A) 年度累計（FYTD）")
@@ -369,14 +361,12 @@ with tab_admin:
     if res_org.ok and not res_org.df.empty:
         df_org = jp_col_rename(res_org.df.copy())
 
-        # Show KPI-like metrics if columns exist
-        # We do best-effort; if not found, show the table.
-        cols = [c.lower() for c in res_org.df.columns]
-        # find likely columns
+        cols_lower = [c.lower() for c in res_org.df.columns]
+
         def pick(*cands: str) -> Optional[str]:
             for x in cands:
-                if x in cols:
-                    return res_org.df.columns[cols.index(x)]
+                if x in cols_lower:
+                    return res_org.df.columns[cols_lower.index(x)]
             return None
 
         sales_col = pick("sales_amount", "sales", "sales_total", "amount")
@@ -384,14 +374,8 @@ with tab_admin:
         gpr_col = pick("gross_profit_rate", "gp_rate", "profit_rate")
 
         m1, m2, m3 = st.columns(3)
-        if sales_col:
-            m1.metric("売上（FYTD）", f"{res_org.df[sales_col].fillna(0).sum():,.0f}")
-        else:
-            m1.metric("売上（FYTD）", "—")
-        if gp_col:
-            m2.metric("粗利（FYTD）", f"{res_org.df[gp_col].fillna(0).sum():,.0f}")
-        else:
-            m2.metric("粗利（FYTD）", "—")
+        m1.metric("売上（FYTD）", f"{res_org.df[sales_col].fillna(0).sum():,.0f}" if sales_col else "—")
+        m2.metric("粗利（FYTD）", f"{res_org.df[gp_col].fillna(0).sum():,.0f}" if gp_col else "—")
         if gpr_col:
             try:
                 v = float(res_org.df[gpr_col].dropna().iloc[0])
@@ -422,10 +406,8 @@ with tab_admin:
             use_cache=True,
         )
         render_result_header("admin_customer_fytd_bottom_named", res_bottom)
-
         if res_bottom.ok and not res_bottom.df.empty:
-            df_b = jp_col_rename(res_bottom.df.copy())
-            st.dataframe(df_b, use_container_width=True, height=420)
+            st.dataframe(jp_col_rename(res_bottom.df.copy()), use_container_width=True, height=420)
         else:
             st.info("下落データがありません。")
 
@@ -439,26 +421,23 @@ with tab_admin:
             use_cache=True,
         )
         render_result_header("admin_customer_fytd_top_named", res_top)
-
         if res_top.ok and not res_top.df.empty:
-            df_t = jp_col_rename(res_top.df.copy())
-            st.dataframe(df_t, use_container_width=True, height=420)
+            st.dataframe(jp_col_rename(res_top.df.copy()), use_container_width=True, height=420)
         else:
             st.info("伸長データがありません。")
 
-    st.caption("※ここは“管理者（統括）”前提で、scoped VIEW を通さずに安定稼働させています。")
+    st.caption("※ここは“全員統括”前提で、scoped VIEW を通さずに安定稼働させています。")
 
 
 # =========================
-# DRILL: customer x item/yj month
+# DRILL
 # =========================
 with tab_drill:
     st.subheader("ドリル（得意先 → 月次 → 品目/YJ）")
+    st.caption("※パラメータSQLで実行（Illegal input character 対策）")
 
-    st.caption("※ここは必ずパラメータSQLで実行します（Illegal input character 対策）")
-
-    # customer picker from top/bottom if available
-    cust_candidates: List[Tuple[str, str]] = []  # (code, name)
+    # candidates from top/bottom if present
+    cust_candidates: List[Tuple[str, str]] = []
     for res in [locals().get("res_top"), locals().get("res_bottom")]:
         if isinstance(res, QueryResult) and res.ok and not res.df.empty:
             cols = [c.lower() for c in res.df.columns]
@@ -466,7 +445,7 @@ with tab_drill:
                 ccode = res.df[res.df.columns[cols.index("customer_code")]].astype(str)
                 cname = res.df[res.df.columns[cols.index("customer_name")]].astype(str)
                 cust_candidates += list(zip(ccode.tolist(), cname.tolist()))
-    cust_candidates = list(dict.fromkeys(cust_candidates))  # dedup preserve order
+    cust_candidates = list(dict.fromkeys(cust_candidates))
 
     left, right = st.columns([2, 1])
     with left:
@@ -480,7 +459,6 @@ with tab_drill:
     with right:
         drill_mode = st.radio("ドリル軸", options=["得意先×品目（月次）", "得意先×YJ（月次）"], horizontal=False)
 
-    # period controls (month start/end as DATE)
     p1, p2, p3 = st.columns([1, 1, 2])
     with p1:
         start_date = st.date_input("開始日", value=date(2025, 4, 1))
@@ -527,7 +505,7 @@ with tab_drill:
         )
         render_result_header("drill", res_drill)
         if res_drill.ok:
-            st.dataframe(jp_col_rename(res_drill.df), use_container_width=True, height=520)
+            st.dataframe(jp_col_rename(res_drill.df.copy()), use_container_width=True, height=520)
         else:
             st.error("ドリル取得に失敗しました。上のエラーとSQLを確認してください。")
 
@@ -544,7 +522,6 @@ with tab_logs:
         df_log = pd.DataFrame(logs)
         st.dataframe(df_log, use_container_width=True, height=420)
 
-        # quick summary
         st.markdown("#### 直近の傾向")
         ok_rate = (df_log["ok"].sum() / len(df_log)) * 100
         st.write(f"- 成功率: {ok_rate:.1f}%")
