@@ -1,13 +1,11 @@
 # app.py
-# SFA Sales OS (入口) - Admin (Org summary + Top/Bottom) + Drill + Perf Logs
-# - Uses non-scoped views to avoid role/area gating (未分類OK・全員統括OK)
-# - Adds check mechanisms: SQL timing, timeout, cache control, query logging, parameterized queries
-# - FIX: Do NOT mutate st.session_state inside cached functions (StreamlitAPIException)
+# SFA Sales OS (入口) - Admin + Drill + Perf Logs
+# FIX-1: Do NOT mutate st.session_state inside cached funcs
+# FIX-2: st.cache_data return value must be serializable -> return (df, meta_dict)
 
 import time
-from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -23,27 +21,22 @@ PROJECT_ID = "salesdb-479915"
 DATASET_ID = "sales_data"
 LOCATION = "asia-northeast1"
 
-# Non-scoped (stable) views for Admin
 VIEW_SYS_CURRENT_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sys_current_month`"
 VIEW_ADMIN_ORG_FYTD = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_org_fytd_summary`"
 VIEW_ADMIN_TOP = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_top_named`"
 VIEW_ADMIN_BOTTOM = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_bottom_named`"
 
-# Drill views (already exist)
 VIEW_DRILL_CUST_ITEM_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_item_month`"
 VIEW_DRILL_CUST_YJ_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_yj_month`"
 
 DEFAULT_TIMEOUT_SEC = 60
 DEFAULT_LIMIT = 200
 
-st.set_page_config(
-    page_title="SFA Sales OS（入口）",
-    page_icon="📊",
-    layout="wide",
-)
+st.set_page_config(page_title="SFA Sales OS（入口）", page_icon="📊", layout="wide")
+
 
 # =========================
-# STATE / LOGGING
+# STATE
 # =========================
 if "query_logs" not in st.session_state:
     st.session_state.query_logs = []
@@ -51,28 +44,8 @@ if "cache_buster" not in st.session_state:
     st.session_state.cache_buster = 0
 
 
-@dataclass
-class QueryResult:
-    df: pd.DataFrame
-    elapsed_s: float
-    bytes_processed_gb: float
-    rows: int
-    job_id: Optional[str]
-    sql: str
-    ok: bool
-    error: Optional[str] = None
-
-
 def _now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _enable_perf_log() -> bool:
-    return bool(st.session_state.get("enable_perf_log", True))
-
-
-def _show_sql() -> bool:
-    return bool(st.session_state.get("show_sql", False))
 
 
 def _safe_float_gb(x: Optional[int]) -> float:
@@ -81,20 +54,28 @@ def _safe_float_gb(x: Optional[int]) -> float:
     return float(x) / (1024**3)
 
 
-def log_query(name: str, res: QueryResult):
+def log_query(name: str, ok: bool, elapsed_s: float, bytes_gb: float, rows: int, job_id: str, error: str, sql: str):
     st.session_state.query_logs.append(
         {
             "ts": _now_ts(),
             "name": name,
-            "ok": res.ok,
-            "elapsed_s": round(res.elapsed_s, 3),
-            "bytes_gb": round(res.bytes_processed_gb, 3),
-            "rows": int(res.rows),
-            "job_id": res.job_id or "",
-            "error": res.error or "",
-            "sql": res.sql if len(res.sql) <= 4000 else (res.sql[:4000] + "\n-- (truncated)"),
+            "ok": ok,
+            "elapsed_s": round(float(elapsed_s), 3),
+            "bytes_gb": round(float(bytes_gb), 3),
+            "rows": int(rows),
+            "job_id": job_id or "",
+            "error": error or "",
+            "sql": sql if len(sql) <= 4000 else (sql[:4000] + "\n-- (truncated)"),
         }
     )
+
+
+def perf_enabled() -> bool:
+    return bool(st.session_state.get("enable_perf_log", True))
+
+
+def show_sql() -> bool:
+    return bool(st.session_state.get("show_sql", False))
 
 
 # =========================
@@ -108,17 +89,16 @@ def get_bq_client() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID, location=LOCATION)
 
 
-def run_bq_query(
+def run_bq_query_df(
     name: str,
     sql: str,
     params: Optional[List[bigquery.ScalarQueryParameter]] = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     use_cache: bool = True,
     use_bqstorage: bool = False,
-) -> QueryResult:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Executes BigQuery SQL with optional query parameters.
-    IMPORTANT: Do not touch st.session_state here if called from cached functions.
+    Returns (df, meta_dict) where meta_dict is JSON-serializable.
     """
     client = get_bq_client()
     job_config = bigquery.QueryJobConfig(use_query_cache=use_cache)
@@ -126,55 +106,49 @@ def run_bq_query(
         job_config.query_parameters = params
 
     t0 = time.time()
-    job_id = None
+    job_id = ""
     try:
         job = client.query(sql, job_config=job_config)
         job_id = job.job_id
 
-        df = job.result(timeout=timeout_sec).to_dataframe(
-            create_bqstorage_client=use_bqstorage
-        )
+        df = job.result(timeout=timeout_sec).to_dataframe(create_bqstorage_client=use_bqstorage)
 
         elapsed = time.time() - t0
         bytes_gb = _safe_float_gb(getattr(job, "total_bytes_processed", None))
         rows = int(len(df))
 
-        res = QueryResult(
-            df=df,
-            elapsed_s=elapsed,
-            bytes_processed_gb=bytes_gb,
-            rows=rows,
-            job_id=job_id,
-            sql=sql,
-            ok=True,
-            error=None,
-        )
-        if _enable_perf_log():
-            log_query(name, res)
-        return res
+        meta = {
+            "ok": True,
+            "elapsed_s": float(elapsed),
+            "bytes_gb": float(bytes_gb),
+            "rows": int(rows),
+            "job_id": job_id,
+            "error": "",
+            "sql": sql,
+        }
+
+        # NOTE: logging is outside cache function, but run_bq_query_df can be used non-cached too
+        return df, meta
 
     except Exception as e:
         elapsed = time.time() - t0
-        res = QueryResult(
-            df=pd.DataFrame(),
-            elapsed_s=elapsed,
-            bytes_processed_gb=0.0,
-            rows=0,
-            job_id=job_id,
-            sql=sql,
-            ok=False,
-            error=str(e),
-        )
-        if _enable_perf_log():
-            log_query(name, res)
-        return res
+        meta = {
+            "ok": False,
+            "elapsed_s": float(elapsed),
+            "bytes_gb": 0.0,
+            "rows": 0,
+            "job_id": job_id,
+            "error": str(e),
+            "sql": sql,
+        }
+        return pd.DataFrame(), meta
 
 
 # =========================
 # CACHE LAYER
 # =========================
 @st.cache_data(show_spinner=False, ttl=300)
-def cached_query(
+def cached_query_df(
     cache_buster: int,
     name: str,
     sql: str,
@@ -182,15 +156,15 @@ def cached_query(
     timeout_sec: int,
     use_cache: bool,
     use_bqstorage: bool,
-) -> QueryResult:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Cached function MUST NOT modify st.session_state.
+    Cached function must return serializable values -> (DataFrame, dict)
     """
     params: List[bigquery.ScalarQueryParameter] = []
     for ptype, pname, pval in params_tuples:
         params.append(bigquery.ScalarQueryParameter(pname, ptype, pval))
 
-    return run_bq_query(
+    df, meta = run_bq_query_df(
         name=name,
         sql=sql,
         params=params or None,
@@ -198,6 +172,8 @@ def cached_query(
         use_cache=use_cache,
         use_bqstorage=use_bqstorage,
     )
+    # meta is dict, serializable
+    return df, meta
 
 
 def query_df(
@@ -206,7 +182,7 @@ def query_df(
     params: Optional[List[Tuple[str, str, Any]]] = None,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     use_cache: bool = True,
-) -> QueryResult:
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     params = params or []
     params_tuples = tuple((t, n, v) for (t, n, v) in params)
 
@@ -216,7 +192,7 @@ def query_df(
 
     if disable_cache:
         bq_params = [bigquery.ScalarQueryParameter(n, t, v) for (t, n, v) in params]
-        return run_bq_query(
+        df, meta = run_bq_query_df(
             name=name,
             sql=sql,
             params=bq_params or None,
@@ -224,16 +200,31 @@ def query_df(
             use_cache=use_cache,
             use_bqstorage=use_bqstorage,
         )
+    else:
+        df, meta = cached_query_df(
+            cache_buster,
+            name,
+            sql,
+            params_tuples,
+            timeout_sec,
+            use_cache,
+            use_bqstorage,
+        )
 
-    return cached_query(
-        cache_buster,
-        name,
-        sql,
-        params_tuples,
-        timeout_sec,
-        use_cache,
-        use_bqstorage,
-    )
+    # logging here (outside cache) is safe
+    if perf_enabled():
+        log_query(
+            name=name,
+            ok=bool(meta.get("ok")),
+            elapsed_s=float(meta.get("elapsed_s", 0.0)),
+            bytes_gb=float(meta.get("bytes_gb", 0.0)),
+            rows=int(meta.get("rows", 0)),
+            job_id=str(meta.get("job_id", "")),
+            error=str(meta.get("error", "")),
+            sql=str(meta.get("sql", "")),
+        )
+
+    return df, meta
 
 
 # =========================
@@ -270,17 +261,20 @@ def jp_col_rename(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={c: mapping.get(c, c) for c in df.columns})
 
 
-def render_result_header(name: str, res: QueryResult):
-    if res.ok:
-        st.caption(f"[{name}] query={res.elapsed_s:.1f}s / bytes={res.bytes_processed_gb:.2f}GB / rows={res.rows}")
-        if _show_sql():
+def render_result_header(name: str, meta: Dict[str, Any]):
+    if meta.get("ok"):
+        st.caption(
+            f"[{name}] query={float(meta.get('elapsed_s', 0.0)):.1f}s / "
+            f"bytes={float(meta.get('bytes_gb', 0.0)):.2f}GB / rows={int(meta.get('rows', 0))}"
+        )
+        if show_sql():
             with st.expander(f"SQL: {name}", expanded=False):
-                st.code(res.sql, language="sql")
+                st.code(str(meta.get("sql", "")), language="sql")
     else:
-        st.error(f"[{name}] ERROR: {res.error}")
-        if _show_sql():
+        st.error(f"[{name}] ERROR: {meta.get('error')}")
+        if show_sql():
             with st.expander(f"SQL: {name}", expanded=True):
-                st.code(res.sql, language="sql")
+                st.code(str(meta.get("sql", "")), language="sql")
 
 
 # =========================
@@ -301,12 +295,12 @@ c1, c2 = st.sidebar.columns(2)
 if c1.button("計測ログをクリア"):
     st.session_state.query_logs = []
     st.toast("計測ログをクリアしました")
-if c2.button("キャッシュ無効化"):
+if c2.button("キャッシュ無効化（再取得）"):
     st.session_state.cache_buster += 1
     st.toast("キャッシュキーを更新しました（次回から再取得）")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("※遅い/固まる時：\n- Storage API ON\n- データキャッシュ無効化 ON\n- SQL表示 ON で原因特定")
+st.sidebar.caption("※遅い/固まる時：Storage API ON / キャッシュ無効化 ON / SQL表示 ON で原因特定")
 
 
 # =========================
@@ -314,7 +308,7 @@ st.sidebar.caption("※遅い/固まる時：\n- Storage API ON\n- データキ�
 # =========================
 st.title("SFA Sales OS（入口）")
 
-res_month = query_df(
+df_month, meta_month = query_df(
     name="sys_current_month",
     sql=f"SELECT * FROM {VIEW_SYS_CURRENT_MONTH} LIMIT 1",
     timeout_sec=timeout_sec,
@@ -323,9 +317,9 @@ res_month = query_df(
 
 colA, colB, colC, colD = st.columns([1, 2, 1, 1])
 with colA:
-    render_result_header("sys_current_month", res_month)
-    if res_month.ok and not res_month.df.empty:
-        current_month = str(res_month.df.iloc[0, 0])
+    render_result_header("sys_current_month", meta_month)
+    if meta_month.get("ok") and not df_month.empty:
+        current_month = str(df_month.iloc[0, 0])
         st.metric("Current month", current_month)
     else:
         st.metric("Current month", "—")
@@ -333,7 +327,7 @@ with colA:
 with colB:
     st.metric("ログイン氏名", user_email if user_email else "（未入力）")
 
-# Requested policy: 未分類OK・全員統括OK（表示上は統括で固定）
+# 方針: 未分類・全員統括でよい（表示上の固定）
 with colC:
     st.metric("role_tier", "HQ_ADMIN")
 with colD:
@@ -350,23 +344,23 @@ tab_admin, tab_drill, tab_logs = st.tabs(["管理者入口（分析）", "ドリ
 with tab_admin:
     st.subheader("A) 年度累計（FYTD）")
 
-    res_org = query_df(
+    df_org, meta_org = query_df(
         name="admin_org_fytd_summary",
         sql=f"SELECT * FROM {VIEW_ADMIN_ORG_FYTD}",
         timeout_sec=timeout_sec,
         use_cache=True,
     )
-    render_result_header("admin_org_fytd_summary", res_org)
+    render_result_header("admin_org_fytd_summary", meta_org)
 
-    if res_org.ok and not res_org.df.empty:
-        df_org = jp_col_rename(res_org.df.copy())
+    if meta_org.get("ok") and not df_org.empty:
+        df_org_jp = jp_col_rename(df_org.copy())
 
-        cols_lower = [c.lower() for c in res_org.df.columns]
+        cols_lower = [c.lower() for c in df_org.columns]
 
         def pick(*cands: str) -> Optional[str]:
             for x in cands:
                 if x in cols_lower:
-                    return res_org.df.columns[cols_lower.index(x)]
+                    return df_org.columns[cols_lower.index(x)]
             return None
 
         sales_col = pick("sales_amount", "sales", "sales_total", "amount")
@@ -374,18 +368,18 @@ with tab_admin:
         gpr_col = pick("gross_profit_rate", "gp_rate", "profit_rate")
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("売上（FYTD）", f"{res_org.df[sales_col].fillna(0).sum():,.0f}" if sales_col else "—")
-        m2.metric("粗利（FYTD）", f"{res_org.df[gp_col].fillna(0).sum():,.0f}" if gp_col else "—")
+        m1.metric("売上（FYTD）", f"{df_org[sales_col].fillna(0).sum():,.0f}" if sales_col else "—")
+        m2.metric("粗利（FYTD）", f"{df_org[gp_col].fillna(0).sum():,.0f}" if gp_col else "—")
         if gpr_col:
             try:
-                v = float(res_org.df[gpr_col].dropna().iloc[0])
+                v = float(df_org[gpr_col].dropna().iloc[0])
                 m3.metric("粗利率（FYTD）", f"{v*100:.1f}%")
             except Exception:
                 m3.metric("粗利率（FYTD）", "—")
         else:
             m3.metric("粗利率（FYTD）", "—")
 
-        st.dataframe(df_org, use_container_width=True, height=220)
+        st.dataframe(df_org_jp, use_container_width=True, height=220)
     else:
         st.warning("FYTDサマリーが取得できません（VIEWを確認）")
 
@@ -398,31 +392,31 @@ with tab_admin:
 
     with cL:
         st.markdown("### 📉 下落（FYTD 前月差）")
-        res_bottom = query_df(
+        df_bottom, meta_bottom = query_df(
             name="admin_customer_fytd_bottom_named",
             sql=f"SELECT * FROM {VIEW_ADMIN_BOTTOM} LIMIT @lim",
             params=[("INT64", "lim", int(topN))],
             timeout_sec=timeout_sec,
             use_cache=True,
         )
-        render_result_header("admin_customer_fytd_bottom_named", res_bottom)
-        if res_bottom.ok and not res_bottom.df.empty:
-            st.dataframe(jp_col_rename(res_bottom.df.copy()), use_container_width=True, height=420)
+        render_result_header("admin_customer_fytd_bottom_named", meta_bottom)
+        if meta_bottom.get("ok") and not df_bottom.empty:
+            st.dataframe(jp_col_rename(df_bottom.copy()), use_container_width=True, height=420)
         else:
             st.info("下落データがありません。")
 
     with cR:
         st.markdown("### 📈 伸長（FYTD 前月差）")
-        res_top = query_df(
+        df_top, meta_top = query_df(
             name="admin_customer_fytd_top_named",
             sql=f"SELECT * FROM {VIEW_ADMIN_TOP} LIMIT @lim",
             params=[("INT64", "lim", int(topN))],
             timeout_sec=timeout_sec,
             use_cache=True,
         )
-        render_result_header("admin_customer_fytd_top_named", res_top)
-        if res_top.ok and not res_top.df.empty:
-            st.dataframe(jp_col_rename(res_top.df.copy()), use_container_width=True, height=420)
+        render_result_header("admin_customer_fytd_top_named", meta_top)
+        if meta_top.get("ok") and not df_top.empty:
+            st.dataframe(jp_col_rename(df_top.copy()), use_container_width=True, height=420)
         else:
             st.info("伸長データがありません。")
 
@@ -436,14 +430,13 @@ with tab_drill:
     st.subheader("ドリル（得意先 → 月次 → 品目/YJ）")
     st.caption("※パラメータSQLで実行（Illegal input character 対策）")
 
-    # candidates from top/bottom if present
     cust_candidates: List[Tuple[str, str]] = []
-    for res in [locals().get("res_top"), locals().get("res_bottom")]:
-        if isinstance(res, QueryResult) and res.ok and not res.df.empty:
-            cols = [c.lower() for c in res.df.columns]
+    for df in [locals().get("df_top"), locals().get("df_bottom")]:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            cols = [c.lower() for c in df.columns]
             if "customer_code" in cols and "customer_name" in cols:
-                ccode = res.df[res.df.columns[cols.index("customer_code")]].astype(str)
-                cname = res.df[res.df.columns[cols.index("customer_name")]].astype(str)
+                ccode = df[df.columns[cols.index("customer_code")]].astype(str)
+                cname = df[df.columns[cols.index("customer_name")]].astype(str)
                 cust_candidates += list(zip(ccode.tolist(), cname.tolist()))
     cust_candidates = list(dict.fromkeys(cust_candidates))
 
@@ -491,7 +484,7 @@ with tab_drill:
             LIMIT @lim
             """
 
-        res_drill = query_df(
+        df_drill, meta_drill = query_df(
             name="drill",
             sql=sql,
             params=[
@@ -503,9 +496,9 @@ with tab_drill:
             timeout_sec=timeout_sec,
             use_cache=True,
         )
-        render_result_header("drill", res_drill)
-        if res_drill.ok:
-            st.dataframe(jp_col_rename(res_drill.df.copy()), use_container_width=True, height=520)
+        render_result_header("drill", meta_drill)
+        if meta_drill.get("ok"):
+            st.dataframe(jp_col_rename(df_drill.copy()), use_container_width=True, height=520)
         else:
             st.error("ドリル取得に失敗しました。上のエラーとSQLを確認してください。")
 
@@ -528,5 +521,5 @@ with tab_logs:
         st.write(f"- 最大時間: {df_log['elapsed_s'].max():.2f}s")
         st.write(f"- 最大bytes: {df_log['bytes_gb'].max():.2f}GB")
 
-        if st.button("ログCSVダウンロード用に表示（コピー）"):
+        if st.button("ログCSV（コピー用）"):
             st.code(df_log.to_csv(index=False), language="text")
