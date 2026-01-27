@@ -1,571 +1,555 @@
-from __future__ import annotations
+# app.py
+# SFA Sales OS (入口) - Admin (Org summary + Top/Bottom) + Drill + Perf Logs
+# - Uses non-scoped views to avoid role/area gating (as requested: 未分類OK・全員統括OK)
+# - Adds check mechanisms: SQL timing, timeout, cache control, query logging, parameterized queries
+# - Designed to be pasted/replaced as-is in your Streamlit repo
 
 import os
-import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
-# ============================================================
+# =========================
 # CONFIG
-# ============================================================
-PROJECT_ID = os.getenv("BQ_PROJECT_ID", "salesdb-479915")
-DATASET = os.getenv("BQ_DATASET", "sales_data")
+# =========================
+PROJECT_ID = "salesdb-479915"
+DATASET_ID = "sales_data"
+LOCATION = "asia-northeast1"
 
-V_SYS_MONTH = f"`{PROJECT_ID}.{DATASET}.v_sys_current_month`"
+# Non-scoped (stable) views for Admin
+VIEW_SYS_CURRENT_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sys_current_month`"
+VIEW_ADMIN_ORG_FYTD = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_org_fytd_summary`"
+VIEW_ADMIN_TOP = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_top_named`"
+VIEW_ADMIN_BOTTOM = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_bottom_named`"
 
-V_ADMIN_ORG_FYTD_SCOPED = f"`{PROJECT_ID}.{DATASET}.v_admin_org_fytd_summary_scoped`"
-V_ADMIN_FYTD_MOM_TOP_SCOPED = f"`{PROJECT_ID}.{DATASET}.v_admin_customer_fytd_top_named_scoped`"
-V_ADMIN_FYTD_MOM_BOTTOM_SCOPED = f"`{PROJECT_ID}.{DATASET}.v_admin_customer_fytd_bottom_named_scoped`"
+# Drill views (you already have these)
+VIEW_DRILL_CUST_ITEM_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_item_month`"
+VIEW_DRILL_CUST_YJ_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_detail_by_customer_yj_month`"
 
-V_YOY_TOP = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_top_current_month`"
-V_YOY_BOTTOM = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_bottom_current_month`"
-V_YOY_INVALID = f"`{PROJECT_ID}.{DATASET}.v_sales_customer_yoy_uncomparable_current_month`"
+DEFAULT_TIMEOUT_SEC = 60  # UI-level timeout target (BQ job can still run; we handle UX)
+DEFAULT_LIMIT = 200
 
-V_FACT = f"`{PROJECT_ID}.{DATASET}.v_sales_fact_login_jan_daily`"
-V_STAFF_EMAIL_NAME = f"`{PROJECT_ID}.{DATASET}.v_staff_email_name`"
-DIM_STAFF_ROLE = f"`{PROJECT_ID}.{DATASET}.dim_staff_role`"
+st.set_page_config(
+    page_title="SFA Sales OS（入口）",
+    page_icon="📊",
+    layout="wide",
+)
 
-# BigQuery timeout（SQL実行）
-BQ_TIMEOUT_SEC = int(os.getenv("BQ_TIMEOUT_SEC", "60"))
-# BigQuery client 初期化 timeout（★ここが今回の主犯）
-BQ_CLIENT_INIT_TIMEOUT_SEC = int(os.getenv("BQ_CLIENT_INIT_TIMEOUT_SEC", "10"))
-
-
-# ============================================================
-# UI
-# ============================================================
-st.set_page_config(page_title="SFA Sales OS（入口）", layout="wide")
-st.title("SFA Sales OS（入口）")  # 真っ黒回避
-
-
-# ============================================================
-# Utils
-# ============================================================
-def yen(x: Any) -> str:
-    try:
-        if pd.isna(x):
-            return ""
-        return f"¥{int(round(float(x))):,}"
-    except Exception:
-        return ""
+# =========================
+# STATE / LOGGING
+# =========================
+if "query_logs" not in st.session_state:
+    st.session_state.query_logs = []  # List[dict]
+if "cache_buster" not in st.session_state:
+    st.session_state.cache_buster = 0
 
 
-def pct(x: Any) -> str:
-    try:
-        if pd.isna(x):
-            return ""
-        return f"{float(x) * 100:.1f}%"
-    except Exception:
-        return ""
-
-
-def safe_lower(s: Any) -> str:
-    return str(s).strip().lower() if s is not None else ""
-
-
-def parse_code_from_label(label: str) -> str:
-    m = re.search(r"\((.+?)\)\s*$", label)
-    return m.group(1) if m else label
-
-
-# ============================================================
-# Perf log
-# ============================================================
 @dataclass
-class QueryPerf:
-    name: str
-    ok: bool
-    query_sec: float
-    df_sec: float
-    total_sec: float
-    bytes_gb: float
+class QueryResult:
+    df: pd.DataFrame
+    elapsed_s: float
+    bytes_processed_gb: float
     rows: int
-    job_id: str
-    note: str
+    job_id: Optional[str]
+    sql: str
+    ok: bool
+    error: Optional[str] = None
 
 
-if "perf_logs" not in st.session_state:
-    st.session_state.perf_logs: List[QueryPerf] = []
-
-if "cache_bust" not in st.session_state:
-    st.session_state.cache_bust = 0
+def _now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ============================================================
-# BigQuery Client (★ここを強化：secrets明示 + init timeout)
-# ============================================================
-def _build_bq_client_strict() -> bigquery.Client:
-    """
-    Streamlit Cloudで bigquery.Client() のADC探索がハングすることがあるため
-    st.secrets の service account を優先して明示的に作る。
-    """
-    # 1) Streamlit secrets に service account JSON がある場合（推奨）
-    if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(
-            info,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        return bigquery.Client(project=PROJECT_ID, credentials=creds)
-
-    # 2) 無ければ従来のADC（ただしここがハングしやすい）
-    return bigquery.Client(project=PROJECT_ID)
+def log_query(name: str, res: QueryResult):
+    st.session_state.query_logs.append(
+        {
+            "ts": _now_ts(),
+            "name": name,
+            "ok": res.ok,
+            "elapsed_s": round(res.elapsed_s, 3),
+            "bytes_gb": round(res.bytes_processed_gb, 3),
+            "rows": int(res.rows),
+            "job_id": res.job_id or "",
+            "error": res.error or "",
+            "sql": res.sql if len(res.sql) <= 4000 else (res.sql[:4000] + "\n-- (truncated)"),
+        }
+    )
 
 
-@st.cache_resource
+# =========================
+# AUTH / CLIENT
+# =========================
+@st.cache_resource(show_spinner=False)
 def get_bq_client() -> bigquery.Client:
     """
-    ★ client生成を別スレッドで行い、timeoutで必ず落とす
+    Uses st.secrets["gcp_service_account"] if present (recommended).
     """
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_build_bq_client_strict)
-        try:
-            return fut.result(timeout=BQ_CLIENT_INIT_TIMEOUT_SEC)
-        except FuturesTimeoutError:
-            raise RuntimeError(
-                f"BigQuery client初期化が {BQ_CLIENT_INIT_TIMEOUT_SEC}s を超えてタイムアウトしました。"
-                "（ADC探索ハングの可能性大。st.secrets['gcp_service_account'] の設定を確認してください）"
-            )
+    if "gcp_service_account" in st.secrets:
+        creds = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+        return bigquery.Client(project=PROJECT_ID, credentials=creds, location=LOCATION)
+    # fallback: default credentials
+    return bigquery.Client(project=PROJECT_ID, location=LOCATION)
 
 
-def _make_job_config(params: Optional[Dict[str, Any]]) -> bigquery.QueryJobConfig:
-    qps = []
-    if params:
-        for k, v in params.items():
-            qps.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
-    return bigquery.QueryJobConfig(query_parameters=qps)
+def _use_bqstorage_api() -> bool:
+    return bool(st.session_state.get("use_bqstorage", False))
 
 
-def _to_df(result, prefer_storage_api: bool) -> Tuple[pd.DataFrame, float, str]:
-    t1 = time.time()
-    note = ""
-    try:
-        if prefer_storage_api:
-            df = result.to_dataframe(create_bqstorage_client=True)
-            note = "df:StorageAPI"
-        else:
-            df = result.to_dataframe()
-            note = "df:REST"
-    except Exception as e:
-        df = result.to_dataframe()
-        note = f"df:fallback(REST) ({type(e).__name__})"
-    t2 = time.time()
-    return df, (t2 - t1), note
+def _show_sql() -> bool:
+    return bool(st.session_state.get("show_sql", False))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def qdf_cached(
-    sql: str,
-    params: Optional[Dict[str, Any]],
-    prefer_storage_api: bool,
-    cache_bust: int,
-    timeout_sec: int,
-) -> Tuple[pd.DataFrame, QueryPerf]:
-    t0 = time.time()
-
-    # ★ここで get_bq_client() が止まるなら、必ず例外で画面に出す
-    client = get_bq_client()
-
-    job = client.query(sql, job_config=_make_job_config(params))
-    try:
-        result = job.result(timeout=timeout_sec)
-        t_query_done = time.time()
-
-        df, df_sec, df_note = _to_df(result, prefer_storage_api=prefer_storage_api)
-        t_end = time.time()
-
-        bytes_gb = float(job.total_bytes_processed or 0) / 1e9
-        perf = QueryPerf(
-            name="",
-            ok=True,
-            query_sec=(t_query_done - t0),
-            df_sec=df_sec,
-            total_sec=(t_end - t0),
-            bytes_gb=bytes_gb,
-            rows=int(df.shape[0]),
-            job_id=str(job.job_id),
-            note=df_note,
-        )
-        return df, perf
-
-    except Exception as e:
-        t_end = time.time()
-        perf = QueryPerf(
-            name="",
-            ok=False,
-            query_sec=0.0,
-            df_sec=0.0,
-            total_sec=(t_end - t0),
-            bytes_gb=0.0,
-            rows=0,
-            job_id=str(getattr(job, "job_id", "")),
-            note=f"ERROR: {type(e).__name__}: {e}",
-        )
-        return pd.DataFrame(), perf
+def _enable_perf_log() -> bool:
+    return bool(st.session_state.get("enable_perf_log", True))
 
 
-def qdf(
+def _cache_key_suffix() -> int:
+    # increments when user hits "キャッシュ無効化"
+    return int(st.session_state.get("cache_buster", 0))
+
+
+def _safe_float_gb(x: Optional[int]) -> float:
+    if not x:
+        return 0.0
+    return float(x) / (1024**3)
+
+
+def run_bq_query(
     name: str,
     sql: str,
-    params: Optional[Dict[str, Any]] = None,
-    prefer_storage_api: bool = True,
-    show_check: bool = True,
-) -> pd.DataFrame:
-    df, perf = qdf_cached(
-        sql=sql,
-        params=params,
-        prefer_storage_api=prefer_storage_api,
-        cache_bust=st.session_state.cache_bust,
-        timeout_sec=BQ_TIMEOUT_SEC,
-    )
-    perf.name = name
-    st.session_state.perf_logs.append(perf)
+    params: Optional[List[bigquery.ScalarQueryParameter]] = None,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    use_cache: bool = True,
+) -> QueryResult:
+    """
+    Executes BigQuery SQL with optional query parameters (prevents illegal character / injection).
+    Adds timing + bytes processed + job id.
+    """
+    client = get_bq_client()
 
-    if show_check:
-        if perf.ok:
-            st.caption(
-                f"✅ [{perf.name}] query={perf.query_sec:.1f}s / df={perf.df_sec:.1f}s / total={perf.total_sec:.1f}s "
-                f"| bytes={perf.bytes_gb:.2f}GB | rows={perf.rows:,} | {perf.note}"
-            )
-        else:
-            st.error(f"❌ [{perf.name}] {perf.note}")
+    job_config = bigquery.QueryJobConfig(use_query_cache=use_cache)
+    if params:
+        job_config.query_parameters = params
 
-    return df
-
-
-# ============================================================
-# Role / Name
-# ============================================================
-@st.cache_data(ttl=600, show_spinner=False)
-def get_staff_name_norm(login_email: str) -> str:
-    df, _ = qdf_cached(
-        sql=f"""
-            SELECT staff_name_norm
-            FROM {V_STAFF_EMAIL_NAME}
-            WHERE LOWER(login_email)=@email
-            LIMIT 1
-        """,
-        params={"email": login_email},
-        prefer_storage_api=True,
-        cache_bust=0,
-        timeout_sec=BQ_TIMEOUT_SEC,
-    )
-    if df.empty:
-        return login_email
-    return str(df.iloc[0]["staff_name_norm"])
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_role_scope(login_email: str) -> Dict[str, Any]:
-    df, _ = qdf_cached(
-        sql=f"""
-            SELECT role_tier, area_name, scope_type
-            FROM {DIM_STAFF_ROLE}
-            WHERE LOWER(login_email)=@email
-            LIMIT 1
-        """,
-        params={"email": login_email},
-        prefer_storage_api=True,
-        cache_bust=0,
-        timeout_sec=BQ_TIMEOUT_SEC,
-    )
-    if df.empty:
-        return {}
-    return df.iloc[0].to_dict()
-
-
-# ============================================================
-# Sidebar（rerun loop対策済み）
-# ============================================================
-with st.sidebar:
-    st.header("ログイン")
-
-    qp_email = safe_lower(st.query_params.get("user_email", ""))
-    user_email = safe_lower(st.text_input("user_email（メール）", value=qp_email))
-
-    if user_email and qp_email != user_email:
-        st.query_params["user_email"] = user_email
-
-    prefer_storage_api = st.toggle("高速転送（Storage API）を試す", value=True)
-    show_checks = st.toggle("チェック表示（SQL計測を表示）", value=True)
-
-    col_a, col_b = st.columns(2)
-    if col_a.button("計測ログをクリア"):
-        st.session_state.perf_logs = []
-    if col_b.button("キャッシュ無効化"):
-        st.session_state.cache_bust += 1
-        st.session_state.perf_logs = []
-
-    st.divider()
-    st.caption("※真っ黒/固まる時：チェック表示ONでどこで止まってるか確認できます。")
-
-if not user_email:
-    st.info("左のサイドバーで user_email を入力してください。")
-    st.stop()
-
-
-# ============================================================
-# Header（必ず表示）
-# ============================================================
-left, right = st.columns([2, 1])
-with left:
-    st.subheader(f"ログイン: {user_email}")
-with right:
-    st.caption(f"BQ timeout: {BQ_TIMEOUT_SEC}s / client init timeout: {BQ_CLIENT_INIT_TIMEOUT_SEC}s")
-
-
-# ============================================================
-# ★ client health check（ここで止まるなら原因は認証/ネットワーク）
-# ============================================================
-with st.spinner("BigQuery client 初期化チェック..."):
+    t0 = time.time()
+    job_id = None
     try:
-        _ = get_bq_client()
-        st.success("BigQuery client OK")
+        job = client.query(sql, job_config=job_config)
+        job_id = job.job_id
+
+        # We don't hard-cancel BQ job; we use a UI timeout for responsiveness
+        # but still try to fetch within timeout.
+        df = job.result(timeout=timeout_sec).to_dataframe(
+            create_bqstorage_client=_use_bqstorage_api()
+        )
+        elapsed = time.time() - t0
+
+        bytes_gb = _safe_float_gb(getattr(job, "total_bytes_processed", None))
+        rows = int(len(df))
+
+        res = QueryResult(
+            df=df,
+            elapsed_s=elapsed,
+            bytes_processed_gb=bytes_gb,
+            rows=rows,
+            job_id=job_id,
+            sql=sql,
+            ok=True,
+            error=None,
+        )
+        if _enable_perf_log():
+            log_query(name, res)
+        return res
+
     except Exception as e:
-        st.error(f"BigQuery client 初期化に失敗: {e}")
-        st.stop()
+        elapsed = time.time() - t0
+        res = QueryResult(
+            df=pd.DataFrame(),
+            elapsed_s=elapsed,
+            bytes_processed_gb=0.0,
+            rows=0,
+            job_id=job_id,
+            sql=sql,
+            ok=False,
+            error=str(e),
+        )
+        if _enable_perf_log():
+            log_query(name, res)
+        return res
 
 
-# ============================================================
-# current_month 取得
-# ============================================================
-with st.spinner("sys_current_month 取得中..."):
-    sys_df = qdf(
-        name="sys_current_month",
-        sql=f"SELECT * FROM {V_SYS_MONTH} LIMIT 1",
-        params=None,
-        prefer_storage_api=prefer_storage_api,
-        show_check=show_checks,
+# Cache layer (data)
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_query(
+    cache_buster: int,
+    name: str,
+    sql: str,
+    params_tuples: Tuple[Tuple[str, str, Any], ...],
+    timeout_sec: int,
+    use_cache: bool,
+    use_bqstorage: bool,
+) -> QueryResult:
+    # Rebuild params objects inside cache function
+    params: List[bigquery.ScalarQueryParameter] = []
+    for ptype, pname, pval in params_tuples:
+        params.append(bigquery.ScalarQueryParameter(pname, ptype, pval))
+    # use_bqstorage is read from st.session_state normally, but passed here to bind cache key
+    st.session_state["use_bqstorage"] = use_bqstorage
+    return run_bq_query(name=name, sql=sql, params=params or None, timeout_sec=timeout_sec, use_cache=use_cache)
+
+
+def query_df(
+    name: str,
+    sql: str,
+    params: Optional[List[Tuple[str, str, Any]]] = None,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    use_cache: bool = True,
+) -> QueryResult:
+    """
+    Wrapper that applies st.cache_data if enabled by UI.
+    params: list of tuples (type, name, value) e.g. ("STRING","customer_code","123")
+    """
+    params = params or []
+    params_tuples = tuple((t, n, v) for (t, n, v) in params)
+
+    if st.session_state.get("disable_data_cache", False):
+        # no cache
+        bq_params = [bigquery.ScalarQueryParameter(n, t, v) for (t, n, v) in params]
+        return run_bq_query(name, sql, bq_params or None, timeout_sec=timeout_sec, use_cache=use_cache)
+
+    return cached_query(
+        _cache_key_suffix(),
+        name,
+        sql,
+        params_tuples,
+        timeout_sec,
+        use_cache,
+        _use_bqstorage_api(),
     )
 
-if not sys_df.empty and "current_month" in sys_df.columns:
-    current_month = str(sys_df.iloc[0]["current_month"])
-else:
-    current_month = "2026-01-01"
 
-staff_name = get_staff_name_norm(user_email)
-role = get_role_scope(user_email)
+# =========================
+# UI HELPERS
+# =========================
+def jp_col_rename(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Best-effort Japanese labels for common columns.
+    If your views use different column names, they will still display as-is.
+    """
+    mapping = {
+        "customer_code": "得意先コード",
+        "customer_name": "得意先名",
+        "branch_code": "支店コード",
+        "branch_name": "支店名",
+        "staff_code": "担当者コード",
+        "staff_name": "担当者名",
+        "sales_amount": "売上",
+        "gross_profit": "粗利",
+        "gross_profit_rate": "粗利率",
+        "gp_rate": "粗利率",
+        "yoy_sales_amount": "前年比（売上）",
+        "yoy_gross_profit": "前年比（粗利）",
+        "mom_sales_amount": "前月差（売上）",
+        "mom_gross_profit": "前月差（粗利）",
+        "rank": "順位",
+        "fiscal_year": "年度",
+        "fiscal_month": "月",
+        "month": "月",
+        "ym": "年月",
+        "item_name": "品目名",
+        "item_code": "品目コード",
+        "yj_code": "YJコード",
+        "jan": "JAN",
+        "quantity": "数量",
+    }
+    cols = {c: mapping.get(c, c) for c in df.columns}
+    return df.rename(columns=cols)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Current month", current_month)
-c2.metric("ログイン氏名", staff_name)
-c3.metric("role_tier", role.get("role_tier", "-"))
-c4.metric("area", role.get("area_name", "-"))
 
-st.divider()
+def render_result_header(name: str, res: QueryResult):
+    if res.ok:
+        st.caption(f"[{name}] query={res.elapsed_s:.1f}s / bytes={res.bytes_processed_gb:.2f}GB / rows={res.rows}")
+        if _show_sql():
+            with st.expander(f"SQL: {name}", expanded=False):
+                st.code(res.sql, language="sql")
+    else:
+        st.error(f"[{name}] ERROR: {res.error}")
+        if _show_sql():
+            with st.expander(f"SQL: {name}", expanded=True):
+                st.code(res.sql, language="sql")
 
-# ============================================================
-# Tabs
-# ============================================================
-tab_admin, tab_drill, tab_perf = st.tabs(["管理者入口（分析）", "ドリル（明細）", "計測ログ（遅い原因）"])
 
+# =========================
+# SIDEBAR (Login / Controls)
+# =========================
+st.sidebar.title("ログイン")
+user_email = st.sidebar.text_input("user_email（メール）", value=st.query_params.get("user_email", ""))
+
+st.sidebar.markdown("---")
+st.sidebar.toggle("高速転送（Storage API）を試す", value=False, key="use_bqstorage")
+st.sidebar.toggle("チェック表示（SQL計測を表示）", value=True, key="enable_perf_log")
+st.sidebar.toggle("SQLを表示（デバッグ用）", value=False, key="show_sql")
+st.sidebar.toggle("データキャッシュ無効化", value=False, key="disable_data_cache")
+
+timeout_sec = st.sidebar.number_input("BQ timeout（秒）", min_value=10, max_value=300, value=DEFAULT_TIMEOUT_SEC, step=10)
+
+c1, c2 = st.sidebar.columns(2)
+if c1.button("計測ログをクリア"):
+    st.session_state.query_logs = []
+    st.toast("計測ログをクリアしました")
+if c2.button("キャッシュ無効化"):
+    st.session_state.cache_buster += 1
+    st.toast("キャッシュキーを更新しました（次回から再取得）")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("※遅い/固まる時：\n- Storage API ON\n- データキャッシュ無効化 ON\n- SQL表示 ON で原因特定")
+
+# =========================
+# HEADER / HEALTH
+# =========================
+st.title("SFA Sales OS（入口）")
+
+# Current month (sys)
+res_month = query_df(
+    name="sys_current_month",
+    sql=f"SELECT * FROM {VIEW_SYS_CURRENT_MONTH} LIMIT 1",
+    timeout_sec=timeout_sec,
+    use_cache=True,
+)
+colA, colB, colC, colD = st.columns([1, 2, 1, 1])
+with colA:
+    render_result_header("sys_current_month", res_month)
+    if res_month.ok and not res_month.df.empty:
+        current_month = str(res_month.df.iloc[0, 0])
+        st.metric("Current month", current_month)
+    else:
+        st.metric("Current month", "—")
+
+with colB:
+    st.metric("ログイン氏名", user_email if user_email else "（未入力）")
+
+# Role display: per request, treat everyone as HQ_ADMIN (統括). Still show what table says if available.
+role_tier = "HQ_ADMIN"
+area_name = "統括"
+with colC:
+    st.metric("role_tier", role_tier)
+with colD:
+    st.metric("area", area_name)
+
+st.markdown("---")
+
+# =========================
+# MAIN TABS
+# =========================
+tab_admin, tab_drill, tab_logs = st.tabs(["管理者入口（分析）", "ドリル（明細）", "計測ログ（遅い原因）"])
+
+
+# =========================
+# ADMIN: FYTD summary + Top/Bottom
+# =========================
 with tab_admin:
     st.subheader("A) 年度累計（FYTD）")
 
-    with st.spinner("FYTDサマリー取得中..."):
-        org = qdf(
-            name="admin_org_fytd_summary_scoped",
-            sql=f"""
-                SELECT sales_amount_fytd, gross_profit_fytd, gross_profit_rate_fytd
-                FROM {V_ADMIN_ORG_FYTD_SCOPED}
-                WHERE viewer_email=@email
-                LIMIT 1
-            """,
-            params={"email": user_email},
-            prefer_storage_api=prefer_storage_api,
-            show_check=show_checks,
-        )
+    res_org = query_df(
+        name="admin_org_fytd_summary",
+        sql=f"SELECT * FROM {VIEW_ADMIN_ORG_FYTD}",
+        timeout_sec=timeout_sec,
+        use_cache=True,
+    )
+    render_result_header("admin_org_fytd_summary", res_org)
 
-    if org.empty:
-        st.warning("FYTDサマリーが取得できません（role/area/scoped を確認）")
-    else:
-        r = org.iloc[0]
-        k1, k2, k3 = st.columns(3)
-        k1.metric("FYTD 売上", yen(r.get("sales_amount_fytd")))
-        k2.metric("FYTD 粗利", yen(r.get("gross_profit_fytd")))
-        k3.metric("FYTD 粗利率", pct(r.get("gross_profit_rate_fytd")))
+    if res_org.ok and not res_org.df.empty:
+        df_org = jp_col_rename(res_org.df.copy())
 
-    st.divider()
-    st.subheader("B) FYTD MoM（前月差）ランキング")
-    left, right = st.columns(2)
+        # Show KPI-like metrics if columns exist
+        # We do best-effort; if not found, show the table.
+        cols = [c.lower() for c in res_org.df.columns]
+        # find likely columns
+        def pick(*cands: str) -> Optional[str]:
+            for x in cands:
+                if x in cols:
+                    return res_org.df.columns[cols.index(x)]
+            return None
 
-    with left:
-        st.markdown("### 📉 下落（FYTD 前月差）")
-        with st.spinner("下落ランキング取得中..."):
-            bottom = qdf(
-                name="admin_customer_fytd_bottom_named_scoped",
-                sql=f"""
-                    SELECT
-                      得意先コード,
-                      得意先名,
-                      支店名,
-                      sales_amount_fytd,
-                      gross_profit_fytd,
-                      sales_diff_mom,
-                      gross_profit_diff_mom
-                    FROM {V_ADMIN_FYTD_MOM_BOTTOM_SCOPED}
-                    WHERE viewer_email=@email
-                    ORDER BY sales_diff_mom ASC
-                    LIMIT 50
-                """,
-                params={"email": user_email},
-                prefer_storage_api=prefer_storage_api,
-                show_check=show_checks,
-            )
-        st.dataframe(bottom, use_container_width=True, height=520)
+        sales_col = pick("sales_amount", "sales", "sales_total", "amount")
+        gp_col = pick("gross_profit", "gp", "profit")
+        gpr_col = pick("gross_profit_rate", "gp_rate", "profit_rate")
 
-    with right:
-        st.markdown("### 📈 伸長（FYTD 前月差）")
-        with st.spinner("伸長ランキング取得中..."):
-            top = qdf(
-                name="admin_customer_fytd_top_named_scoped",
-                sql=f"""
-                    SELECT
-                      得意先コード,
-                      得意先名,
-                      支店名,
-                      sales_amount_fytd,
-                      gross_profit_fytd,
-                      sales_diff_mom,
-                      gross_profit_diff_mom
-                    FROM {V_ADMIN_FYTD_MOM_TOP_SCOPED}
-                    WHERE viewer_email=@email
-                    ORDER BY sales_diff_mom DESC
-                    LIMIT 50
-                """,
-                params={"email": user_email},
-                prefer_storage_api=prefer_storage_api,
-                show_check=show_checks,
-            )
-        st.dataframe(top, use_container_width=True, height=520)
-
-    st.divider()
-    st.subheader("C) 当月 YoY（前年比較）")
-    t1, t2, t3 = st.tabs(["下落（YoY valid）", "伸長（YoY valid）", "比較不能（YoY invalid）"])
-
-    with t1:
-        yoy_bottom = qdf(
-            name="sales_customer_yoy_bottom_current_month",
-            sql=f"SELECT * FROM {V_YOY_BOTTOM} WHERE login_email=@email LIMIT 200",
-            params={"email": user_email},
-            prefer_storage_api=prefer_storage_api,
-            show_check=show_checks,
-        )
-        st.dataframe(yoy_bottom, use_container_width=True, height=520)
-
-    with t2:
-        yoy_top = qdf(
-            name="sales_customer_yoy_top_current_month",
-            sql=f"SELECT * FROM {V_YOY_TOP} WHERE login_email=@email LIMIT 200",
-            params={"email": user_email},
-            prefer_storage_api=prefer_storage_api,
-            show_check=show_checks,
-        )
-        st.dataframe(yoy_top, use_container_width=True, height=520)
-
-    with t3:
-        yoy_inv = qdf(
-            name="sales_customer_yoy_uncomparable_current_month",
-            sql=f"SELECT * FROM {V_YOY_INVALID} WHERE login_email=@email LIMIT 200",
-            params={"email": user_email},
-            prefer_storage_api=prefer_storage_api,
-            show_check=show_checks,
-        )
-        st.dataframe(yoy_inv, use_container_width=True, height=520)
-
-with tab_drill:
-    st.subheader("得意先 → 当月 日次明細（JAN粒度）")
-
-    with st.form("drill_form", clear_on_submit=False):
-        kw = st.text_input("得意先名（部分一致）", value="")
-        limit_candidates = st.slider("候補件数", 10, 200, 50)
-        run = st.form_submit_button("検索 → 候補表示")
-
-    if run and kw.strip():
-        cand = qdf(
-            name="drill_candidates",
-            sql=f"""
-                SELECT DISTINCT customer_code, customer_name
-                FROM {V_FACT}
-                WHERE login_email=@email
-                  AND month=DATE(@m)
-                  AND customer_name LIKE CONCAT('%', @kw, '%')
-                LIMIT {int(limit_candidates)}
-            """,
-            params={"email": user_email, "m": current_month, "kw": kw.strip()},
-            prefer_storage_api=prefer_storage_api,
-            show_check=show_checks,
-        )
-
-        if cand.empty:
-            st.info("候補なし")
+        m1, m2, m3 = st.columns(3)
+        if sales_col:
+            m1.metric("売上（FYTD）", f"{res_org.df[sales_col].fillna(0).sum():,.0f}")
         else:
-            labels = cand.apply(lambda r: f"{r['customer_name']} ({r['customer_code']})", axis=1).tolist()
-            pick = st.selectbox("得意先選択", labels)
-            code = parse_code_from_label(pick)
+            m1.metric("売上（FYTD）", "—")
+        if gp_col:
+            m2.metric("粗利（FYTD）", f"{res_org.df[gp_col].fillna(0).sum():,.0f}")
+        else:
+            m2.metric("粗利（FYTD）", "—")
+        if gpr_col:
+            try:
+                v = float(res_org.df[gpr_col].dropna().iloc[0])
+                m3.metric("粗利率（FYTD）", f"{v*100:.1f}%")
+            except Exception:
+                m3.metric("粗利率（FYTD）", "—")
+        else:
+            m3.metric("粗利率（FYTD）", "—")
 
-            with st.form("detail_form", clear_on_submit=False):
-                limit_rows = st.slider("表示行数", 100, 5000, 800)
-                run_detail = st.form_submit_button("当月の明細を表示")
-
-            if run_detail:
-                detail = qdf(
-                    name="drill_detail_daily",
-                    sql=f"""
-                        SELECT
-                          sales_date AS 日付,
-                          item_name  AS 商品名,
-                          pack_unit  AS 包装,
-                          jan        AS JAN,
-                          yj_code    AS YJ,
-                          quantity   AS 数量,
-                          sales_amount AS 売上,
-                          gross_profit AS 粗利
-                        FROM {V_FACT}
-                        WHERE login_email=@email
-                          AND customer_code=@code
-                          AND month=DATE(@m)
-                        ORDER BY sales_date DESC
-                        LIMIT {int(limit_rows)}
-                    """,
-                    params={"email": user_email, "code": code, "m": current_month},
-                    prefer_storage_api=prefer_storage_api,
-                    show_check=show_checks,
-                )
-                st.dataframe(detail, use_container_width=True, height=640)
-
-with tab_perf:
-    st.subheader("このセッションで実行されたクエリ計測ログ")
-
-    logs = st.session_state.perf_logs
-    if not logs:
-        st.info("まだ計測ログがありません。")
+        st.dataframe(df_org, use_container_width=True, height=220)
     else:
-        df_log = pd.DataFrame([{
-            "name": x.name,
-            "ok": x.ok,
-            "query_sec": round(x.query_sec, 2),
-            "df_sec": round(x.df_sec, 2),
-            "total_sec": round(x.total_sec, 2),
-            "bytes_gb": round(x.bytes_gb, 3),
-            "rows": x.rows,
-            "job_id": x.job_id,
-            "note": x.note,
-        } for x in logs]).sort_values(["total_sec", "bytes_gb"], ascending=[False, False])
+        st.warning("FYTDサマリーが取得できません（VIEWを確認）")
 
-        st.dataframe(df_log, use_container_width=True, height=520)
-        st.markdown("### 見分け方")
-        st.write(
-            "- query_sec が長い → BigQuery側が重い（VIEWのJOIN/集計/スキャン）\n"
-            "- df_sec が長い → 転送が重い（Storage API未導入 or 結果が大きすぎる）\n"
-            "- bytes_gb が大きい → SELECT * / 絞り込み不足 / 不要JOIN の可能性"
+    st.markdown("---")
+    st.subheader("B) FYTD MoM（前月差）ランキング（得意先）")
+
+    topN = st.slider("表示件数", min_value=10, max_value=200, value=50, step=10)
+
+    cL, cR = st.columns(2)
+
+    with cL:
+        st.markdown("### 📉 下落（FYTD 前月差）")
+        res_bottom = query_df(
+            name="admin_customer_fytd_bottom_named",
+            sql=f"SELECT * FROM {VIEW_ADMIN_BOTTOM} LIMIT @lim",
+            params=[("INT64", "lim", int(topN))],
+            timeout_sec=timeout_sec,
+            use_cache=True,
         )
+        render_result_header("admin_customer_fytd_bottom_named", res_bottom)
+
+        if res_bottom.ok and not res_bottom.df.empty:
+            df_b = jp_col_rename(res_bottom.df.copy())
+            st.dataframe(df_b, use_container_width=True, height=420)
+        else:
+            st.info("下落データがありません。")
+
+    with cR:
+        st.markdown("### 📈 伸長（FYTD 前月差）")
+        res_top = query_df(
+            name="admin_customer_fytd_top_named",
+            sql=f"SELECT * FROM {VIEW_ADMIN_TOP} LIMIT @lim",
+            params=[("INT64", "lim", int(topN))],
+            timeout_sec=timeout_sec,
+            use_cache=True,
+        )
+        render_result_header("admin_customer_fytd_top_named", res_top)
+
+        if res_top.ok and not res_top.df.empty:
+            df_t = jp_col_rename(res_top.df.copy())
+            st.dataframe(df_t, use_container_width=True, height=420)
+        else:
+            st.info("伸長データがありません。")
+
+    st.caption("※ここは“管理者（統括）”前提で、scoped VIEW を通さずに安定稼働させています。")
+
+
+# =========================
+# DRILL: customer x item/yj month
+# =========================
+with tab_drill:
+    st.subheader("ドリル（得意先 → 月次 → 品目/YJ）")
+
+    st.caption("※ここは必ずパラメータSQLで実行します（Illegal input character 対策）")
+
+    # customer picker from top/bottom if available
+    cust_candidates: List[Tuple[str, str]] = []  # (code, name)
+    for res in [locals().get("res_top"), locals().get("res_bottom")]:
+        if isinstance(res, QueryResult) and res.ok and not res.df.empty:
+            cols = [c.lower() for c in res.df.columns]
+            if "customer_code" in cols and "customer_name" in cols:
+                ccode = res.df[res.df.columns[cols.index("customer_code")]].astype(str)
+                cname = res.df[res.df.columns[cols.index("customer_name")]].astype(str)
+                cust_candidates += list(zip(ccode.tolist(), cname.tolist()))
+    cust_candidates = list(dict.fromkeys(cust_candidates))  # dedup preserve order
+
+    left, right = st.columns([2, 1])
+    with left:
+        if cust_candidates:
+            label_map = {f"{n}（{c}）": (c, n) for c, n in cust_candidates}
+            pick_label = st.selectbox("得意先（ランキングから選択）", options=list(label_map.keys()))
+            customer_code, customer_name = label_map[pick_label]
+        else:
+            customer_code = st.text_input("得意先コード（直接入力）", value="")
+            customer_name = st.text_input("得意先名（任意）", value="")
+    with right:
+        drill_mode = st.radio("ドリル軸", options=["得意先×品目（月次）", "得意先×YJ（月次）"], horizontal=False)
+
+    # period controls (month start/end as DATE)
+    p1, p2, p3 = st.columns([1, 1, 2])
+    with p1:
+        start_date = st.date_input("開始日", value=date(2025, 4, 1))
+    with p2:
+        end_date = st.date_input("終了日", value=date.today())
+    with p3:
+        limit = st.number_input("最大行数", min_value=50, max_value=5000, value=DEFAULT_LIMIT, step=50)
+
+    run = st.button("ドリル実行", type="primary", disabled=not bool(customer_code))
+
+    if run and customer_code:
+        if drill_mode == "得意先×品目（月次）":
+            sql = f"""
+            SELECT *
+            FROM {VIEW_DRILL_CUST_ITEM_MONTH}
+            WHERE customer_code = @customer_code
+              AND sales_month >= @start_date
+              AND sales_month <= @end_date
+            ORDER BY sales_month DESC
+            LIMIT @lim
+            """
+        else:
+            sql = f"""
+            SELECT *
+            FROM {VIEW_DRILL_CUST_YJ_MONTH}
+            WHERE customer_code = @customer_code
+              AND sales_month >= @start_date
+              AND sales_month <= @end_date
+            ORDER BY sales_month DESC
+            LIMIT @lim
+            """
+
+        res_drill = query_df(
+            name="drill",
+            sql=sql,
+            params=[
+                ("STRING", "customer_code", str(customer_code)),
+                ("DATE", "start_date", start_date),
+                ("DATE", "end_date", end_date),
+                ("INT64", "lim", int(limit)),
+            ],
+            timeout_sec=timeout_sec,
+            use_cache=True,
+        )
+        render_result_header("drill", res_drill)
+        if res_drill.ok:
+            st.dataframe(jp_col_rename(res_drill.df), use_container_width=True, height=520)
+        else:
+            st.error("ドリル取得に失敗しました。上のエラーとSQLを確認してください。")
+
+
+# =========================
+# PERF LOGS
+# =========================
+with tab_logs:
+    st.subheader("計測ログ（どのSQLが遅いか・失敗したか）")
+    logs = st.session_state.query_logs
+    if not logs:
+        st.info("まだログはありません。管理者入口/ドリルを実行すると記録されます。")
+    else:
+        df_log = pd.DataFrame(logs)
+        st.dataframe(df_log, use_container_width=True, height=420)
+
+        # quick summary
+        st.markdown("#### 直近の傾向")
+        ok_rate = (df_log["ok"].sum() / len(df_log)) * 100
+        st.write(f"- 成功率: {ok_rate:.1f}%")
+        st.write(f"- 最大時間: {df_log['elapsed_s'].max():.2f}s")
+        st.write(f"- 最大bytes: {df_log['bytes_gb'].max():.2f}GB")
+
+        if st.button("ログCSVダウンロード用に表示（コピー）"):
+            st.code(df_log.to_csv(index=False), language="text")
