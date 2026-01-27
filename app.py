@@ -8,7 +8,10 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
+
 from google.cloud import bigquery
+from google.oauth2 import service_account
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
 # ============================================================
@@ -31,15 +34,17 @@ V_FACT = f"`{PROJECT_ID}.{DATASET}.v_sales_fact_login_jan_daily`"
 V_STAFF_EMAIL_NAME = f"`{PROJECT_ID}.{DATASET}.v_staff_email_name`"
 DIM_STAFF_ROLE = f"`{PROJECT_ID}.{DATASET}.dim_staff_role`"
 
-# BigQuery timeout（秒）
-BQ_TIMEOUT_SEC = int(os.getenv("BQ_TIMEOUT_SEC", "60"))  # まずは60秒で落として原因を出す
+# BigQuery timeout（SQL実行）
+BQ_TIMEOUT_SEC = int(os.getenv("BQ_TIMEOUT_SEC", "60"))
+# BigQuery client 初期化 timeout（★ここが今回の主犯）
+BQ_CLIENT_INIT_TIMEOUT_SEC = int(os.getenv("BQ_CLIENT_INIT_TIMEOUT_SEC", "10"))
 
 
 # ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title="SFA Sales OS（入口）", layout="wide")
-st.title("SFA Sales OS（入口）")  # まずここを描画（真っ黒防止）
+st.title("SFA Sales OS（入口）")  # 真っ黒回避
 
 
 # ============================================================
@@ -96,11 +101,40 @@ if "cache_bust" not in st.session_state:
 
 
 # ============================================================
-# BigQuery Client
+# BigQuery Client (★ここを強化：secrets明示 + init timeout)
 # ============================================================
+def _build_bq_client_strict() -> bigquery.Client:
+    """
+    Streamlit Cloudで bigquery.Client() のADC探索がハングすることがあるため
+    st.secrets の service account を優先して明示的に作る。
+    """
+    # 1) Streamlit secrets に service account JSON がある場合（推奨）
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return bigquery.Client(project=PROJECT_ID, credentials=creds)
+
+    # 2) 無ければ従来のADC（ただしここがハングしやすい）
+    return bigquery.Client(project=PROJECT_ID)
+
+
 @st.cache_resource
 def get_bq_client() -> bigquery.Client:
-    return bigquery.Client(project=PROJECT_ID)
+    """
+    ★ client生成を別スレッドで行い、timeoutで必ず落とす
+    """
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_build_bq_client_strict)
+        try:
+            return fut.result(timeout=BQ_CLIENT_INIT_TIMEOUT_SEC)
+        except FuturesTimeoutError:
+            raise RuntimeError(
+                f"BigQuery client初期化が {BQ_CLIENT_INIT_TIMEOUT_SEC}s を超えてタイムアウトしました。"
+                "（ADC探索ハングの可能性大。st.secrets['gcp_service_account'] の設定を確認してください）"
+            )
 
 
 def _make_job_config(params: Optional[Dict[str, Any]]) -> bigquery.QueryJobConfig:
@@ -136,12 +170,13 @@ def qdf_cached(
     cache_bust: int,
     timeout_sec: int,
 ) -> Tuple[pd.DataFrame, QueryPerf]:
-    client = get_bq_client()
     t0 = time.time()
+
+    # ★ここで get_bq_client() が止まるなら、必ず例外で画面に出す
+    client = get_bq_client()
 
     job = client.query(sql, job_config=_make_job_config(params))
     try:
-        # ★ timeout を入れる（詰まっても画面が止まらない）
         result = job.result(timeout=timeout_sec)
         t_query_done = time.time()
 
@@ -249,7 +284,7 @@ def get_role_scope(login_email: str) -> Dict[str, Any]:
 
 
 # ============================================================
-# Sidebar (★無限rerun対策済み)
+# Sidebar（rerun loop対策済み）
 # ============================================================
 with st.sidebar:
     st.header("ログイン")
@@ -257,7 +292,6 @@ with st.sidebar:
     qp_email = safe_lower(st.query_params.get("user_email", ""))
     user_email = safe_lower(st.text_input("user_email（メール）", value=qp_email))
 
-    # ★変更があった時だけ更新（毎回書くと rerun ループになり得る）
     if user_email and qp_email != user_email:
         st.query_params["user_email"] = user_email
 
@@ -272,7 +306,7 @@ with st.sidebar:
         st.session_state.perf_logs = []
 
     st.divider()
-    st.caption("※真っ黒/固まる時：チェック表示ONでどのSQLが詰まってるか確認できます。")
+    st.caption("※真っ黒/固まる時：チェック表示ONでどこで止まってるか確認できます。")
 
 if not user_email:
     st.info("左のサイドバーで user_email を入力してください。")
@@ -280,17 +314,29 @@ if not user_email:
 
 
 # ============================================================
-# Header (必ず表示させる)
+# Header（必ず表示）
 # ============================================================
 left, right = st.columns([2, 1])
 with left:
     st.subheader(f"ログイン: {user_email}")
 with right:
-    st.caption(f"BQ timeout: {BQ_TIMEOUT_SEC}s")
+    st.caption(f"BQ timeout: {BQ_TIMEOUT_SEC}s / client init timeout: {BQ_CLIENT_INIT_TIMEOUT_SEC}s")
 
 
 # ============================================================
-# current_month の取得（失敗しても落とさない）
+# ★ client health check（ここで止まるなら原因は認証/ネットワーク）
+# ============================================================
+with st.spinner("BigQuery client 初期化チェック..."):
+    try:
+        _ = get_bq_client()
+        st.success("BigQuery client OK")
+    except Exception as e:
+        st.error(f"BigQuery client 初期化に失敗: {e}")
+        st.stop()
+
+
+# ============================================================
+# current_month 取得
 # ============================================================
 with st.spinner("sys_current_month 取得中..."):
     sys_df = qdf(
@@ -304,7 +350,6 @@ with st.spinner("sys_current_month 取得中..."):
 if not sys_df.empty and "current_month" in sys_df.columns:
     current_month = str(sys_df.iloc[0]["current_month"])
 else:
-    # 取れなくても先に進める（真っ黒回避）
     current_month = "2026-01-01"
 
 staff_name = get_staff_name_norm(user_email)
@@ -323,9 +368,6 @@ st.divider()
 # ============================================================
 tab_admin, tab_drill, tab_perf = st.tabs(["管理者入口（分析）", "ドリル（明細）", "計測ログ（遅い原因）"])
 
-# ----------------------------
-# 管理者入口（分析）
-# ----------------------------
 with tab_admin:
     st.subheader("A) 年度累計（FYTD）")
 
@@ -440,9 +482,6 @@ with tab_admin:
         )
         st.dataframe(yoy_inv, use_container_width=True, height=520)
 
-# ----------------------------
-# ドリル（明細）
-# ----------------------------
 with tab_drill:
     st.subheader("得意先 → 当月 日次明細（JAN粒度）")
 
@@ -504,9 +543,6 @@ with tab_drill:
                 )
                 st.dataframe(detail, use_container_width=True, height=640)
 
-# ----------------------------
-# 計測ログ
-# ----------------------------
 with tab_perf:
     st.subheader("このセッションで実行されたクエリ計測ログ")
 
