@@ -1,722 +1,599 @@
 # app.py
-# =============================================================================
-# SFA Sales OS（入口・高速版 / 判断専用）— 確定版
-# - FYTDサマリー（年度累計＋昨年度累計＋前年差＋粗利）
-# - 当月 YoYランキング（上がり/下がり）
-# - 新規納品サマリー（昨日/直近7日/月間/FYTD）
-# - 権限分岐（dim_staff_role を参照）
-# - 日本語表示のみ
-# - 得意先検索（名称入力→候補→選択）
+# ============================================================
+# SFA Sales OS - 入口高速版（判断専用ミニ版 / 確定）
+# - FYTD（年度累計：4月〜当月末）サマリー（前年差・昨対）
+# - 当月：前年同月比ランキング（上位/下位 + 比較不能）
+# - 新規納品サマリー（月間）※まずは軽量カウント中心
+# - 権限分岐（admin_view/admin_edit/sales_view）
+# - 日本語表示（英語ラベル排除）
+# - 得意先検索：部分一致→候補→選択（コード/名称）
 #
-# 重要：高速化のため「重い計算はすべて BigQuery VIEW 側」で実施する前提。
-# =============================================================================
+# 重要方針（超重要）：
+# - 入口で叩くクエリは「最大3本」(FYTD/当月YoY/新規納品)
+# - それ以外は “押した人だけ” 後読み（クリック後ロード）
+# - Streamlit cache で「DataFrameだけ」返す（client等は返さない）
+# ============================================================
 
 from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
+
 from google.cloud import bigquery
 
-# =============================================================================
-# 設定（あなたの環境に合わせて必要なら変更）
-# =============================================================================
+# -----------------------------
+# Config
+# -----------------------------
+PROJECT_ID = os.getenv("BQ_PROJECT_ID", "salesdb-479915")
+DATASET_ID = os.getenv("BQ_DATASET_ID", "sales_data")
+LOCATION = os.getenv("BQ_LOCATION", "asia-northeast1")
 
-@dataclass(frozen=True)
-class BQViews:
-    # 現在月（月初 DATE を返す）
-    v_sys_current_month: str = "salesdb-479915.sales_data.v_sys_current_month"
+# 参照：この3つだけが「入口クエリ」
+VIEW_SYS_CURRENT_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sys_current_month`"
+FACT_LOGIN_DAILY = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_fact_login_jan_daily`"
+NEW_DELIV_MONTHLY = f"`{PROJECT_ID}.{DATASET_ID}.v_new_deliveries_realized_monthly`"
 
-    # 管理者（全社）FYTDサマリー（scoped版）
-    v_admin_org_fytd_summary_scoped: str = "salesdb-479915.sales_data.v_admin_org_fytd_summary_scoped"
+# 権限
+TBL_STAFF_ROLE = f"`{PROJECT_ID}.{DATASET_ID}.dim_staff_role`"
 
-    # 管理者（得意先 FYTD / 当月YoY 上下：担当者名付き + スコープ済み）
-    v_admin_customer_fytd_top_named_scoped: str = "salesdb-479915.sales_data.v_admin_customer_fytd_top_named_scoped"
-    v_admin_customer_fytd_bottom_named_scoped: str = "salesdb-479915.sales_data.v_admin_customer_fytd_bottom_named_scoped"
+# 得意先候補（検索用）
+# adminは全得意先候補、salesは自分担当優先（あれば）。
+# 無い環境でも落ちないように optional として扱う。
+VIEW_CUSTOMER_STAFF = f"`{PROJECT_ID}.{DATASET_ID}.dim_customer_staff_current`"
 
-    # 売上（得意先×月）YoY系（担当者入口にも使える想定）
-    v_sales_customer_monthly_yoy_valid: str = "salesdb-479915.sales_data.v_sales_customer_monthly_yoy_valid"
-    v_sales_customer_fytd_yoy_valid: str = "salesdb-479915.sales_data.v_sales_customer_fytd_yoy_valid"
-    v_sales_customer_fytd_base: str = "salesdb-479915.sales_data.v_sales_customer_fytd_base"
+# 表示設定
+TOP_N = 30
+MAX_SUGGEST = 30
 
-    # 新規納品（月次 Realized）
-    v_new_deliveries_realized_monthly: str = "salesdb-479915.sales_data.v_new_deliveries_realized_monthly"
-
-    # 役割（最終テーブル）
-    dim_staff_role: str = "salesdb-479915.sales_data.dim_staff_role"
-
-    # 得意先×担当（検索用：2,000件程度なら一括取得してPythonフィルタが最速）
-    dim_customer_staff_current: str = "salesdb-479915.sales_data.dim_customer_staff_current"
-
-
-V = BQViews()
-
-APP_TITLE = "SFA Sales OS（入口）"
-TZ = "Asia/Tokyo"
-
-
-# =============================================================================
-# Streamlit 基本設定
-# =============================================================================
-
-st.set_page_config(
-    page_title=APP_TITLE,
-    layout="wide",
-)
-
-st.title(APP_TITLE)
-st.caption("判断専用（入口高速版）")
-
-
-# =============================================================================
-# ユーティリティ
-# =============================================================================
-
-def norm_email(x: str) -> str:
-    if x is None:
+# -----------------------------
+# Helpers
+# -----------------------------
+def jpy(n: Optional[float]) -> str:
+    if n is None or pd.isna(n):
         return ""
-    return re.sub(r"\s+", "", str(x)).strip().lower()
+    return f"¥{int(round(n)):,}"
 
-def safe_int(x: Any) -> Optional[int]:
-    try:
-        if pd.isna(x):
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-def safe_float(x: Any) -> Optional[float]:
-    try:
-        if pd.isna(x):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def money_fmt(x: Any) -> str:
-    v = safe_float(x)
-    if v is None:
+def pct(n: Optional[float]) -> str:
+    if n is None or pd.isna(n):
         return ""
-    return f"{v:,.0f}円"
+    return f"{n*100:.1f}%"
 
-def pct_fmt(x: Any) -> str:
-    v = safe_float(x)
-    if v is None:
-        return ""
-    return f"{v*100:,.1f}%"
+def safe_lower(s: str) -> str:
+    return (s or "").lower()
 
-def df_has_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> bool:
-    return all(c in df.columns for c in cols)
+def now_jst() -> datetime:
+    return datetime.now(timezone(timedelta(hours=9)))
 
-def only_existing_cols(df: pd.DataFrame, cols: Tuple[str, ...]) -> pd.DataFrame:
-    return df[[c for c in cols if c in df.columns]].copy()
+@dataclass
+class LoginContext:
+    user_email: str
+    role_admin_view: bool
+    role_admin_edit: bool
+    role_sales_view: bool
+    role_tier: str
+    area_name: str
 
+def get_query_param_user_email() -> str:
+    qp = st.query_params
+    v = qp.get("user_email", "")
+    if isinstance(v, list):
+        v = v[0] if v else ""
+    return (v or "").strip()
 
-# =============================================================================
-# BigQuery（高速 & 安定：cache_resource で client を保持）
-# =============================================================================
-
-@st.cache_resource
-def get_bq_client() -> bigquery.Client:
-    # Streamlit Cloud では secrets / サービスアカウントで自動認証される前提
-    return bigquery.Client()
-
-def _to_df(job: bigquery.job.QueryJob, use_bqstorage: bool) -> pd.DataFrame:
-    # BigQuery Storage API が使えるなら高速
-    # 使えない環境でも落ちないようにフォールバックする
-    if use_bqstorage:
-        try:
-            return job.to_dataframe(create_bqstorage_client=True)
-        except Exception:
-            return job.to_dataframe()
-    return job.to_dataframe()
-
-@st.cache_data(ttl=600, show_spinner=False)
-def query_df(sql: str, params: Tuple[Tuple[str, str, Any], ...], use_bqstorage: bool) -> pd.DataFrame:
-    """
-    st.cache_data で DataFrame をキャッシュ（返り値がシリアライズ可能）
-    params: (name, type, value) のタプル配列
-    """
-    client = get_bq_client()
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter(n, t, v) for (n, t, v) in params]
-    )
-    job = client.query(sql, job_config=job_config)
-    df = _to_df(job, use_bqstorage=use_bqstorage)
-    return df
-
-
-# =============================================================================
-# ログイン（user_email）
-# =============================================================================
-
-with st.sidebar:
-    st.subheader("ログイン")
-    # URLクエリ ?user_email=... 対応
-    q = st.query_params
-    default_email = norm_email(q.get("user_email", "")) if isinstance(q, dict) else ""
-    user_email = norm_email(st.text_input("メールアドレス（user_email）", value=default_email))
-    use_bqstorage = st.toggle("高速モード（BQ Storage API）", value=True)
-    st.divider()
-    st.caption("※ 英語の見出しは出しません（日本語のみ）")
-
-if not user_email:
-    st.info("左のサイドバーでメールアドレス（user_email）を入力してください。")
-    st.stop()
-
-
-# =============================================================================
-# 役割取得（dim_staff_role）
-# =============================================================================
-
-ROLE_SQL = f"""
-SELECT
-  login_email,
-  role_tier,
-  area_name,
-  scope_type,
-  scope_branches,
-  role_admin_view,
-  role_admin_edit,
-  role_sales_view
-FROM `{V.dim_staff_role}`
-WHERE LOWER(TRIM(login_email)) = @email
-LIMIT 1
-"""
-
-role_df = query_df(
-    ROLE_SQL,
-    params=(("email", "STRING", user_email),),
-    use_bqstorage=use_bqstorage
-)
-
-if role_df.empty:
-    st.error("権限テーブルにログインメールが登録されていません（dim_staff_role）。")
-    st.stop()
-
-role = role_df.iloc[0].to_dict()
-is_admin_view = bool(role.get("role_admin_view", False))
-is_admin_edit = bool(role.get("role_admin_edit", False))
-is_sales_view = bool(role.get("role_sales_view", False))
-
-# あなたの運用：未分類・全員統括でもOK（ただしrole_admin_viewが優先）
-role_tier = str(role.get("role_tier", "") or "")
-area_name = str(role.get("area_name", "") or "")
-
-# 表示上はシンプルに
-with st.sidebar:
-    st.subheader("権限")
-    tags = []
-    if is_admin_view:
-        tags.append("管理（閲覧）")
-    if is_admin_edit:
-        tags.append("管理（編集）")
-    if is_sales_view:
-        tags.append("現場（閲覧）")
-    st.write(" / ".join(tags) if tags else "権限なし")
-    if role_tier:
-        st.caption(f"ロール：{role_tier}")
-    if area_name:
-        st.caption(f"エリア：{area_name}")
-
-
-# =============================================================================
-# 現在月取得（v_sys_current_month）
-# =============================================================================
-
-CUR_SQL = f"SELECT current_month FROM `{V.v_sys_current_month}` LIMIT 1"
-cur_df = query_df(CUR_SQL, params=tuple(), use_bqstorage=use_bqstorage)
-if cur_df.empty or "current_month" not in cur_df.columns:
-    st.error("current_month が取得できません（v_sys_current_month）。")
-    st.stop()
-
-current_month = pd.to_datetime(cur_df.loc[0, "current_month"]).date()
-
-st.caption(f"対象月：{current_month.strftime('%Y-%m')}（月初基準）")
-
-
-# =============================================================================
-# 得意先検索（名称入力→候補→選択）— 入口の必須UI
-# =============================================================================
+def _bq_client() -> bigquery.Client:
+    # クライアントはキャッシュ対象にしない（unserializable対策）
+    return bigquery.Client(project=PROJECT_ID, location=LOCATION)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_customers_for_search(use_bqstorage: bool) -> pd.DataFrame:
-    # 2,000件規模なので一括取得→Python側で部分一致が最速
+def bq_query_df(sql: str, params: Tuple[Tuple[str, str, Any], ...] = ()) -> pd.DataFrame:
+    """
+    BigQuery -> DataFrame
+    params: (name, type, value) tuples. type is BigQuery scalar type string.
+    NOTE: DataFrameだけ返す（client/job/iteratorを返さない）
+    """
+    client = _bq_client()
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter(name, typ, val) for (name, typ, val) in params
+        ]
+    )
+    job = client.query(sql, job_config=job_config, location=LOCATION)
+    return job.result().to_dataframe(create_bqstorage_client=True)
+
+def bq_try_query_df(sql: str, params: Tuple[Tuple[str, str, Any], ...] = ()) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    try:
+        df = bq_query_df(sql, params)
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_current_month() -> pd.Timestamp:
+    df = bq_query_df(f"SELECT current_month FROM {VIEW_SYS_CURRENT_MONTH} LIMIT 1")
+    if df.empty:
+        raise RuntimeError("v_sys_current_month が空です")
+    return pd.to_datetime(df.loc[0, "current_month"]).normalize()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_login_context(user_email: str) -> LoginContext:
+    # 役割が未登録でも落とさず、sales_view を True に倒す（暫定運用）
+    sql = f"""
+    SELECT
+      login_email,
+      COALESCE(role_admin_view, FALSE) AS role_admin_view,
+      COALESCE(role_admin_edit, FALSE) AS role_admin_edit,
+      COALESCE(role_sales_view, TRUE)  AS role_sales_view,
+      COALESCE(role_tier, "SALES")     AS role_tier,
+      COALESCE(area_name, "未分類")    AS area_name
+    FROM {TBL_STAFF_ROLE}
+    WHERE login_email = @user_email
+    LIMIT 1
+    """
+    df = bq_query_df(sql, (("user_email", "STRING", user_email),))
+    if df.empty:
+        return LoginContext(
+            user_email=user_email,
+            role_admin_view=False,
+            role_admin_edit=False,
+            role_sales_view=True,
+            role_tier="SALES",
+            area_name="未分類",
+        )
+    r = df.iloc[0].to_dict()
+    return LoginContext(
+        user_email=user_email,
+        role_admin_view=bool(r["role_admin_view"]),
+        role_admin_edit=bool(r["role_admin_edit"]),
+        role_sales_view=bool(r["role_sales_view"]),
+        role_tier=str(r["role_tier"] or "SALES"),
+        area_name=str(r["area_name"] or "未分類"),
+    )
+
+# -----------------------------
+# Core SQL (入口3本)
+# -----------------------------
+def sql_fytd_org_summary() -> str:
+    # FYTD: 4/1〜当月末（current_month の月末まで）
+    # FYTD比較: 前年度同期間（昨年度4/1〜昨年当月末）
+    return f"""
+    WITH sys AS (
+      SELECT
+        current_month,
+        EXTRACT(YEAR FROM DATE_SUB(current_month, INTERVAL 3 MONTH)) AS fiscal_year_apr,
+        DATE(EXTRACT(YEAR FROM DATE_SUB(current_month, INTERVAL 3 MONTH)), 4, 1) AS fy_start,
+        DATE_ADD(current_month, INTERVAL 1 MONTH) AS next_month
+      FROM {VIEW_SYS_CURRENT_MONTH}
+    ),
+    bounds AS (
+      SELECT
+        current_month,
+        fy_start,
+        DATE_SUB(next_month, INTERVAL 1 DAY) AS as_of_date,
+        DATE_SUB(fy_start, INTERVAL 1 YEAR) AS fy_start_py,
+        DATE_SUB(DATE_SUB(next_month, INTERVAL 1 DAY), INTERVAL 1 YEAR) AS as_of_date_py
+      FROM sys
+    ),
+    fact AS (
+      SELECT sales_date, sales_amount, gross_profit
+      FROM {FACT_LOGIN_DAILY}
+      WHERE sales_date IS NOT NULL
+    )
+    SELECT
+      b.current_month AS 対象月,
+      b.fy_start AS 年度開始日,
+      b.as_of_date AS 集計終端日,
+      SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.sales_amount, 0)) AS 売上_年度累計,
+      SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.gross_profit, 0)) AS 粗利_年度累計,
+      SAFE_DIVIDE(
+        SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.gross_profit, 0)),
+        NULLIF(SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.sales_amount, 0)), 0)
+      ) AS 粗利率_年度累計,
+
+      SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.sales_amount, 0)) AS 売上_前年差_比較対象,
+      SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.gross_profit, 0)) AS 粗利_前年差_比較対象,
+
+      (SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.sales_amount, 0))
+        - SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.sales_amount, 0))) AS 売上_前年差,
+      (SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.gross_profit, 0))
+        - SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.gross_profit, 0))) AS 粗利_前年差,
+
+      SAFE_DIVIDE(
+        SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.sales_amount, 0)),
+        NULLIF(SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.sales_amount, 0)), 0)
+      ) - 1 AS 売上_昨対_年度累計,
+
+      SAFE_DIVIDE(
+        SUM(IF(f.sales_date BETWEEN b.fy_start AND b.as_of_date, f.gross_profit, 0)),
+        NULLIF(SUM(IF(f.sales_date BETWEEN b.fy_start_py AND b.as_of_date_py, f.gross_profit, 0)), 0)
+      ) - 1 AS 粗利_昨対_年度累計
+    FROM bounds b
+    CROSS JOIN fact f
+    GROUP BY 対象月, 年度開始日, 集計終端日
+    """
+
+def sql_monthly_yoy_customer_rank(valid_only: bool) -> str:
+    # 当月（current_month） vs 前年同月
+    # valid_only=True: 比較可能（前年同月あり）
+    # valid_only=False: 比較不能（前年同月が0/NULL）
+    cond = "py_sales IS NOT NULL AND py_sales != 0" if valid_only else "(py_sales IS NULL OR py_sales = 0)"
+    return f"""
+    WITH sys AS (
+      SELECT current_month FROM {VIEW_SYS_CURRENT_MONTH}
+    ),
+    base AS (
+      SELECT
+        f.customer_code,
+        f.customer_name,
+        SUM(IF(f.month = s.current_month, f.sales_amount, 0)) AS cy_sales,
+        SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.sales_amount, 0)) AS py_sales,
+        SUM(IF(f.month = s.current_month, f.gross_profit, 0)) AS cy_gp,
+        SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.gross_profit, 0)) AS py_gp
+      FROM {FACT_LOGIN_DAILY} f
+      CROSS JOIN sys s
+      WHERE f.month IN (s.current_month, DATE_SUB(s.current_month, INTERVAL 1 YEAR))
+      GROUP BY customer_code, customer_name
+    )
+    SELECT
+      customer_code AS 得意先コード,
+      customer_name AS 得意先名,
+      cy_sales AS 売上_当月,
+      py_sales AS 売上_前年同月,
+      (cy_sales - py_sales) AS 売上_前年差,
+      SAFE_DIVIDE(cy_sales, NULLIF(py_sales,0)) - 1 AS 売上_前年同月比,
+      cy_gp AS 粗利_当月,
+      py_gp AS 粗利_前年同月,
+      (cy_gp - py_gp) AS 粗利_前年差,
+      SAFE_DIVIDE(cy_gp, NULLIF(py_gp,0)) - 1 AS 粗利_前年同月比
+    FROM base
+    WHERE {cond}
+    """
+
+def sql_new_deliveries_monthly_summary() -> str:
+    # 入口は軽量に：月次の「新規納品（realized）」件数の概況だけ
+    # ※列が環境差で違っても落ちないように、最低限の列でまず取得
+    return f"""
+    SELECT
+      month_start AS 月,
+      COUNT(DISTINCT customer_code) AS 新規納品_得意先数,
+      COUNT(DISTINCT yj_code) AS 新規納品_YJ数
+    FROM {NEW_DELIV_MONTHLY}
+    GROUP BY 月
+    ORDER BY 月 DESC
+    LIMIT 24
+    """
+
+# -----------------------------
+# Customer search (Python side, zero-BQ after initial load)
+# -----------------------------
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def load_customer_candidates() -> pd.DataFrame:
+    # adminでもsalesでも「候補リスト」にはこれを使う（軽い）
+    # ※存在しない環境でも落ちないように try で返す
     sql = f"""
     SELECT
       CAST(customer_code AS STRING) AS customer_code,
       customer_name,
       staff_name,
       branch_name
-    FROM `{V.dim_customer_staff_current}`
+    FROM {VIEW_CUSTOMER_STAFF}
     """
-    df = query_df(sql, params=tuple(), use_bqstorage=use_bqstorage)
-    # 正規化列（検索用）
-    df["customer_name_norm"] = df["customer_name"].astype(str)
+    df, err = bq_try_query_df(sql)
+    if err or df is None or df.empty:
+        # 最低限、factから候補を作る（やや重いが1日キャッシュ）
+        sql2 = f"""
+        SELECT
+          customer_code,
+          ANY_VALUE(customer_name) AS customer_name,
+          ANY_VALUE(staff_name) AS staff_name,
+          ANY_VALUE(branch_name) AS branch_name
+        FROM {FACT_LOGIN_DAILY}
+        GROUP BY customer_code
+        """
+        df2 = bq_query_df(sql2)
+        df2["customer_code"] = df2["customer_code"].astype(str)
+        return df2
+
+    df["customer_code"] = df["customer_code"].astype(str)
     return df
 
-customers_df = load_customers_for_search(use_bqstorage=use_bqstorage)
+def suggest_customers(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    q = (q or "").strip()
+    if not q:
+        return df.head(0)
+    ql = safe_lower(q)
+    # 部分一致（名前・コード・担当者・支店名）
+    mask = (
+        df["customer_name"].fillna("").str.lower().str.contains(ql)
+        | df["customer_code"].fillna("").str.lower().str.contains(ql)
+        | df["staff_name"].fillna("").str.lower().str.contains(ql)
+        | df["branch_name"].fillna("").str.lower().str.contains(ql)
+    )
+    out = df.loc[mask].copy()
+    # ざっくり並び：名前一致優先 → それ以外
+    out["__rank"] = out["customer_name"].fillna("").str.lower().apply(lambda s: 0 if ql in s else 1)
+    out = out.sort_values(["__rank", "customer_name"]).drop(columns=["__rank"])
+    return out.head(MAX_SUGGEST)
 
-with st.expander("得意先を検索（名称入力→候補選択）", expanded=True):
-    kw = st.text_input("得意先名（例：熊谷 / 循環器）", value="", placeholder="キーワードを入力すると候補を表示します")
-    cand = customers_df
-    if kw.strip():
-        pat = re.escape(kw.strip())
-        # 大小文字はそのまま（日本語前提）、部分一致
-        cand = cand[cand["customer_name_norm"].str.contains(pat, na=False)]
-    # 候補数を絞る（多すぎると見づらい）
-    cand = cand.head(50).copy()
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="SFA Sales OS（入口）", layout="wide")
+st.title("SFA Sales OS（入口）")
 
-    if cand.empty:
-        st.warning("候補がありません。別のキーワードで検索してください。")
-        selected_customer_code = None
+# --- login ---
+user_email = get_query_param_user_email()
+if not user_email:
+    st.error("URLに user_email を付けてください。例： ?user_email=okazaki@shinrai8.by-works.com")
+    st.stop()
+
+ctx = get_login_context(user_email)
+
+# ヘッダ表示（英語ラベル排除）
+colA, colB, colC, colD = st.columns([2.2, 1.2, 1.2, 1.4])
+with colA:
+    st.write(f"**ログイン：{ctx.user_email}**")
+with colB:
+    st.write(f"**権限：{'管理者' if (ctx.role_admin_view or ctx.role_admin_edit) else '担当者'}**")
+with colC:
+    st.write(f"**ロール：{ctx.role_tier or 'SALES'}**")
+with colD:
+    st.write(f"**エリア：{ctx.area_name or '未分類'}**")
+
+# --- current month ---
+try:
+    current_month = get_current_month()
+except Exception as e:
+    st.error(f"current_month の取得に失敗しました：{e}")
+    st.stop()
+
+st.caption(f"対象月：{current_month.strftime('%Y-%m')}（月初: {current_month.date()}）")
+
+# ============================================================
+# 入口クエリ（最大3本）を “順番に” 実行（同時多発させない）
+# ============================================================
+with st.spinner("入口データを読み込み中…（高速版）"):
+    df_fytd, err_fytd = bq_try_query_df(sql_fytd_org_summary())
+    # 当月YoY：valid
+    df_yoy_valid, err_yoy_valid = bq_try_query_df(sql_monthly_yoy_customer_rank(valid_only=True))
+    # 新規納品（月次）
+    df_new_month, err_new_month = bq_try_query_df(sql_new_deliveries_monthly_summary())
+
+# ============================================================
+# 管理者：全体判断（FYTD → 当月YoY → 新規納品）
+# 担当者：同じ入口は見せるが、ランキングは“選択後に絞る”導線
+# ============================================================
+
+is_admin = bool(ctx.role_admin_view or ctx.role_admin_edit)
+
+# -----------------------------
+# A) 年度累計（4月〜当月末）サマリー
+# -----------------------------
+st.subheader("A) 年度累計（4月〜当月末）")
+
+if err_fytd or df_fytd is None or df_fytd.empty:
+    st.error(f"FYTDサマリー取得エラー：{err_fytd}")
+else:
+    r = df_fytd.iloc[0].to_dict()
+
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
+    with c1:
+        st.metric("売上（年度累計）", jpy(r.get("売上_年度累計")))
+    with c2:
+        st.metric("粗利（年度累計）", jpy(r.get("粗利_年度累計")))
+    with c3:
+        st.metric("粗利率（年度累計）", pct(r.get("粗利率_年度累計")))
+    with c4:
+        st.metric("前年差（売上）", jpy(r.get("売上_前年差")))
+    with c5:
+        st.metric("前年差（粗利）", jpy(r.get("粗利_前年差")))
+
+    d1, d2, d3 = st.columns([1.2, 1.2, 1.6])
+    with d1:
+        st.metric("昨対（売上：年度累計）", pct(r.get("売上_昨対_年度累計")))
+    with d2:
+        st.metric("昨対（粗利：年度累計）", pct(r.get("粗利_昨対_年度累計")))
+    with d3:
+        st.caption(f"集計期間：{pd.to_datetime(r.get('年度開始日')).date()} 〜 {pd.to_datetime(r.get('集計終端日')).date()}")
+
+# -----------------------------
+# B) 当月：前年同月比（上位/下位 + 比較不能）
+# -----------------------------
+st.subheader("B) 当月：前年同月比（上がった先・下がった先）")
+
+if err_yoy_valid or df_yoy_valid is None:
+    st.error(f"当月YoY（比較可能）取得エラー：{err_yoy_valid}")
+else:
+    dfv = df_yoy_valid.copy()
+
+    # 表示用整形（重い処理はしない：列追加だけ）
+    dfv["売上_当月"] = dfv["売上_当月"].astype(float)
+    dfv["売上_前年差"] = dfv["売上_前年差"].astype(float)
+    dfv["粗利_当月"] = dfv["粗利_当月"].astype(float)
+    dfv["粗利_前年差"] = dfv["粗利_前年差"].astype(float)
+
+    # 並び：入口は粗利額差 → 粗利率差 → 売上差（OS方針）
+    # ただし “率” はpy=0で不安定なため valid のみで扱う
+    df_top = dfv.sort_values(["粗利_前年差", "売上_前年差"], ascending=[False, False]).head(TOP_N)
+    df_bot = dfv.sort_values(["粗利_前年差", "売上_前年差"], ascending=[True, True]).head(TOP_N)
+
+    t1, t2 = st.columns(2)
+    with t1:
+        st.write("**上がった先（当月）**")
+        show = df_top[[
+            "得意先コード","得意先名",
+            "売上_当月","売上_前年差","売上_前年同月比",
+            "粗利_当月","粗利_前年差","粗利_前年同月比"
+        ]].copy()
+        # 表示整形（文字列化）
+        show["売上_当月"] = show["売上_当月"].map(jpy)
+        show["売上_前年差"] = show["売上_前年差"].map(jpy)
+        show["売上_前年同月比"] = show["売上_前年同月比"].map(pct)
+        show["粗利_当月"] = show["粗利_当月"].map(jpy)
+        show["粗利_前年差"] = show["粗利_前年差"].map(jpy)
+        show["粗利_前年同月比"] = show["粗利_前年同月比"].map(pct)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    with t2:
+        st.write("**下がった先（当月）**")
+        show = df_bot[[
+            "得意先コード","得意先名",
+            "売上_当月","売上_前年差","売上_前年同月比",
+            "粗利_当月","粗利_前年差","粗利_前年同月比"
+        ]].copy()
+        show["売上_当月"] = show["売上_当月"].map(jpy)
+        show["売上_前年差"] = show["売上_前年差"].map(jpy)
+        show["売上_前年同月比"] = show["売上_前年同月比"].map(pct)
+        show["粗利_当月"] = show["粗利_当月"].map(jpy)
+        show["粗利_前年差"] = show["粗利_前年差"].map(jpy)
+        show["粗利_前年同月比"] = show["粗利_前年同月比"].map(pct)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+# 比較不能（入口で “別枠” 表示）
+with st.expander("比較不能（前年同月が無い・0）", expanded=False):
+    df_yoy_invalid, err_yoy_invalid = bq_try_query_df(sql_monthly_yoy_customer_rank(valid_only=False))
+    if err_yoy_invalid or df_yoy_invalid is None:
+        st.error(f"比較不能リスト取得エラー：{err_yoy_invalid}")
     else:
-        options = [
-            f'{r["customer_name"]}（{r["branch_name"]} / {r["staff_name"]}）｜{r["customer_code"]}'
-            for _, r in cand.iterrows()
-        ]
-        sel = st.selectbox("候補リスト（選択してください）", options=options, index=0)
-        selected_customer_code = sel.split("｜")[-1].strip()
+        dfi = df_yoy_invalid.copy()
+        dfi = dfi.sort_values(["粗利_当月", "売上_当月"], ascending=[False, False]).head(TOP_N)
+        show = dfi[["得意先コード","得意先名","売上_当月","粗利_当月"]].copy()
+        show["売上_当月"] = show["売上_当月"].map(jpy)
+        show["粗利_当月"] = show["粗利_当月"].map(jpy)
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
-    # 選択結果は session_state に保持
-    if selected_customer_code:
-        st.session_state["selected_customer_code"] = selected_customer_code
+# -----------------------------
+# C) 新規納品サマリー（月間）
+# -----------------------------
+st.subheader("C) 新規納品サマリー（月間）")
 
+if err_new_month or df_new_month is None:
+    st.error(f"新規納品（月次）取得エラー：{err_new_month}")
+else:
+    # 入口は軽量：24ヶ月の件数推移だけ
+    show = df_new_month.copy()
+    show["月"] = pd.to_datetime(show["月"]).dt.strftime("%Y-%m")
+    st.dataframe(show, use_container_width=True, hide_index=True)
 
-# =============================================================================
-# 表示コンポーネント（数字カード）
-# =============================================================================
+    # クリック後ロード（重い日次/週次は後に拡張）
+    st.caption("※「昨日・週間・年間」は次フェーズで “押した人だけ” 取得にします（入口は固定で軽くします）。")
 
-def metric_row(cols, labels, values, fmts):
-    for c, lab, val, fmt in zip(cols, labels, values, fmts):
-        if fmt == "円":
-            c.metric(lab, money_fmt(val))
-        elif fmt == "%":
-            c.metric(lab, pct_fmt(val))
-        else:
-            c.metric(lab, "" if pd.isna(val) else str(val))
+# ============================================================
+# 得意先検索（候補→選択）  ※入口の基本UX（OS確定）
+# ============================================================
+st.subheader("得意先検索（候補から選択）")
 
+cand = load_customer_candidates()
 
-# =============================================================================
-# 1) FYTD サマリー（管理者は全社、担当は自分だけ）
-# =============================================================================
+q = st.text_input("得意先名 / 一部文字（例：熊谷、循環器）または 得意先コード", value="")
+sug = suggest_customers(cand, q)
 
-def load_fytd_summary_admin() -> pd.DataFrame:
-    sql = f"""
-    SELECT * FROM `{V.v_admin_org_fytd_summary_scoped}`
-    WHERE current_month = @current_month
-    LIMIT 1
-    """
-    return query_df(sql, params=(("current_month", "DATE", str(current_month)),), use_bqstorage=use_bqstorage)
+if q and sug.empty:
+    st.info("一致する候補がありません。別の文字で試してください。")
+elif not sug.empty:
+    # 候補を「コード + 名称 + 担当/支店」で表示
+    options = []
+    for _, row in sug.iterrows():
+        code = str(row.get("customer_code", "") or "")
+        name = str(row.get("customer_name", "") or "")
+        staff = str(row.get("staff_name", "") or "")
+        branch = str(row.get("branch_name", "") or "")
+        label = f"{code}｜{name}"
+        tail = " / ".join([x for x in [staff, branch] if x])
+        if tail:
+            label += f"（{tail}）"
+        options.append((label, code))
 
-def load_fytd_summary_sales() -> pd.DataFrame:
-    # 担当者入口用：FYTDベース（自分の担当分）を v_sales_customer_fytd_base から集計してもよいが
-    # “入口高速”のため、まずは VIEW 側に集計済みがあるのが理想。
-    # ここでは暫定として v_sales_customer_fytd_base から自分の担当だけ集計する（軽めの集計）。
-    # ※重く感じる場合は「v_sales_staff_fytd_summary_scoped」を作って差し替えてください。
-    sql = f"""
+    labels = [x[0] for x in options]
+    sel = st.selectbox("候補一覧（選択してください）", options=[""] + labels, index=0)
+    if sel:
+        code = dict(options).get(sel)
+        st.success(f"選択：{sel}")
+
+        # クリック後ロード（ここから先は “必要な人だけ”）
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            do_customer_month = st.button("この得意先の当月状況を見る（軽量）")
+        with c2:
+            st.caption("※ここは入口を重くしないため、ボタンを押した時だけ集計します。")
+
+        if do_customer_month:
+            # 1本だけ：当月＆前年同月をその得意先に限定
+            sql = f"""
+            WITH sys AS (SELECT current_month FROM {VIEW_SYS_CURRENT_MONTH})
+            SELECT
+              f.customer_code AS 得意先コード,
+              ANY_VALUE(f.customer_name) AS 得意先名,
+              SUM(IF(f.month = s.current_month, f.sales_amount, 0)) AS 売上_当月,
+              SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.sales_amount, 0)) AS 売上_前年同月,
+              (SUM(IF(f.month = s.current_month, f.sales_amount, 0))
+                - SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.sales_amount, 0))) AS 売上_前年差,
+              SAFE_DIVIDE(
+                SUM(IF(f.month = s.current_month, f.sales_amount, 0)),
+                NULLIF(SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.sales_amount, 0)), 0)
+              ) - 1 AS 売上_前年同月比,
+
+              SUM(IF(f.month = s.current_month, f.gross_profit, 0)) AS 粗利_当月,
+              SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.gross_profit, 0)) AS 粗利_前年同月,
+              (SUM(IF(f.month = s.current_month, f.gross_profit, 0))
+                - SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.gross_profit, 0))) AS 粗利_前年差,
+              SAFE_DIVIDE(
+                SUM(IF(f.month = s.current_month, f.gross_profit, 0)),
+                NULLIF(SUM(IF(f.month = DATE_SUB(s.current_month, INTERVAL 1 YEAR), f.gross_profit, 0)), 0)
+              ) - 1 AS 粗利_前年同月比
+            FROM {FACT_LOGIN_DAILY} f
+            CROSS JOIN sys s
+            WHERE f.customer_code = @customer_code
+              AND f.month IN (s.current_month, DATE_SUB(s.current_month, INTERVAL 1 YEAR))
+            GROUP BY 得意先コード
+            """
+            df, err = bq_try_query_df(sql, (("customer_code", "STRING", code),))
+            if err or df is None or df.empty:
+                st.error(f"得意先集計エラー：{err}")
+            else:
+                r = df.iloc[0].to_dict()
+                m1, m2, m3, m4 = st.columns(4)
+                with m1:
+                    st.metric("売上（当月）", jpy(r.get("売上_当月")))
+                with m2:
+                    st.metric("売上前年差", jpy(r.get("売上_前年差")))
+                with m3:
+                    st.metric("粗利（当月）", jpy(r.get("粗利_当月")))
+                with m4:
+                    st.metric("粗利前年差", jpy(r.get("粗利_前年差")))
+
+                m5, m6 = st.columns(2)
+                with m5:
+                    st.metric("売上前年同月比", pct(r.get("売上_前年同月比")))
+                with m6:
+                    st.metric("粗利前年同月比", pct(r.get("粗利_前年同月比")))
+
+# ============================================================
+# チェック機構（軽量）
+# ============================================================
+with st.expander("チェック（軽量）", expanded=False):
+    st.write("入口が重くならない範囲で、最低限の健全性だけ確認します。")
+
+    # Fact row count / date range（あなたのログで使っていたのに合わせる）
+    sql_check = f"""
     SELECT
-      @current_month AS current_month,
-      SUM(fytd_sales_amount) AS fytd_sales_amount,
-      SUM(pytd_sales_amount) AS pytd_sales_amount,
-      SUM(fytd_gross_profit) AS fytd_gross_profit,
-      SAFE_DIVIDE(SUM(fytd_gross_profit), NULLIF(SUM(fytd_sales_amount),0)) AS fytd_gross_profit_rate
-    FROM `{V.v_sales_customer_fytd_base}`
-    WHERE current_month = @current_month
-      AND LOWER(TRIM(login_email)) = @email
+      COUNT(1) AS n_rows,
+      MIN(sales_date) AS min_date,
+      MAX(sales_date) AS max_date
+    FROM {FACT_LOGIN_DAILY}
     """
-    return query_df(
-        sql,
-        params=(
-            ("current_month", "DATE", str(current_month)),
-            ("email", "STRING", user_email),
-        ),
-        use_bqstorage=use_bqstorage
-    )
-
-st.subheader("年度累計（4月〜当月まで）")
-
-if is_admin_view:
-    fy = load_fytd_summary_admin()
-else:
-    fy = load_fytd_summary_sales()
-
-if fy.empty:
-    st.warning("年度累計サマリーのデータがありません。")
-else:
-    row = fy.iloc[0].to_dict()
-
-    # 期待カラム（管理者VIEW側の命名が異なる場合は、ここを合わせてください）
-    # 推奨：fytd_sales_amount / pytd_sales_amount / fytd_gross_profit / fytd_gross_profit_rate
-    fytd_sales = row.get("fytd_sales_amount", row.get("sales_amount_fytd", None))
-    pytd_sales = row.get("pytd_sales_amount", row.get("sales_amount_pytd", None))
-    diff_sales = None if (pd.isna(fytd_sales) or pd.isna(pytd_sales)) else (float(fytd_sales) - float(pytd_sales))
-
-    fytd_gp = row.get("fytd_gross_profit", row.get("gross_profit_fytd", None))
-    fytd_gpr = row.get("fytd_gross_profit_rate", row.get("gross_profit_rate_fytd", None))
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    metric_row(
-        [c1, c2, c3, c4, c5],
-        ["年度累計 売上", "昨年度累計 売上", "前年差（売上）", "年度累計 粗利額", "年度累計 粗利率"],
-        [fytd_sales, pytd_sales, diff_sales, fytd_gp, fytd_gpr],
-        ["円", "円", "円", "円", "%"]
-    )
-
-
-# =============================================================================
-# 2) 当月 YoY ランキング（上がり/下がり）
-# =============================================================================
-
-st.subheader("当月（前年同月比）— 上がり／下がり")
-
-def load_monthly_yoy_top_bottom_admin(limit_n: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # 既に scoped の上位/下位VIEWがある前提（最速）
-    top_sql = f"""
-    SELECT * FROM `{V.v_admin_customer_fytd_top_named_scoped}`
-    WHERE current_month = @current_month
-    LIMIT {limit_n}
-    """
-    bottom_sql = f"""
-    SELECT * FROM `{V.v_admin_customer_fytd_bottom_named_scoped}`
-    WHERE current_month = @current_month
-    LIMIT {limit_n}
-    """
-    top = query_df(top_sql, params=(("current_month", "DATE", str(current_month)),), use_bqstorage=use_bqstorage)
-    bottom = query_df(bottom_sql, params=(("current_month", "DATE", str(current_month)),), use_bqstorage=use_bqstorage)
-    return top, bottom
-
-def load_monthly_yoy_top_bottom_sales(limit_n: int = 30) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # 担当者入口：v_sales_customer_monthly_yoy_valid を自分で絞って差額順（軽め）
-    sql_base = f"""
-    SELECT
-      customer_code,
-      customer_name,
-      staff_name,
-      branch_name,
-      sales_amount AS 当月売上,
-      py_sales_amount AS 前年同月売上,
-      (sales_amount - py_sales_amount) AS 差額,
-      gross_profit AS 当月粗利額
-    FROM `{V.v_sales_customer_monthly_yoy_valid}`
-    WHERE month = @current_month
-      AND LOWER(TRIM(login_email)) = @email
-    """
-    top_sql = f"""
-    WITH t AS ({sql_base})
-    SELECT * FROM t
-    ORDER BY 差額 DESC
-    LIMIT {limit_n}
-    """
-    bottom_sql = f"""
-    WITH t AS ({sql_base})
-    SELECT * FROM t
-    ORDER BY 差額 ASC
-    LIMIT {limit_n}
-    """
-    top = query_df(top_sql, params=(("current_month", "DATE", str(current_month)), ("email", "STRING", user_email)), use_bqstorage=use_bqstorage)
-    bottom = query_df(bottom_sql, params=(("current_month", "DATE", str(current_month)), ("email", "STRING", user_email)), use_bqstorage=use_bqstorage)
-    return top, bottom
-
-if is_admin_view:
-    top_df, bottom_df = load_monthly_yoy_top_bottom_admin(limit_n=30)
-else:
-    top_df, bottom_df = load_monthly_yoy_top_bottom_sales(limit_n=30)
-
-# 表示する列を日本語に寄せる（VIEW側で日本語列を持てるならそれが最速）
-def normalize_rank_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    # よくある列名を吸収
-    rename_map = {
-        "sales_amount": "当月売上",
-        "py_sales_amount": "前年同月売上",
-        "diff_sales_amount": "差額",
-        "gross_profit": "当月粗利額",
-        "staff_name": "担当者",
-        "branch_name": "支店",
-        "customer_name": "得意先名",
-        "customer_code": "得意先コード",
-    }
-    df2 = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}).copy()
-    # 表示列（最小）
-    cols = ("得意先名", "支店", "担当者", "当月売上", "前年同月売上", "差額", "当月粗利額", "得意先コード")
-    return only_existing_cols(df2, cols)
-
-t1, t2 = st.columns(2)
-
-with t1:
-    st.markdown("#### 上がっている得意先（当月）")
-    d = normalize_rank_df(top_df)
-    if d.empty:
-        st.write("データなし")
+    df, err = bq_try_query_df(sql_check)
+    if err or df is None or df.empty:
+        st.error(f"Fact健全性チェック失敗：{err}")
     else:
-        st.dataframe(
-            d,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "当月売上": st.column_config.NumberColumn("当月売上", format="%,d"),
-                "前年同月売上": st.column_config.NumberColumn("前年同月売上", format="%,d"),
-                "差額": st.column_config.NumberColumn("差額", format="%,d"),
-                "当月粗利額": st.column_config.NumberColumn("当月粗利額", format="%,d"),
-            },
-        )
+        r = df.iloc[0].to_dict()
+        st.write(f"- 行数: **{int(r.get('n_rows',0)):,}**")
+        st.write(f"- 期間: **{pd.to_datetime(r.get('min_date')).date()} 〜 {pd.to_datetime(r.get('max_date')).date()}**")
+        st.write(f"- current_month: **{current_month.date()}**")
 
-with t2:
-    st.markdown("#### 下がっている得意先（当月）")
-    d = normalize_rank_df(bottom_df)
-    if d.empty:
-        st.write("データなし")
-    else:
-        st.dataframe(
-            d,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "当月売上": st.column_config.NumberColumn("当月売上", format="%,d"),
-                "前年同月売上": st.column_config.NumberColumn("前年同月売上", format="%,d"),
-                "差額": st.column_config.NumberColumn("差額", format="%,d"),
-                "当月粗利額": st.column_config.NumberColumn("当月粗利額", format="%,d"),
-            },
-        )
-
-
-# =============================================================================
-# 3) 新規納品サマリー（昨日/7日/月間/FYTD）
-# =============================================================================
-
-st.subheader("新規納品サマリー（Realized）")
-
-# 基本：v_new_deliveries_realized_monthly がある前提（最速）
-# ただし「昨日」「直近7日」は日次factが必要。
-# ここでは既存の月次VIEWから
-# - 月間（当月）
-# - FYTD（4月〜当月）
-# を確定表示し、
-# 「昨日/7日」は別VIEWがある場合だけ表示（無ければ “準備中” とする）。
-#
-# あなたは既に日次 fact（v_new_deliveries_realized_daily_fact_all_months）を持っているので、
-# それが存在する前提で昨日/7日も追加します。
-
-DAILY_VIEW = "salesdb-479915.sales_data.v_new_deliveries_realized_daily_fact_all_months"
-
-def load_new_deliveries_monthly_summary(scope_email: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # 当月（月間）
-    month_sql = f"""
-    SELECT
-      COUNT(DISTINCT customer_code) AS 新規得意先数,
-      COUNT(DISTINCT yj_code) AS 新規品目数,
-      SUM(sales_amount) AS 売上,
-      SUM(gross_profit) AS 粗利
-    FROM `{V.v_new_deliveries_realized_monthly}`
-    WHERE month_start = @current_month
-    {"" if scope_email is None else "AND LOWER(TRIM(login_email)) = @email"}
-    """
-    # FYTD（4月〜当月）
-    fy_sql = f"""
-    SELECT
-      COUNT(DISTINCT customer_code) AS 新規得意先数,
-      COUNT(DISTINCT yj_code) AS 新規品目数,
-      SUM(sales_amount) AS 売上,
-      SUM(gross_profit) AS 粗利
-    FROM `{V.v_new_deliveries_realized_monthly}`
-    WHERE month_start BETWEEN DATE_TRUNC(DATE_SUB(@current_month, INTERVAL 9 MONTH), MONTH) AND @current_month
-      AND EXTRACT(MONTH FROM @current_month) <= 3
-      OR (month_start BETWEEN DATE_TRUNC(@current_month, YEAR) + INTERVAL 3 MONTH AND @current_month
-          AND EXTRACT(MONTH FROM @current_month) >= 4)
-    {"" if scope_email is None else "AND LOWER(TRIM(login_email)) = @email"}
-    """
-    # FY開始（4/1）を正確に出すため、current_monthからFY開始日を算出して BETWEEN する方が安全
-    fy_sql = f"""
-    WITH p AS (
-      SELECT
-        @current_month AS current_month,
-        CASE
-          WHEN EXTRACT(MONTH FROM @current_month) >= 4 THEN DATE(EXTRACT(YEAR FROM @current_month), 4, 1)
-          ELSE DATE(EXTRACT(YEAR FROM @current_month) - 1, 4, 1)
-        END AS fy_start
-    )
-    SELECT
-      COUNT(DISTINCT customer_code) AS 新規得意先数,
-      COUNT(DISTINCT yj_code) AS 新規品目数,
-      SUM(sales_amount) AS 売上,
-      SUM(gross_profit) AS 粗利
-    FROM `{V.v_new_deliveries_realized_monthly}` n
-    CROSS JOIN p
-    WHERE n.month_start BETWEEN DATE_TRUNC(p.fy_start, MONTH) AND p.current_month
-    {"" if scope_email is None else "AND LOWER(TRIM(n.login_email)) = @email"}
-    """
-
-    params = [("current_month", "DATE", str(current_month))]
-    if scope_email is not None:
-        params.append(("email", "STRING", scope_email))
-
-    m = query_df(month_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-    f = query_df(fy_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-    return m, f
-
-def load_new_deliveries_daily_summary(scope_email: Optional[str]) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    # 昨日 / 直近7日（v_new_deliveries_realized_daily_fact_all_months が必要）
-    # もし VIEW が無い/権限が無い場合は None を返す
-    base = f"""
-    SELECT
-      COUNT(DISTINCT customer_code) AS 新規得意先数,
-      COUNT(DISTINCT yj_code) AS 新規品目数,
-      SUM(sales_amount) AS 売上,
-      SUM(gross_profit) AS 粗利
-    FROM `{DAILY_VIEW}`
-    WHERE 1=1
-    {"" if scope_email is None else "AND LOWER(TRIM(login_email)) = @email"}
-    """
-    y_sql = f"""
-    WITH p AS (SELECT DATE_SUB(CURRENT_DATE("Asia/Tokyo"), INTERVAL 1 DAY) AS d)
-    {base}
-    AND sales_date = (SELECT d FROM p)
-    """
-    w_sql = f"""
-    WITH p AS (
-      SELECT
-        DATE_SUB(CURRENT_DATE("Asia/Tokyo"), INTERVAL 7 DAY) AS d0,
-        DATE_SUB(CURRENT_DATE("Asia/Tokyo"), INTERVAL 1 DAY) AS d1
-    )
-    {base}
-    AND sales_date BETWEEN (SELECT d0 FROM p) AND (SELECT d1 FROM p)
-    """
-    params = []
-    if scope_email is not None:
-        params.append(("email", "STRING", scope_email))
-
-    try:
-        y = query_df(y_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-        w = query_df(w_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-        return y, w
-    except Exception:
-        return None, None
-
-
-scope_email = None if is_admin_view else user_email
-
-m_month, m_fy = load_new_deliveries_monthly_summary(scope_email=scope_email)
-d_y, d_w = load_new_deliveries_daily_summary(scope_email=scope_email)
-
-# 並び順：月間→直近7日→昨日→年度累計
-c1, c2, c3, c4 = st.columns(4)
-
-def show_new_box(col, title: str, df: Optional[pd.DataFrame]):
-    col.markdown(f"#### {title}")
-    if df is None or df.empty:
-        col.write("準備中 / データなし")
-        return
-    r = df.iloc[0].to_dict()
-    col.metric("新規得意先数", "" if pd.isna(r.get("新規得意先数")) else f'{int(r["新規得意先数"]):,}社')
-    col.metric("新規品目数", "" if pd.isna(r.get("新規品目数")) else f'{int(r["新規品目数"]):,}品目')
-    col.metric("売上", money_fmt(r.get("売上")))
-    col.metric("粗利", money_fmt(r.get("粗利")))
-
-show_new_box(c1, "月間（当月）", m_month)
-show_new_box(c2, "直近7日", d_w)
-show_new_box(c3, "昨日", d_y)
-show_new_box(c4, "年度累計（FYTD）", m_fy)
-
-
-# =============================================================================
-# 選択した得意先の「入口ドリル（軽量）」：FYTD + 当月の概況だけ
-# =============================================================================
-
-st.subheader("選択した得意先（概況）")
-
-selected_code = st.session_state.get("selected_customer_code", None)
-if not selected_code:
-    st.info("上の『得意先検索』から得意先を選択してください。")
-else:
-    # FYTD（得意先単体）
-    fy_sql = f"""
-    SELECT
-      customer_code,
-      customer_name,
-      staff_name,
-      branch_name,
-      fytd_sales_amount AS 年度累計売上,
-      pytd_sales_amount AS 昨年度累計売上,
-      (fytd_sales_amount - pytd_sales_amount) AS 年度累計前年差,
-      fytd_gross_profit AS 年度累計粗利額,
-      SAFE_DIVIDE(fytd_gross_profit, NULLIF(fytd_sales_amount,0)) AS 年度累計粗利率
-    FROM `{V.v_sales_customer_fytd_yoy_valid}`
-    WHERE current_month = @current_month
-      AND customer_code = @customer_code
-      {"" if is_admin_view else "AND LOWER(TRIM(login_email)) = @email"}
-    LIMIT 1
-    """
-    params = [
-        ("current_month", "DATE", str(current_month)),
-        ("customer_code", "STRING", str(selected_code)),
-    ]
-    if not is_admin_view:
-        params.append(("email", "STRING", user_email))
-
-    fy_one = query_df(fy_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-
-    # 当月YoY（得意先単体）
-    m_sql = f"""
-    SELECT
-      customer_code,
-      customer_name,
-      sales_amount AS 当月売上,
-      py_sales_amount AS 前年同月売上,
-      (sales_amount - py_sales_amount) AS 当月前年差,
-      gross_profit AS 当月粗利額,
-      SAFE_DIVIDE(gross_profit, NULLIF(sales_amount,0)) AS 当月粗利率
-    FROM `{V.v_sales_customer_monthly_yoy_valid}`
-    WHERE month = @current_month
-      AND customer_code = @customer_code
-      {"" if is_admin_view else "AND LOWER(TRIM(login_email)) = @email"}
-    LIMIT 1
-    """
-    m_one = query_df(m_sql, params=tuple(params), use_bqstorage=use_bqstorage)
-
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("#### 年度累計（得意先）")
-        if fy_one.empty:
-            st.write("データなし")
-        else:
-            r = fy_one.iloc[0].to_dict()
-            st.write(f'**{r.get("customer_name","")}**（{r.get("branch_name","")} / {r.get("staff_name","")}）')
-            cc1, cc2, cc3 = st.columns(3)
-            metric_row(
-                [cc1, cc2, cc3],
-                ["年度累計 売上", "年度累計 粗利額", "年度累計 粗利率"],
-                [r.get("年度累計売上"), r.get("年度累計粗利額"), r.get("年度累計粗利率")],
-                ["円", "円", "%"]
-            )
-            st.caption(f'前年差（年度累計売上）：{money_fmt(r.get("年度累計前年差"))}')
-
-    with right:
-        st.markdown("#### 当月（前年同月比）— 得意先")
-        if m_one.empty:
-            st.write("データなし")
-        else:
-            r = m_one.iloc[0].to_dict()
-            cc1, cc2, cc3 = st.columns(3)
-            metric_row(
-                [cc1, cc2, cc3],
-                ["当月 売上", "当月 粗利額", "当月 粗利率"],
-                [r.get("当月売上"), r.get("当月粗利額"), r.get("当月粗利率")],
-                ["円", "円", "%"]
-            )
-            st.caption(f'前年差（当月売上）：{money_fmt(r.get("当月前年差"))}')
-
-st.divider()
-
-# =============================================================================
-# 注意：この app.py は “入口高速” のため、ここで明細は出しません。
-# 明細（品目・日次）はドリル画面（別セクション）で追加してください。
-# =============================================================================
-
-st.caption("入口は判断専用です。根拠（明細）はドリル側で確認します。")
+st.caption("入口高速版：最初の表示は最大3クエリに制限。重い詳細はクリック後ロード。")
