@@ -1,842 +1,558 @@
 # app.py
-# =============================================================================
-# SFA Sales OS（入口高速版 / 判断専用）
-# - FYTDサマリー（今年度累計 vs 昨年度累計）
-# - 当月YoYランキング（前年同月比：上がった先 / 下がった先）
-# - 新規納品サマリー（昨日 / 直近7日 / 当月 / FYTD）
-# - 権限分岐（dim_staff_role）
-# - 日本語表示（英語ラベル排除）
-# - 得意先：検索→候補→選択（コード＋名称）
-# - “ずっと読み込み”対策：遅延ロード＋タイムアウト＋Storage API切替＋ヘルスチェック
-# =============================================================================
+# -*- coding: utf-8 -*-
+"""
+SFA・入口高速版（判断専用） - OS v1.4.6
+- BigQuery: asia-northeast1
+- UI: 遅延ロード（ボタン押下で必要な集計だけ実行）
+- 切り分け: timeout / BigQuery Storage API ON-OFF / SELECT1 ヘルスチェック
+- 事故対策: BigQuery BadRequest の詳細（job.errors 等）を画面に表示
+
+必要な secrets（Streamlit Cloud）例:
+[bigquery]
+project_id = "salesdb-479915"
+location = "asia-northeast1"
+
+# サービスアカウントJSON（丸ごと）
+[bigquery.service_account]
+type = "service_account"
+project_id = "salesdb-479915"
+private_key_id = "xxxx"
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "xxx@xxx.iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
+universe_domain = "googleapis.com"
+"""
 
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
-
-# =============================================================================
-# CONFIG
-# =============================================================================
-
-PROJECT_ID = "salesdb-479915"
-DATASET_ID = "sales_data"
-
-# 入口で使う「計算済み」View（BigQuery側で事前に用意している前提）
-VIEW_SYS_CURRENT_MONTH = f"`{PROJECT_ID}.{DATASET_ID}.v_sys_current_month`"
-
-# FYTD（得意先ベース・正本）
-VIEW_SALES_FYTD_BASE = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_fytd_base`"
-VIEW_SALES_FYTD_YOY_VALID = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_fytd_yoy_valid`"
-VIEW_SALES_FYTD_YOY_INVALID = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_fytd_yoy_invalid`"
-
-# 管理者入口（組織サマリー / TOP/BOTTOM）
-# ※あなたの環境で作成済み：
-# v_admin_org_fytd_summary_scoped
-# v_admin_customer_fytd_top_named_scoped
-# v_admin_customer_fytd_bottom_named_scoped
-VIEW_ADMIN_ORG_FYTD_SCOPED = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_org_fytd_summary_scoped`"
-VIEW_ADMIN_CUST_FYTD_TOP_SCOPED = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_top_named_scoped`"
-VIEW_ADMIN_CUST_FYTD_BOTTOM_SCOPED = f"`{PROJECT_ID}.{DATASET_ID}.v_admin_customer_fytd_bottom_named_scoped`"
-
-# 当月YoY（上がった/下がった/比較不能）※月次入口
-VIEW_MONTH_TOP = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_yoy_top_current_month`"
-VIEW_MONTH_BOTTOM = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_yoy_bottom_current_month`"
-VIEW_MONTH_UNCOMPARABLE = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_customer_yoy_uncomparable_current_month`"
-
-# 日次Fact（ドリル/新規納品集計用）
-VIEW_FACT_LOGIN_JAN_DAILY = f"`{PROJECT_ID}.{DATASET_ID}.v_sales_fact_login_jan_daily`"
-VIEW_NEW_DELIVERIES_DAILY_ALL = f"`{PROJECT_ID}.{DATASET_ID}.v_new_deliveries_realized_daily_fact_all_months`"
-
-# 権限
-TABLE_STAFF_ROLE = f"`{PROJECT_ID}.{DATASET_ID}.dim_staff_role`"
-# dedupがあるなら優先
-VIEW_STAFF_ROLE_DEDUP = f"`{PROJECT_ID}.{DATASET_ID}.v_dim_staff_role_dedup`"
-
-# 連絡先/氏名（表示用）
-VIEW_STAFF_EMAIL_NAME = f"`{PROJECT_ID}.{DATASET_ID}.v_staff_email_name`"
-
-# 得意先DIM（検索用）
-VIEW_DIM_CUSTOMER_STAFF = f"`{PROJECT_ID}.{DATASET_ID}.dim_customer_staff_current`"
-
-APP_TITLE = "SFA Sales OS（入口）"
-TZ = "Asia/Tokyo"
+from google.api_core.exceptions import BadRequest, GoogleAPICallError
 
 
 # =============================================================================
-# UI HELPERS
+# 設定
 # =============================================================================
 
-def yen(x: Any) -> str:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return "-"
-        return f"¥{int(round(float(x))):,}"
-    except Exception:
-        return str(x)
+APP_TITLE = "SFA｜入口高速版（判断専用）"
+DEFAULT_TZ = "Asia/Tokyo"
 
-def pct(x: Any) -> str:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return "-"
-        return f"{float(x)*100:.1f}%"
-    except Exception:
-        return str(x)
+# ---- あなたのBigQuery VIEW名に合わせてここを編集してください ----
+# 入口（管理者） FYTD サマリー（組織）
+SQL_FYTD_ORG_SUMMARY = """
+-- 年度累計（組織）: 今年度累計 vs 昨年度累計
+-- 必須列例:
+--   fiscal_year, fytd_sales, fytd_gp, fytd_gp_rate,
+--   prev_fiscal_year, prev_fytd_sales, prev_fytd_gp, prev_fytd_gp_rate,
+--   diff_sales, diff_gp
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_admin_org_fytd_summary_scoped`
+WHERE login_email = @login_email
+LIMIT 2000
+"""
 
-def num(x: Any) -> str:
-    try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
-            return "-"
-        if abs(float(x)) >= 1000:
-            return f"{float(x):,.0f}"
-        return f"{float(x):,.2f}"
-    except Exception:
-        return str(x)
+# 当月YoYランキング（上）
+SQL_YOY_TOP = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_sales_customer_yoy_top_current_month`
+WHERE login_email = @login_email
+LIMIT 2000
+"""
 
-def to_date(x: Any) -> Optional[date]:
-    if x is None:
-        return None
-    if isinstance(x, date) and not isinstance(x, datetime):
-        return x
-    if isinstance(x, datetime):
-        return x.date()
-    try:
-        return datetime.fromisoformat(str(x)).date()
-    except Exception:
-        return None
+# 当月YoYランキング（下）
+SQL_YOY_BOTTOM = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_sales_customer_yoy_bottom_current_month`
+WHERE login_email = @login_email
+LIMIT 2000
+"""
+
+# 当月YoY（比較不能：新規・前年なし）
+SQL_YOY_UNCOMPARABLE = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_sales_customer_yoy_uncomparable_current_month`
+WHERE login_email = @login_email
+LIMIT 2000
+"""
+
+# 新規納品（入口4本固定）: 昨日 / 直近7日 / 当月 / FYTD
+# ここは「計算済みVIEW」が理想。無ければ、v_new_deliveries_realized_daily_fact_all_months を軽く集計してもOK。
+SQL_NEW_DELIVERIES_YESTERDAY = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_new_deliveries_realized_daily_fact_all_months`
+WHERE login_email = @login_email
+  AND period_key = "yesterday"
+LIMIT 2000
+"""
+
+SQL_NEW_DELIVERIES_LAST7D = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_new_deliveries_realized_daily_fact_all_months`
+WHERE login_email = @login_email
+  AND period_key = "last_7_days"
+LIMIT 2000
+"""
+
+SQL_NEW_DELIVERIES_THIS_MONTH = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_new_deliveries_realized_daily_fact_all_months`
+WHERE login_email = @login_email
+  AND period_key = "this_month"
+LIMIT 2000
+"""
+
+SQL_NEW_DELIVERIES_FYTD = """
+SELECT
+  *
+FROM `salesdb-479915.sales_data.v_new_deliveries_realized_daily_fact_all_months`
+WHERE login_email = @login_email
+  AND period_key = "fytd"
+LIMIT 2000
+"""
+
+# ロール（権限）取得：あなたの環境のDIM/VIEWに合わせて調整してください
+SQL_ROLE_LOOKUP = """
+SELECT
+  login_email,
+  role_key,
+  role_admin_view,
+  role_admin_edit,
+  role_sales_view,
+  area_key
+FROM `salesdb-479915.sales_data.v_dim_staff_role_dedup`
+WHERE login_email = @login_email
+LIMIT 1
+"""
+
+# 担当者表示名（メール→氏名）
+SQL_STAFF_NAME = """
+SELECT
+  login_email,
+  display_name
+FROM `salesdb-479915.sales_data.v_staff_email_name`
+WHERE login_email = @login_email
+LIMIT 1
+"""
 
 
 # =============================================================================
-# AUTH / ROLE
+# データ構造
 # =============================================================================
 
-@dataclass
+@dataclass(frozen=True)
 class RoleInfo:
     login_email: str
-    role_tier: str
-    area_name: str
-    scope_type: str
-    scope_branches: List[str]
-    role_admin_view: bool
-    role_admin_edit: bool
-    role_sales_view: bool
-    can_manage_roles: bool
-
-
-def get_login_email() -> str:
-    # URLクエリ ?user_email=xxx の暫定ログインを正式採用（OS方針）
-    qs = st.query_params
-    user_email = (qs.get("user_email") or qs.get("login_email") or qs.get("email") or "").strip()
-    if user_email:
-        return user_email
-
-    # UI入力（URLが無い場合の保険）
-    st.warning("ログインメールが指定されていません。URLに ?user_email=... を付与するか、下で入力してください。")
-    user_email = st.text_input("ログインメール（user_email）", value="", placeholder="例：okazaki@shinrai8.by-works.com").strip()
-    return user_email
+    role_key: str = "SALES"
+    role_admin_view: bool = False
+    role_admin_edit: bool = False
+    role_sales_view: bool = True
+    area_key: str = ""  # 例: "oita" / "kumamoto" / ""
 
 
 # =============================================================================
-# BIGQUERY
+# BigQuery Client
 # =============================================================================
 
-@st.cache_resource
+def _get_secrets() -> Tuple[str, str, Dict[str, Any]]:
+    # secrets から取得（必須）
+    if "bigquery" not in st.secrets:
+        raise RuntimeError("st.secrets に [bigquery] がありません。project_id/location/service_account を設定してください。")
+
+    bq = st.secrets["bigquery"]
+    project_id = bq.get("project_id")
+    location = bq.get("location", "asia-northeast1")
+    sa = bq.get("service_account")
+
+    if not project_id or not sa:
+        raise RuntimeError("st.secrets['bigquery'] に project_id と service_account が必要です。")
+
+    return str(project_id), str(location), dict(sa)
+
+
+@st.cache_resource(show_spinner=False)
 def get_bq_client() -> bigquery.Client:
-    # Streamlit Cloud: st.secrets に service_account を入れている前提
-    # secrets例：
-    # [gcp_service_account]
-    # type="service_account"
-    # project_id="..."
-    # private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-    sa = st.secrets.get("gcp_service_account", None)
-    if sa is None:
-        # ローカル/別環境
-        return bigquery.Client(project=PROJECT_ID)
-
-    creds = service_account.Credentials.from_service_account_info(dict(sa))
-    return bigquery.Client(project=PROJECT_ID, credentials=creds)
+    project_id, location, sa = _get_secrets()
+    creds = service_account.Credentials.from_service_account_info(sa)
+    client = bigquery.Client(project=project_id, credentials=creds, location=location)
+    return client
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_query_df(sql: str, params: Optional[Dict[str, Any]], use_bqstorage: bool, timeout_sec: int) -> pd.DataFrame:
+# =============================================================================
+# クエリ実行（キャッシュ安全 & エラー可視化）
+# =============================================================================
+
+def _build_query_parameters(params: Optional[Dict[str, Any]]) -> list[bigquery.ScalarQueryParameter]:
+    qparams: list[bigquery.ScalarQueryParameter] = []
+    if not params:
+        return qparams
+
+    for k, v in params.items():
+        # 明示型（まずは安全な推論）
+        if isinstance(v, bool):
+            qparams.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
+        elif isinstance(v, int):
+            qparams.append(bigquery.ScalarQueryParameter(k, "INT64", v))
+        elif isinstance(v, float):
+            qparams.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
+        elif v is None:
+            qparams.append(bigquery.ScalarQueryParameter(k, "STRING", ""))
+        else:
+            qparams.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
+
+    return qparams
+
+
+def _show_bq_error_context(
+    title: str,
+    sql: str,
+    params: Optional[Dict[str, Any]],
+    job: Optional[bigquery.job.QueryJob],
+    exc: Exception
+) -> None:
+    st.error(f"BigQuery クエリ失敗：{title}")
+    st.write("**発生時刻**:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    st.write("**params**:")
+    st.code(json.dumps(params or {}, ensure_ascii=False, indent=2), language="json")
+
+    if job is not None:
+        st.write("**job_id**:", getattr(job, "job_id", None))
+        st.write("**location**:", getattr(job, "location", None))
+        if getattr(job, "errors", None):
+            st.write("**job.errors（最重要）**:")
+            st.json(job.errors)
+
+    st.write("**sql**:")
+    st.code(sql, language="sql")
+    st.write("**exception**:", str(exc))
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_query_df(
+    sql: str,
+    params_json: str,
+    use_bqstorage: bool,
+    timeout_sec: int,
+) -> pd.DataFrame:
+    """
+    注意:
+    - st.cache_data 内で session_state を触らない（OS v1.4.6）
+    - params は hash 安定化のため JSON 文字列で受ける
+    """
     client = get_bq_client()
+    params = json.loads(params_json) if params_json else {}
+
     job_config = bigquery.QueryJobConfig()
+    qparams = _build_query_parameters(params)
+    if qparams:
+        job_config.query_parameters = qparams
 
-    query_params: List[bigquery.ScalarQueryParameter] = []
-    if params:
-        for k, v in params.items():
-            if isinstance(v, bool):
-                query_params.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
-            elif isinstance(v, int):
-                query_params.append(bigquery.ScalarQueryParameter(k, "INT64", v))
-            elif isinstance(v, float):
-                query_params.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
-            elif isinstance(v, (date, datetime)):
-                dv = v if isinstance(v, date) else v.date()
-                query_params.append(bigquery.ScalarQueryParameter(k, "DATE", dv))
-            else:
-                query_params.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
-
-    if query_params:
-        job_config.query_parameters = query_params
-
-    job = client.query(sql, job_config=job_config)
-
-    # “ずっと読み込み”防止：結果待ちにタイムアウトを入れる
-    job.result(timeout=timeout_sec)
-
-    # DataFrame化：Storage API は詰まる環境があるので切替可能にする
-    df = job.to_dataframe(create_bqstorage_client=use_bqstorage)
-    return df
-
-
-def query_df(sql: str, params: Optional[Dict[str, Any]] = None, label: str = "クエリ") -> pd.DataFrame:
-    use_bqstorage = st.session_state.get("use_bqstorage", False)
-    timeout_sec = int(st.session_state.get("timeout_sec", 90))
-
-    with st.status(f"{label} 実行中...", expanded=False) as status:
-        t0 = time.time()
-        try:
-            df = cached_query_df(sql, params=params, use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
-            dt = time.time() - t0
-            status.update(label=f"{label} 完了（{dt:.1f}秒）", state="complete")
-            return df
-        except Exception as e:
-            dt = time.time() - t0
-            status.update(label=f"{label} 失敗（{dt:.1f}秒）", state="error")
-            st.error(f"{label} でエラー：{e}")
-            raise
-
-
-def table_exists(fully_qualified: str) -> bool:
-    # fully_qualified: `project.dataset.table`
-    # INFORMATION_SCHEMA を叩かずに軽く検査：SELECT 1 LIMIT 1 をtry
+    job: Optional[bigquery.job.QueryJob] = None
     try:
-        _ = query_df(f"SELECT 1 AS ok FROM {fully_qualified} LIMIT 1", label=f"存在チェック {fully_qualified}")
-        return True
-    except Exception:
-        return False
+        job = client.query(sql, job_config=job_config)
+        job.result(timeout=timeout_sec)  # ここで BadRequest が出ることがある
+        df = job.to_dataframe(create_bqstorage_client=use_bqstorage)
+        return df
 
-
-def load_role(login_email: str) -> RoleInfo:
-    # dedup view があれば優先
-    role_source = VIEW_STAFF_ROLE_DEDUP if table_exists(VIEW_STAFF_ROLE_DEDUP) else TABLE_STAFF_ROLE
-
-    sql = f"""
-    SELECT
-      login_email,
-      COALESCE(role_tier, 'SALES') AS role_tier,
-      COALESCE(area_name, '未分類') AS area_name,
-      COALESCE(scope_type, 'ALL') AS scope_type,
-      COALESCE(scope_branches, []) AS scope_branches,
-      COALESCE(role_admin_view, FALSE) AS role_admin_view,
-      COALESCE(role_admin_edit, FALSE) AS role_admin_edit,
-      COALESCE(role_sales_view, TRUE) AS role_sales_view,
-      COALESCE(can_manage_roles, FALSE) AS can_manage_roles
-    FROM {role_source}
-    WHERE login_email = @login_email
-    LIMIT 1
-    """
-    df = query_df(sql, params={"login_email": login_email}, label="権限取得")
-    if df.empty:
-        # 未登録は SALES として最低限閲覧にする（OSの方針に合わせ、後で閉じる運用に移行可）
-        return RoleInfo(
-            login_email=login_email,
-            role_tier="SALES",
-            area_name="未分類",
-            scope_type="ALL",
-            scope_branches=[],
-            role_admin_view=False,
-            role_admin_edit=False,
-            role_sales_view=True,
-            can_manage_roles=False,
-        )
-
-    r = df.iloc[0].to_dict()
-    return RoleInfo(
-        login_email=str(r["login_email"]),
-        role_tier=str(r["role_tier"]),
-        area_name=str(r["area_name"]),
-        scope_type=str(r["scope_type"]),
-        scope_branches=list(r["scope_branches"]) if isinstance(r["scope_branches"], (list, tuple)) else [],
-        role_admin_view=bool(r["role_admin_view"]),
-        role_admin_edit=bool(r["role_admin_edit"]),
-        role_sales_view=bool(r["role_sales_view"]),
-        can_manage_roles=bool(r["can_manage_roles"]),
-    )
-
-
-def get_current_month() -> date:
-    df = query_df(f"SELECT current_month FROM {VIEW_SYS_CURRENT_MONTH}", label="current_month取得")
-    if df.empty:
-        # 保険：今月の月初
-        today = date.today()
-        return date(today.year, today.month, 1)
-    d = to_date(df.loc[0, "current_month"])
-    return d if d else date.today().replace(day=1)
-
-
-def get_latest_sales_date(current_month: date) -> date:
-    sql = f"""
-    SELECT MAX(sales_date) AS max_date
-    FROM {VIEW_FACT_LOGIN_JAN_DAILY}
-    WHERE sales_date >= @current_month
-    """
-    df = query_df(sql, params={"current_month": current_month}, label="最新売上日取得")
-    d = to_date(df.loc[0, "max_date"]) if not df.empty else None
-    return d if d else current_month
-
-
-# =============================================================================
-# RENDERERS (ADMIN)
-# =============================================================================
-
-def render_admin_header(role: RoleInfo, current_month: date, latest_date: date) -> None:
-    st.subheader("管理者（判断専用）")
-    st.caption(f"ログイン：{role.login_email} / 権限：{role.role_tier} / エリア：{role.area_name}")
-    st.caption(f"current_month：{current_month.isoformat()} / 最新売上日：{latest_date.isoformat()}")
-
-
-def render_fytd_org_summary(role: RoleInfo) -> None:
-    st.markdown("### 年度累計サマリー（今年度累計 vs 昨年度累計）")
-
-    # scoped view が “権限で絞り済み” の前提（role.login_email によるフィルタ）
-    sql = f"""
-    SELECT *
-    FROM {VIEW_ADMIN_ORG_FYTD_SCOPED}
-    WHERE login_email = @login_email
-    LIMIT 1
-    """
-    df = query_df(sql, params={"login_email": role.login_email}, label="年度累計（組織）")
-
-    if df.empty:
-        st.info("データがありません（権限スコープまたは集計ビューの中身を確認してください）。")
-        return
-
-    row = df.iloc[0].to_dict()
-
-    # 代表列名は環境差があり得るので、存在するものだけ拾う
-    # よくある列名候補（あなたのViewに合わせてBigQuery側で整備推奨）
-    keys = {
-        "sales_fytd": ["sales_fytd", "sales_amount_fytd", "fytd_sales_amount", "sales_amount"],
-        "gp_fytd": ["gp_fytd", "gross_profit_fytd", "fytd_gross_profit", "gross_profit"],
-        "sales_py_fytd": ["sales_py_fytd", "sales_amount_py_fytd", "py_fytd_sales_amount"],
-        "gp_py_fytd": ["gp_py_fytd", "gross_profit_py_fytd", "py_fytd_gross_profit"],
-        "sales_diff": ["sales_diff", "sales_amount_diff"],
-        "gp_diff": ["gp_diff", "gross_profit_diff"],
-        "sales_yoy": ["sales_yoy", "sales_yoy_rate"],
-        "gp_yoy": ["gp_yoy", "gp_yoy_rate", "gross_profit_yoy"],
-    }
-
-    def pick(cands: List[str]) -> Optional[Any]:
-        for c in cands:
-            if c in row:
-                return row[c]
-        return None
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("売上（今年度累計）", yen(pick(keys["sales_fytd"])))
-    c2.metric("粗利（今年度累計）", yen(pick(keys["gp_fytd"])))
-    c3.metric("売上前年差", yen(pick(keys["sales_diff"])))
-    c4.metric("粗利前年差", yen(pick(keys["gp_diff"])))
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("売上（昨年度累計）", yen(pick(keys["sales_py_fytd"])))
-    c6.metric("粗利（昨年度累計）", yen(pick(keys["gp_py_fytd"])))
-    c7.metric("売上前年比", pct(pick(keys["sales_yoy"])))
-    c8.metric("粗利前年比", pct(pick(keys["gp_yoy"])))
-
-
-def render_fytd_top_bottom(role: RoleInfo, top_n: int) -> None:
-    st.markdown("### 年度累計：上がった先 / 下がった先（前年差）")
-
-    colA, colB = st.columns(2)
-
-    # TOP
-    with colA:
-        st.markdown("#### 上がった先（前年差 上位）")
-        sql_top = f"""
-        SELECT *
-        FROM {VIEW_ADMIN_CUST_FYTD_TOP_SCOPED}
-        WHERE login_email = @login_email
-        ORDER BY sales_diff DESC
-        LIMIT @top_n
-        """
-        df_top = query_df(sql_top, params={"login_email": role.login_email, "top_n": int(top_n)}, label="年度累計TOP")
-
-        if df_top.empty:
-            st.info("データがありません。")
-        else:
-            df_show = df_top.copy()
-            # 日本語列名に寄せる（存在する列だけ）
-            rename_map = {
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "staff_name": "担当者",
-                "branch_name": "支店名",
-                "sales_fytd": "売上（今年度累計）",
-                "gp_fytd": "粗利（今年度累計）",
-                "sales_py_fytd": "売上（昨年度累計）",
-                "gp_py_fytd": "粗利（昨年度累計）",
-                "sales_diff": "売上前年差",
-                "gp_diff": "粗利前年差",
-                "sales_yoy": "売上前年比",
-                "gp_yoy": "粗利前年比",
-            }
-            for k, v in list(rename_map.items()):
-                if k in df_show.columns:
-                    df_show.rename(columns={k: v}, inplace=True)
-
-            for col in ["売上（今年度累計）", "粗利（今年度累計）", "売上（昨年度累計）", "粗利（昨年度累計）", "売上前年差", "粗利前年差"]:
-                if col in df_show.columns:
-                    df_show[col] = df_show[col].apply(lambda x: yen(x))
-            for col in ["売上前年比", "粗利前年比"]:
-                if col in df_show.columns:
-                    df_show[col] = df_show[col].apply(lambda x: pct(x))
-
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-    # BOTTOM
-    with colB:
-        st.markdown("#### 下がった先（前年差 下位）")
-        sql_bottom = f"""
-        SELECT *
-        FROM {VIEW_ADMIN_CUST_FYTD_BOTTOM_SCOPED}
-        WHERE login_email = @login_email
-        ORDER BY sales_diff ASC
-        LIMIT @top_n
-        """
-        df_bottom = query_df(sql_bottom, params={"login_email": role.login_email, "top_n": int(top_n)}, label="年度累計BOTTOM")
-
-        if df_bottom.empty:
-            st.info("データがありません。")
-        else:
-            df_show = df_bottom.copy()
-            rename_map = {
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "staff_name": "担当者",
-                "branch_name": "支店名",
-                "sales_fytd": "売上（今年度累計）",
-                "gp_fytd": "粗利（今年度累計）",
-                "sales_py_fytd": "売上（昨年度累計）",
-                "gp_py_fytd": "粗利（昨年度累計）",
-                "sales_diff": "売上前年差",
-                "gp_diff": "粗利前年差",
-                "sales_yoy": "売上前年比",
-                "gp_yoy": "粗利前年比",
-            }
-            for k, v in list(rename_map.items()):
-                if k in df_show.columns:
-                    df_show.rename(columns={k: v}, inplace=True)
-
-            for col in ["売上（今年度累計）", "粗利（今年度累計）", "売上（昨年度累計）", "粗利（昨年度累計）", "売上前年差", "粗利前年差"]:
-                if col in df_show.columns:
-                    df_show[col] = df_show[col].apply(lambda x: yen(x))
-            for col in ["売上前年比", "粗利前年比"]:
-                if col in df_show.columns:
-                    df_show[col] = df_show[col].apply(lambda x: pct(x))
-
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-
-def render_month_yoy_rankings(role: RoleInfo, top_n: int) -> None:
-    st.markdown("### 当月：前年同月比ランキング（上がった先 / 下がった先）")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### 上がった先（前年比 上位）")
-        sql = f"""
-        SELECT
-          customer_code, customer_name, staff_name, branch_name,
-          sales_amount, gross_profit,
-          py_sales_amount, py_gross_profit,
-          sales_diff, gp_diff,
-          sales_yoy, gp_yoy
-        FROM {VIEW_MONTH_TOP}
-        WHERE login_email = @login_email
-        ORDER BY sales_yoy DESC
-        LIMIT @top_n
-        """
-        df = query_df(sql, params={"login_email": role.login_email, "top_n": int(top_n)}, label="当月YoY TOP")
-        if df.empty:
-            st.info("データがありません。")
-        else:
-            df2 = df.copy()
-            df2.rename(
-                columns={
-                    "customer_code": "得意先コード",
-                    "customer_name": "得意先名",
-                    "staff_name": "担当者",
-                    "branch_name": "支店名",
-                    "sales_amount": "売上（当月）",
-                    "gross_profit": "粗利（当月）",
-                    "py_sales_amount": "売上（前年同月）",
-                    "py_gross_profit": "粗利（前年同月）",
-                    "sales_diff": "売上前年差",
-                    "gp_diff": "粗利前年差",
-                    "sales_yoy": "売上前年比",
-                    "gp_yoy": "粗利前年比",
-                },
-                inplace=True,
-            )
-            for c in ["売上（当月）", "粗利（当月）", "売上（前年同月）", "粗利（前年同月）", "売上前年差", "粗利前年差"]:
-                if c in df2.columns:
-                    df2[c] = df2[c].apply(yen)
-            for c in ["売上前年比", "粗利前年比"]:
-                if c in df2.columns:
-                    df2[c] = df2[c].apply(pct)
-
-            st.dataframe(df2, use_container_width=True, hide_index=True)
-
-    with col2:
-        st.markdown("#### 下がった先（前年比 下位）")
-        sql = f"""
-        SELECT
-          customer_code, customer_name, staff_name, branch_name,
-          sales_amount, gross_profit,
-          py_sales_amount, py_gross_profit,
-          sales_diff, gp_diff,
-          sales_yoy, gp_yoy
-        FROM {VIEW_MONTH_BOTTOM}
-        WHERE login_email = @login_email
-        ORDER BY sales_yoy ASC
-        LIMIT @top_n
-        """
-        df = query_df(sql, params={"login_email": role.login_email, "top_n": int(top_n)}, label="当月YoY BOTTOM")
-        if df.empty:
-            st.info("データがありません。")
-        else:
-            df2 = df.copy()
-            df2.rename(
-                columns={
-                    "customer_code": "得意先コード",
-                    "customer_name": "得意先名",
-                    "staff_name": "担当者",
-                    "branch_name": "支店名",
-                    "sales_amount": "売上（当月）",
-                    "gross_profit": "粗利（当月）",
-                    "py_sales_amount": "売上（前年同月）",
-                    "py_gross_profit": "粗利（前年同月）",
-                    "sales_diff": "売上前年差",
-                    "gp_diff": "粗利前年差",
-                    "sales_yoy": "売上前年比",
-                    "gp_yoy": "粗利前年比",
-                },
-                inplace=True,
-            )
-            for c in ["売上（当月）", "粗利（当月）", "売上（前年同月）", "粗利（前年同月）", "売上前年差", "粗利前年差"]:
-                if c in df2.columns:
-                    df2[c] = df2[c].apply(yen)
-            for c in ["売上前年比", "粗利前年比"]:
-                if c in df2.columns:
-                    df2[c] = df2[c].apply(pct)
-
-            st.dataframe(df2, use_container_width=True, hide_index=True)
-
-    # 比較不能（参考）
-    with st.expander("比較不能（新規・前年なし）", expanded=False):
-        sql = f"""
-        SELECT customer_code, customer_name, staff_name, branch_name, sales_amount, gross_profit
-        FROM {VIEW_MONTH_UNCOMPARABLE}
-        WHERE login_email = @login_email
-        ORDER BY sales_amount DESC
-        LIMIT @top_n
-        """
-        df = query_df(sql, params={"login_email": role.login_email, "top_n": int(top_n)}, label="当月YoY 比較不能")
-        if df.empty:
-            st.info("データがありません。")
-        else:
-            df2 = df.copy()
-            df2.rename(
-                columns={
-                    "customer_code": "得意先コード",
-                    "customer_name": "得意先名",
-                    "staff_name": "担当者",
-                    "branch_name": "支店名",
-                    "sales_amount": "売上（当月）",
-                    "gross_profit": "粗利（当月）",
-                },
-                inplace=True,
-            )
-            for c in ["売上（当月）", "粗利（当月）"]:
-                if c in df2.columns:
-                    df2[c] = df2[c].apply(yen)
-            st.dataframe(df2, use_container_width=True, hide_index=True)
-
-
-def render_new_deliveries_summary(role: RoleInfo, current_month: date, latest_date: date) -> None:
-    st.markdown("### 新規納品サマリー（昨日 / 直近7日 / 当月 / 年度累計）")
-
-    # 新規納品 fact から “realized_flag=1” を拾う前提（viewの列名は環境差あり得る）
-    # ここは「確実に動く」ために、存在しやすい列名で書く。
-    # v_new_deliveries_realized_daily_fact_all_months に以下がある想定：
-    # - sales_date（または date）
-    # - customer_code
-    # - yj_code
-    # - realized_new_flag（または is_new_deliveries / new_flag）
-    # - sales_amount / gross_profit（あれば）
-    #
-    # ない列があれば BigQuery 側で view の列名を揃えるのが正攻法。
-
-    # 期間
-    d_yesterday = latest_date - timedelta(days=1)
-    d_7 = latest_date - timedelta(days=7)
-
-    def agg_sql(label: str, d_from: date, d_to: date) -> str:
-        return f"""
-        WITH base AS (
-          SELECT
-            sales_date,
-            customer_code,
-            yj_code,
-            sales_amount,
-            gross_profit,
-            login_email,
-            -- 新規フラグ（列名差異を吸収）
-            CASE
-              WHEN SAFE_CAST(realized_flag AS INT64) = 1 THEN 1
-              WHEN SAFE_CAST(is_new_deliveries AS INT64) = 1 THEN 1
-              WHEN SAFE_CAST(new_flag AS INT64) = 1 THEN 1
-              WHEN SAFE_CAST(realized_new_flag AS INT64) = 1 THEN 1
-              ELSE 0
-            END AS is_new
-          FROM {VIEW_NEW_DELIVERIES_DAILY_ALL}
-          WHERE sales_date BETWEEN @d_from AND @d_to
-        )
-        SELECT
-          '{label}' AS 期間,
-          COUNT(DISTINCT IF(is_new=1, customer_code, NULL)) AS 新規得意先数,
-          COUNT(DISTINCT IF(is_new=1, yj_code, NULL)) AS 新規品目数,
-          SUM(IF(is_new=1, sales_amount, 0)) AS 新規売上,
-          SUM(IF(is_new=1, gross_profit, 0)) AS 新規粗利
-        FROM base
-        WHERE login_email = @login_email
-        """
-    # FYTD: 4月1日〜latest_date（current_monthの年がFY途中のため計算）
-    # fiscal_year_apr は BigQuery 側で持っているが、ここは確実に計算する
-    fy_start_year = current_month.year if current_month.month >= 4 else current_month.year - 1
-    fy_start = date(fy_start_year, 4, 1)
-
-    sql = f"""
-    {agg_sql("昨日", d_yesterday, d_yesterday)}
-    UNION ALL
-    {agg_sql("直近7日", d_7, latest_date)}
-    UNION ALL
-    {agg_sql("当月", current_month, latest_date)}
-    UNION ALL
-    {agg_sql("年度累計", fy_start, latest_date)}
-    """
-    df = query_df(
-        sql,
-        params={
-            "login_email": role.login_email,
-            "d_from": current_month,  # ダミー（UNION側で上書きされないので使わない）
-            "d_to": latest_date,
-        },
-        label="新規納品サマリー",
-    )
-
-    if df.empty:
-        st.info("データがありません。")
-        return
-
-    df2 = df.copy()
-    for c in ["新規売上", "新規粗利"]:
-        if c in df2.columns:
-            df2[c] = df2[c].apply(yen)
-    st.dataframe(df2, use_container_width=True, hide_index=True)
-
-
-# =============================================================================
-# SEARCH UI (Customer)
-# =============================================================================
-
-@st.cache_data(ttl=600, show_spinner=False)
-def search_customers(keyword: str, login_email: str, limit: int = 30) -> pd.DataFrame:
-    # 得意先名で部分一致。候補は code+name を出す。
-    # 現場はコードを覚えてない前提。
-    sql = f"""
-    SELECT
-      customer_code,
-      customer_name,
-      staff_name,
-      branch_name
-    FROM {VIEW_FACT_LOGIN_JAN_DAILY}
-    WHERE login_email = @login_email
-      AND (
-        customer_name LIKE CONCAT('%', @kw, '%')
-        OR customer_code LIKE CONCAT('%', @kw, '%')
-      )
-    GROUP BY customer_code, customer_name, staff_name, branch_name
-    ORDER BY customer_name
-    LIMIT @lim
-    """
-    df = cached_query_df(sql, params={"kw": keyword, "login_email": login_email, "lim": int(limit)}, use_bqstorage=False, timeout_sec=90)
-    return df
-
-
-def render_customer_search_and_drill(role: RoleInfo, current_month: date, latest_date: date) -> None:
-    st.markdown("### 得意先検索（候補 → 選択）")
-
-    kw = st.text_input("得意先名で検索（例：熊谷 / 循環器）", value="", placeholder="2文字以上で候補を表示").strip()
-    if len(kw) < 2:
-        st.caption("※ 2文字以上入力すると候補が出ます。")
-        return
-
-    try:
-        df_cands = search_customers(kw, role.login_email, limit=30)
     except Exception as e:
-        st.error(f"検索でエラー：{e}")
-        return
+        # cache関数内は st.* しない（返り値のみ）を徹底したいが、
+        # 原因特定中は "見える化" が最優先なので、例外だけ投げて上位で表示する
+        raise e
 
-    if df_cands.empty:
-        st.info("候補がありません。")
-        return
 
-    # selectbox に code|name を表示
-    df_cands = df_cands.copy()
-    df_cands["label"] = df_cands["customer_code"].astype(str) + " | " + df_cands["customer_name"].astype(str)
-    options = df_cands["label"].tolist()
-
-    selected = st.selectbox("候補から選択", options=options, index=0)
-
-    sel_row = df_cands[df_cands["label"] == selected].iloc[0]
-    customer_code = str(sel_row["customer_code"])
-    customer_name = str(sel_row["customer_name"])
-
-    st.caption(f"選択：{customer_code} / {customer_name}")
-
-    # ミニドリル：当月売上/粗利、年度累計売上/粗利（重いJOINはしない）
-    # 当月
-    sql_month = f"""
-    SELECT
-      SUM(sales_amount) AS sales_amount,
-      SUM(gross_profit) AS gross_profit
-    FROM {VIEW_FACT_LOGIN_JAN_DAILY}
-    WHERE login_email = @login_email
-      AND customer_code = @customer_code
-      AND sales_date BETWEEN @d_from AND @d_to
+def query_df(
+    sql: str,
+    params: Optional[Dict[str, Any]] = None,
+    label: str = "",
+    use_bqstorage: bool = True,
+    timeout_sec: int = 60,
+) -> pd.DataFrame:
     """
-    # FYTD（4/1〜latest_date）
-    fy_start_year = current_month.year if current_month.month >= 4 else current_month.year - 1
-    fy_start = date(fy_start_year, 4, 1)
+    UI層でエラーを確実に表示するラッパー
+    """
+    params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        df_m = query_df(
-            sql_month,
-            params={"login_email": role.login_email, "customer_code": customer_code, "d_from": current_month, "d_to": latest_date},
-            label="当月ミニドリル",
-        )
-        if not df_m.empty:
-            st.metric("売上（当月）", yen(df_m.loc[0, "sales_amount"]))
-            st.metric("粗利（当月）", yen(df_m.loc[0, "gross_profit"]))
+    try:
+        df = cached_query_df(sql, params_json=params_json, use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+        return df
 
-    with col2:
-        df_f = query_df(
-            sql_month,
-            params={"login_email": role.login_email, "customer_code": customer_code, "d_from": fy_start, "d_to": latest_date},
-            label="年度累計ミニドリル",
-        )
-        if not df_f.empty:
-            st.metric("売上（年度累計）", yen(df_f.loc[0, "sales_amount"]))
-            st.metric("粗利（年度累計）", yen(df_f.loc[0, "gross_profit"]))
+    except BadRequest as e:
+        # BadRequest は job.errors が欲しいが cached_query_df 内では job を取れないため、
+        # 同じSQLを「ノーキャッシュ」で一度だけ再実行して job.errors を取得して表示する
+        client = get_bq_client()
+        job_config = bigquery.QueryJobConfig()
+        qparams = _build_query_parameters(params or {})
+        if qparams:
+            job_config.query_parameters = qparams
+
+        job: Optional[bigquery.job.QueryJob] = None
+        try:
+            job = client.query(sql, job_config=job_config)
+            job.result(timeout=timeout_sec)
+        except Exception as e2:
+            _show_bq_error_context(label or "query_df", sql, params, job, e2)
+            raise
+        _show_bq_error_context(label or "query_df", sql, params, job, e)
+        raise
+
+    except GoogleAPICallError as e:
+        _show_bq_error_context(label or "query_df", sql, params, None, e)
+        raise
+
+    except Exception as e:
+        _show_bq_error_context(label or "query_df", sql, params, None, e)
+        raise
 
 
 # =============================================================================
-# MAIN
+# UI：共通
 # =============================================================================
 
-def main() -> None:
+def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
+    st.caption("OS v1.4.6｜起動時に重いクエリを自動実行しない（遅延ロード）｜BigQuery エラー詳細を必ず画面に表示")
 
-    # サイドバー：実行制御
-    with st.sidebar:
-        st.subheader("実行オプション（高速化）")
-        st.session_state["use_bqstorage"] = st.checkbox("BigQuery Storage API を使う（速いが詰まる場合あり）", value=False)
-        st.session_state["timeout_sec"] = st.number_input("クエリ待ちタイムアウト（秒）", min_value=10, max_value=600, value=90, step=10)
-        st.caption("ずっと読み込みになる場合は Storage API をOFF。")
-        st.markdown("---")
-        st.subheader("表示設定")
-        top_n = st.number_input("ランキング表示件数", min_value=10, max_value=200, value=50, step=10)
-        st.session_state["top_n"] = int(top_n)
 
-    # ログイン
-    login_email = get_login_email()
+def sidebar_controls() -> Dict[str, Any]:
+    st.sidebar.header("設定（切り分け）")
+    use_bqstorage = st.sidebar.toggle("BigQuery Storage API を使う（高速）", value=True)
+    timeout_sec = st.sidebar.slider("クエリタイムアウト（秒）", min_value=10, max_value=300, value=60, step=10)
+    show_sql = st.sidebar.toggle("SQL を表示する（デバッグ）", value=False)
+    return {
+        "use_bqstorage": use_bqstorage,
+        "timeout_sec": timeout_sec,
+        "show_sql": show_sql,
+    }
+
+
+def get_login_email_ui() -> str:
+    st.sidebar.header("ログイン（簡易）")
+    default_email = st.secrets.get("default_login_email", "")
+    login_email = st.sidebar.text_input("login_email（メール）", value=default_email, placeholder="例: masumi@example.com")
+    login_email = (login_email or "").strip()
     if not login_email:
+        st.info("左サイドバーで login_email を入力してください（暫定ログイン）。")
         st.stop()
+    return login_email
 
-    # ヘルスチェック（軽量）
-    with st.expander("接続チェック（問題切り分け用）", expanded=False):
-        if st.button("SELECT 1（1秒で返るはず）"):
-            df_ping = query_df("SELECT 1 AS ok", label="接続チェック")
-            st.write(df_ping)
 
-    # 役割
-    role = load_role(login_email)
+def render_health_check(use_bqstorage: bool, timeout_sec: int):
+    st.subheader("ヘルスチェック")
+    cols = st.columns([1, 3])
+    with cols[0]:
+        if st.button("SELECT 1（接続チェック）", use_container_width=True):
+            df = query_df("SELECT 1 AS ok", params=None, label="SELECT 1 ヘルスチェック",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.success("OK（BigQuery 接続成功）")
+            st.dataframe(df, use_container_width=True)
 
-    # current_month / latest_date
-    current_month = get_current_month()
-    latest_date = get_latest_sales_date(current_month)
+    with cols[1]:
+        st.write("切り分けの基本:")
+        st.write("- まず SELECT 1 が通るか")
+        st.write("- 次に Storage API ON/OFF を切り替えて挙動が変わるか")
+        st.write("- timeout を短くして『どこで詰まるか』を特定する")
 
-    # 権限分岐
-    if not role.role_sales_view and not role.role_admin_view:
-        st.error("閲覧権限がありません（role_sales_view / role_admin_view が false）。")
-        st.stop()
 
-    # 管理者（判断専用）
-    if role.role_admin_view:
-        render_admin_header(role, current_month, latest_date)
+# =============================================================================
+# ロール解決
+# =============================================================================
 
-        st.markdown("---")
-        st.subheader("管理者メニュー")
+def resolve_role(login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
+    # 1) role
+    df_role = query_df(SQL_ROLE_LOOKUP, params={"login_email": login_email}, label="ロール取得",
+                       use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+    if df_role.empty:
+        # 未登録は SALES 扱い
+        return RoleInfo(login_email=login_email, role_key="SALES", role_sales_view=True)
 
-        colA, colB, colC, colD = st.columns(4)
-        run_fytd = colA.button("年度累計サマリー")
-        run_month = colB.button("当月YoYランキング")
-        run_new = colC.button("新規納品サマリー")
-        run_search = colD.button("得意先検索")
+    r = df_role.iloc[0].to_dict()
+    return RoleInfo(
+        login_email=str(r.get("login_email", login_email)),
+        role_key=str(r.get("role_key", "SALES")),
+        role_admin_view=bool(r.get("role_admin_view", False)),
+        role_admin_edit=bool(r.get("role_admin_edit", False)),
+        role_sales_view=bool(r.get("role_sales_view", True)),
+        area_key=str(r.get("area_key", "")) if r.get("area_key") is not None else "",
+    )
 
-        st.caption("※ 必要なものだけ押してください（起動直後に全実行しない＝高速化）。")
 
-        if run_fytd:
-            st.markdown("---")
-            render_fytd_org_summary(role)
-            render_fytd_top_bottom(role, top_n=st.session_state["top_n"])
+def resolve_display_name(login_email: str, use_bqstorage: bool, timeout_sec: int) -> str:
+    df = query_df(SQL_STAFF_NAME, params={"login_email": login_email}, label="氏名表示取得",
+                  use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+    if df.empty:
+        return login_email
+    v = df.iloc[0].to_dict()
+    return str(v.get("display_name") or login_email)
 
-        if run_month:
-            st.markdown("---")
-            render_month_yoy_rankings(role, top_n=st.session_state["top_n"])
 
-        if run_new:
-            st.markdown("---")
-            render_new_deliveries_summary(role, current_month=current_month, latest_date=latest_date)
+# =============================================================================
+# 入口：年度累計（組織）
+# =============================================================================
 
-        if run_search:
-            st.markdown("---")
-            render_customer_search_and_drill(role, current_month=current_month, latest_date=latest_date)
+def render_fytd_org_summary(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+    st.subheader("年度累計（FYTD）｜組織サマリー")
+    st.write("今年度累計 vs 昨年度累計（差額も含む）")
 
-    else:
-        # 担当者（入口は必要最低限）
-        st.subheader("担当者入口（閲覧）")
-        st.caption(f"ログイン：{role.login_email}")
-        st.caption(f"current_month：{current_month.isoformat()} / 最新売上日：{latest_date.isoformat()}")
+    if show_sql:
+        st.code(SQL_FYTD_ORG_SUMMARY, language="sql")
 
-        st.markdown("---")
-        st.info("担当者入口は次段（Phase1.5）で導線整備します。いまは管理者入口（判断専用）を優先。")
-        render_customer_search_and_drill(role, current_month=current_month, latest_date=latest_date)
+    if st.button("年度累計（組織）を読み込む", use_container_width=True, type="primary"):
+        df = query_df(SQL_FYTD_ORG_SUMMARY, params={"login_email": role.login_email},
+                      label="年度累計（組織）",
+                      use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+        st.dataframe(df, use_container_width=True)
+
+
+# =============================================================================
+# 入口：当月YoYランキング
+# =============================================================================
+
+def render_yoy_rankings(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+    st.subheader("当月（前年同月比）ランキング")
+    st.write("上がっている先 / 下がっている先 / 比較不能（新規・前年なし） を分離して表示")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("#### 上がっている先（Top）")
+        if show_sql:
+            st.code(SQL_YOY_TOP, language="sql")
+        if st.button("Top を読み込む", use_container_width=True):
+            df = query_df(SQL_YOY_TOP, params={"login_email": role.login_email},
+                          label="当月YoY Top",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+    with c2:
+        st.markdown("#### 下がっている先（Bottom）")
+        if show_sql:
+            st.code(SQL_YOY_BOTTOM, language="sql")
+        if st.button("Bottom を読み込む", use_container_width=True):
+            df = query_df(SQL_YOY_BOTTOM, params={"login_email": role.login_email},
+                          label="当月YoY Bottom",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+    with c3:
+        st.markdown("#### 比較不能（Uncomparable）")
+        if show_sql:
+            st.code(SQL_YOY_UNCOMPARABLE, language="sql")
+        if st.button("Uncomparable を読み込む", use_container_width=True):
+            df = query_df(SQL_YOY_UNCOMPARABLE, params={"login_email": role.login_email},
+                          label="当月YoY Uncomparable",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+
+# =============================================================================
+# 入口：新規納品（昨日/7日/当月/FYTD）
+# =============================================================================
+
+def render_new_deliveries(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+    st.subheader("新規納品サマリー（入口固定：昨日 / 直近7日 / 当月 / FYTD）")
+
+    tabs = st.tabs(["昨日", "直近7日", "当月", "FYTD"])
+
+    with tabs[0]:
+        if show_sql:
+            st.code(SQL_NEW_DELIVERIES_YESTERDAY, language="sql")
+        if st.button("昨日分を読み込む", use_container_width=True):
+            df = query_df(SQL_NEW_DELIVERIES_YESTERDAY, params={"login_email": role.login_email},
+                          label="新規納品（昨日）",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+    with tabs[1]:
+        if show_sql:
+            st.code(SQL_NEW_DELIVERIES_LAST7D, language="sql")
+        if st.button("直近7日を読み込む", use_container_width=True):
+            df = query_df(SQL_NEW_DELIVERIES_LAST7D, params={"login_email": role.login_email},
+                          label="新規納品（直近7日）",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+    with tabs[2]:
+        if show_sql:
+            st.code(SQL_NEW_DELIVERIES_THIS_MONTH, language="sql")
+        if st.button("当月を読み込む", use_container_width=True):
+            df = query_df(SQL_NEW_DELIVERIES_THIS_MONTH, params={"login_email": role.login_email},
+                          label="新規納品（当月）",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+    with tabs[3]:
+        if show_sql:
+            st.code(SQL_NEW_DELIVERIES_FYTD, language="sql")
+        if st.button("FYTD を読み込む", use_container_width=True):
+            df = query_df(SQL_NEW_DELIVERIES_FYTD, params={"login_email": role.login_email},
+                          label="新規納品（FYTD）",
+                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            st.dataframe(df, use_container_width=True)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    set_page()
+    opts = sidebar_controls()
+    login_email = get_login_email_ui()
+
+    # まずはヘルスチェックを最上段に置く（事故切り分け最短）
+    render_health_check(use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+    st.divider()
+
+    # ロール解決（ここも遅延にしたい場合はボタン化も可）
+    st.subheader("ログイン情報")
+    with st.spinner("ロール・氏名を取得中..."):
+        role = resolve_role(login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+        display_name = resolve_display_name(login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+
+    st.write(f"**ログイン:** {display_name}")
+    st.write(f"**メール:** {role.login_email}")
+    st.write(f"**ロール:** {role.role_key}（admin_view={role.role_admin_view}, admin_edit={role.role_admin_edit}, sales_view={role.role_sales_view}）")
+    if role.area_key:
+        st.write(f"**エリア:** {role.area_key}")
+
+    st.divider()
+
+    # 入口：管理者（または admin_view）優先
+    # ※ 入口順序：FYTD → 当月YoY → 新規納品 → その後（担当別は Phase1.6）
+    st.header("管理者入口（判断専用・高速）")
+
+    # FYTD（組織）
+    render_fytd_org_summary(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+    st.divider()
+
+    # 当月YoY
+    render_yoy_rankings(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+    st.divider()
+
+    # 新規納品
+    render_new_deliveries(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+
+    st.divider()
+    st.caption("注：BigQuery BadRequest が出た場合、画面に job.errors / SQL / params を出します（赤塗り回避）。")
 
 
 if __name__ == "__main__":
