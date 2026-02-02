@@ -2,33 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 SFA｜入口高速版（判断専用） - OS v1.4.6
+
+✅ この版でできること
 - 起動時に重いクエリを走らせない（遅延ロード）
 - timeout / BigQuery Storage API ON-OFF / SELECT1 ヘルスチェック
 - BadRequest の詳細（job.errors, SQL, params）を必ず画面に表示
-- Secrets 未設定時はクラッシュせず、設定手順とテンプレを表示して停止
+- st.secrets が未設定でも、画面で「サービスアカウントJSON貼り付け」で一時起動可能（セッション限定）
 
-【Streamlit Cloud Secrets（推奨）】
-App -> Manage app -> Settings -> Secrets に secrets.toml を貼り付け
-
-【必要な secrets.toml（テンプレ）】
-[bigquery]
-project_id = "salesdb-479915"
-location = "asia-northeast1"
-
-[bigquery.service_account]
-type = "service_account"
-project_id = "salesdb-479915"
-private_key_id = "YOUR_PRIVATE_KEY_ID"
-private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-client_email = "YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com"
-client_id = "YOUR_CLIENT_ID"
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_SA%40YOUR_PROJECT.iam.gserviceaccount.com"
-universe_domain = "googleapis.com"
-
-default_login_email = "masumi@example.com"  # 任意
+推奨（本番）:
+- Streamlit Cloud -> Manage app -> Settings -> Secrets に secrets.toml を設定
 """
 
 from __future__ import annotations
@@ -59,7 +41,6 @@ CACHE_TTL_SEC = 300
 # SQL（あなたの実体に合わせて VIEW 名などを調整）
 # =============================================================================
 
-# FYTD（組織）
 SQL_FYTD_ORG_SUMMARY = """
 SELECT
   *
@@ -68,7 +49,6 @@ WHERE login_email = @login_email
 LIMIT 2000
 """
 
-# 当月YoY（上/下/比較不能）
 SQL_YOY_TOP = """
 SELECT
   *
@@ -94,7 +74,7 @@ LIMIT 2000
 """
 
 # 新規納品（入口4本固定）
-# あなたの環境が period_key を持っていない場合は、別VIEW/SQLに置き換えてOK
+# period_key が無い場合は、あなたのビュー仕様に合わせてこのSQLを差し替えてください
 SQL_NEW_DELIVERIES_YESTERDAY = """
 SELECT
   *
@@ -131,7 +111,6 @@ WHERE login_email = @login_email
 LIMIT 2000
 """
 
-# ロール（権限）
 SQL_ROLE_LOOKUP = """
 SELECT
   login_email,
@@ -145,7 +124,6 @@ WHERE login_email = @login_email
 LIMIT 1
 """
 
-# 表示名（メール→氏名）
 SQL_STAFF_NAME = """
 SELECT
   login_email,
@@ -171,26 +149,63 @@ class RoleInfo:
 
 
 # =============================================================================
-# Secrets ユーティリティ（★未設定でも落ちずにガイド表示）
+# Secrets / Credentials
 # =============================================================================
 
-def _secrets_ready() -> bool:
+def _secrets_has_bigquery() -> bool:
     if "bigquery" not in st.secrets:
         return False
     bq = st.secrets.get("bigquery", {})
-    if not bq.get("project_id"):
-        return False
-    if not bq.get("service_account"):
-        return False
-    return True
+    return bool(bq.get("project_id")) and bool(bq.get("service_account"))
 
 
-def render_secrets_setup_guide_and_stop():
-    st.error("BigQuery Secrets が未設定です（st.secrets に [bigquery] がありません / 必須項目が不足）。")
-    st.write("Streamlit Cloud を使う場合：右下 **Manage app** → **Settings** → **Secrets** に以下を貼り付けて Reboot してください。")
-    st.write("ローカルの場合：リポジトリ直下に `.streamlit/secrets.toml` を作成し、同じ内容を入れてください。")
+def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
+    """
+    secrets.toml:
+    [bigquery]
+    project_id = "..."
+    location = "asia-northeast1"
+    [bigquery.service_account]
+    ... service account fields ...
+    """
+    bq = st.secrets["bigquery"]
+    project_id = str(bq.get("project_id"))
+    location = str(bq.get("location") or DEFAULT_LOCATION)
+    sa = dict(bq.get("service_account"))
+    return project_id, location, sa
 
-    template = """[bigquery]
+
+def _parse_service_account_json(text: str) -> Dict[str, Any]:
+    """
+    画面貼り付け用。JSON文字列を dict にするだけ。
+    """
+    obj = json.loads(text)
+    if not isinstance(obj, dict):
+        raise ValueError("JSONの形式が不正です（dictではありません）")
+    # 最低限チェック
+    for k in ["type", "project_id", "private_key", "client_email"]:
+        if k not in obj:
+            raise ValueError(f"サービスアカウントJSONに {k} がありません")
+    return obj
+
+
+def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
+    """
+    優先順位:
+    1) st.secrets[bigquery] があればそれを使う（本番）
+    2) 無ければ、画面でサービスアカウントJSONを貼り付けて一時利用（セッション限定）
+    """
+    st.sidebar.header("接続設定")
+
+    if _secrets_has_bigquery():
+        project_id, location, sa = _get_bq_from_secrets()
+        st.sidebar.success("Secrets: OK（st.secrets から BigQuery 設定を読み込み）")
+        return project_id, location, sa
+
+    st.sidebar.warning("Secrets が未設定です。下で『サービスアカウントJSON貼り付け』で暫定接続できます。")
+
+    with st.expander("（推奨）Streamlit Cloud Secrets 設定テンプレ", expanded=False):
+        template = """[bigquery]
 project_id = "salesdb-479915"
 location = "asia-northeast1"
 
@@ -207,45 +222,56 @@ auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_SA%40YOUR_PROJECT.iam.gserviceaccount.com"
 universe_domain = "googleapis.com"
 
-# 任意：ログイン入力の初期値
 default_login_email = "masumi@example.com"
 """
-    st.code(template, language="toml")
-    st.warning("注意：private_key は複数行ではなく、上のように \\n を含む1行文字列にしてください（TOML崩れ防止）。")
-    st.stop()
+        st.code(template, language="toml")
+        st.caption("private_key は複数行ではなく \\n を含む1行文字列にしてください。")
 
+    st.markdown("### サービスアカウントJSON貼り付け（暫定・セッション限定）")
+    st.caption("※ Secrets に入れるのが本番推奨。ここは“いま動かして原因切り分け”用です。")
 
-def _get_secrets() -> Tuple[str, str, Dict[str, Any]]:
-    """
-    必要な secrets がある前提で呼ばれる関数。
-    """
-    bq = st.secrets["bigquery"]
-    project_id = str(bq.get("project_id"))
-    location = str(bq.get("location") or DEFAULT_LOCATION)
-    sa = dict(bq.get("service_account"))
-    return project_id, location, sa
+    default_project = "salesdb-479915"
+    project_id = st.sidebar.text_input("project_id（暫定）", value=default_project)
+    location = st.sidebar.text_input("location（暫定）", value=DEFAULT_LOCATION)
 
+    sa_text = st.sidebar.text_area(
+        "サービスアカウントJSON（貼り付け）",
+        value="",
+        height=200,
+        placeholder='{"type":"service_account", ... } を丸ごと貼り付け',
+    )
 
-# =============================================================================
-# BigQuery Client
-# =============================================================================
+    if not sa_text.strip():
+        st.info("左サイドバーにサービスアカウントJSONを貼り付けると接続できるようになります。")
+        st.stop()
+
+    try:
+        sa = _parse_service_account_json(sa_text.strip())
+    except Exception as e:
+        st.error("サービスアカウントJSONの読み取りに失敗しました。")
+        st.write(str(e))
+        st.stop()
+
+    # project_id は JSON にもあるが、上で入力した方を優先（誤差吸収）
+    sa["project_id"] = project_id.strip() or sa.get("project_id")
+    st.sidebar.success("貼り付けJSON: OK（このセッション中のみ有効）")
+    return str(project_id), str(location), sa
+
 
 @st.cache_resource(show_spinner=False)
-def get_bq_client() -> bigquery.Client:
-    project_id, location, sa = _get_secrets()
+def get_bq_client(project_id: str, location: str, sa: Dict[str, Any]) -> bigquery.Client:
     creds = service_account.Credentials.from_service_account_info(sa)
     return bigquery.Client(project=project_id, credentials=creds, location=location)
 
 
 # =============================================================================
-# クエリ実行（キャッシュ安全 + エラー可視化）
+# BigQuery query helper（キャッシュ安全 + エラー可視化）
 # =============================================================================
 
 def _build_query_parameters(params: Optional[Dict[str, Any]]) -> list[bigquery.ScalarQueryParameter]:
     qparams: list[bigquery.ScalarQueryParameter] = []
     if not params:
         return qparams
-
     for k, v in params.items():
         if isinstance(v, bool):
             qparams.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
@@ -286,16 +312,21 @@ def _show_bq_error_context(
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
 def cached_query_df(
+    project_id: str,
+    location: str,
+    sa_json: str,
     sql: str,
     params_json: str,
     use_bqstorage: bool,
     timeout_sec: int,
 ) -> pd.DataFrame:
     """
-    cache_data 内では session_state を触らない（OS v1.4.6）
-    params は hash 安定化のため JSON文字列で受け取る
+    cache_data 内で session_state を触らない（OS v1.4.6）
+    sa は hash 安定化のため JSON 文字列で受ける
     """
-    client = get_bq_client()
+    sa = json.loads(sa_json)
+    client = get_bq_client(project_id, location, sa)
+
     params = json.loads(params_json) if params_json else {}
 
     job_config = bigquery.QueryJobConfig()
@@ -309,30 +340,50 @@ def cached_query_df(
 
 
 def query_df(
+    client: bigquery.Client,
     sql: str,
     params: Optional[Dict[str, Any]] = None,
     label: str = "",
     use_bqstorage: bool = True,
     timeout_sec: int = 60,
+    cache_key: Optional[Tuple[str, str, str]] = None,
 ) -> pd.DataFrame:
     """
     UI層でエラーを確実に表示するラッパー
+    cache_key = (project_id, location, sa_json)
     """
     params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
 
     try:
-        return cached_query_df(sql, params_json=params_json, use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+        if cache_key is None:
+            # キャッシュを使わず直実行（例: 緊急切り分け）
+            job_config = bigquery.QueryJobConfig()
+            qparams = _build_query_parameters(params or {})
+            if qparams:
+                job_config.query_parameters = qparams
+            job = client.query(sql, job_config=job_config)
+            job.result(timeout=timeout_sec)
+            return job.to_dataframe(create_bqstorage_client=use_bqstorage)
+
+        project_id, location, sa_json = cache_key
+        return cached_query_df(
+            project_id=project_id,
+            location=location,
+            sa_json=sa_json,
+            sql=sql,
+            params_json=params_json,
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+        )
 
     except BadRequest as e:
-        # job.errors を取るため、ノーキャッシュで一度だけ再実行して job 情報を表示
-        client = get_bq_client()
-        job_config = bigquery.QueryJobConfig()
-        qparams = _build_query_parameters(params or {})
-        if qparams:
-            job_config.query_parameters = qparams
-
+        # job.errors を取るため、ノーキャッシュで再実行して job を表示
         job = None
         try:
+            job_config = bigquery.QueryJobConfig()
+            qparams = _build_query_parameters(params or {})
+            if qparams:
+                job_config.query_parameters = qparams
             job = client.query(sql, job_config=job_config)
             job.result(timeout=timeout_sec)
         except Exception as e2:
@@ -351,13 +402,13 @@ def query_df(
 
 
 # =============================================================================
-# UI：共通
+# UI
 # =============================================================================
 
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.6｜遅延ロード｜timeout/Storage API 切替｜BadRequest詳細表示｜Secrets未設定ガイド")
+    st.caption("OS v1.4.6｜遅延ロード｜timeout/Storage API 切替｜BadRequest詳細表示｜Secrets/貼り付け起動対応")
 
 
 def sidebar_controls() -> Dict[str, Any]:
@@ -373,7 +424,9 @@ def sidebar_controls() -> Dict[str, Any]:
 
 def get_login_email_ui() -> str:
     st.sidebar.header("ログイン（暫定）")
-    default_email = st.secrets.get("default_login_email", "") if _secrets_ready() else ""
+    default_email = ""
+    if "default_login_email" in st.secrets:
+        default_email = st.secrets.get("default_login_email", "")
     login_email = st.sidebar.text_input("login_email（メール）", value=default_email, placeholder="例: masumi@example.com")
     login_email = (login_email or "").strip()
     if not login_email:
@@ -382,31 +435,34 @@ def get_login_email_ui() -> str:
     return login_email
 
 
-def render_health_check(use_bqstorage: bool, timeout_sec: int):
+def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str], use_bqstorage: bool, timeout_sec: int):
     st.subheader("ヘルスチェック")
-    st.write("最初にここを通すことで「Secrets」「権限」「接続」「Storage API」の切り分けができます。")
+    st.write("まずここで BigQuery 接続を確定させます（SELECT 1）。")
 
-    cols = st.columns([1, 3])
-    with cols[0]:
-        if st.button("SELECT 1（接続チェック）", use_container_width=True):
-            df = query_df("SELECT 1 AS ok", params=None, label="SELECT 1 ヘルスチェック",
-                          use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
-            st.success("OK（BigQuery 接続成功）")
-            st.dataframe(df, use_container_width=True)
+    if st.button("SELECT 1（接続チェック）", use_container_width=True, type="primary"):
+        df = query_df(
+            client,
+            "SELECT 1 AS ok",
+            params=None,
+            label="SELECT 1 ヘルスチェック",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+        st.success("OK（BigQuery 接続成功）")
+        st.dataframe(df, use_container_width=True)
 
-    with cols[1]:
-        st.write("- まず SELECT 1 が通るか")
-        st.write("- 次に Storage API ON/OFF で挙動が変わるか")
-        st.write("- timeout を短くして「どのクエリが重いか」特定する")
 
-
-# =============================================================================
-# ロール解決
-# =============================================================================
-
-def resolve_role(login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
-    df_role = query_df(SQL_ROLE_LOOKUP, params={"login_email": login_email}, label="ロール取得",
-                       use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+def resolve_role(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
+    df_role = query_df(
+        client,
+        SQL_ROLE_LOOKUP,
+        params={"login_email": login_email},
+        label="ロール取得",
+        use_bqstorage=use_bqstorage,
+        timeout_sec=timeout_sec,
+        cache_key=cache_key,
+    )
     if df_role.empty:
         return RoleInfo(login_email=login_email, role_key="SALES", role_sales_view=True)
 
@@ -421,57 +477,59 @@ def resolve_role(login_email: str, use_bqstorage: bool, timeout_sec: int) -> Rol
     )
 
 
-def resolve_display_name(login_email: str, use_bqstorage: bool, timeout_sec: int) -> str:
-    df = query_df(SQL_STAFF_NAME, params={"login_email": login_email}, label="氏名表示取得",
-                  use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+def resolve_display_name(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> str:
+    df = query_df(
+        client,
+        SQL_STAFF_NAME,
+        params={"login_email": login_email},
+        label="氏名表示取得",
+        use_bqstorage=use_bqstorage,
+        timeout_sec=timeout_sec,
+        cache_key=cache_key,
+    )
     if df.empty:
         return login_email
     v = df.iloc[0].to_dict()
     return str(v.get("display_name") or login_email)
 
 
-# =============================================================================
-# 入口：FYTD（組織）
-# =============================================================================
-
-def render_fytd_org_summary(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+def render_fytd_org_summary(client: bigquery.Client, cache_key: Tuple[str, str, str], role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
     st.subheader("年度累計（FYTD）｜組織サマリー")
-    st.write("今年度累計 vs 昨年度累計（差額も含む）")
     if show_sql:
         st.code(SQL_FYTD_ORG_SUMMARY, language="sql")
-
-    if st.button("年度累計（組織）を読み込む", use_container_width=True, type="primary"):
-        df = query_df(SQL_FYTD_ORG_SUMMARY, params={"login_email": role.login_email},
-                      label="年度累計（組織）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+    if st.button("年度累計（組織）を読み込む", use_container_width=True):
+        df = query_df(
+            client,
+            SQL_FYTD_ORG_SUMMARY,
+            params={"login_email": role.login_email},
+            label="年度累計（組織）",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
         st.dataframe(df, use_container_width=True)
 
 
-# =============================================================================
-# 入口：当月YoY
-# =============================================================================
-
-def render_yoy_rankings(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
-    st.subheader("当月（前年同月比）ランキング")
-    st.write("Top / Bottom / 比較不能（新規・前年なし）を分離して表示（事故防止）")
+def render_yoy_rankings(client: bigquery.Client, cache_key: Tuple[str, str, str], role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+    st.subheader("当月（前年同月比）ランキング（Top / Bottom / 比較不能）")
 
     c1, c2, c3 = st.columns(3)
-
     with c1:
-        st.markdown("#### 上がっている先（Top）")
+        st.markdown("#### Top（伸び先）")
         if show_sql:
             st.code(SQL_YOY_TOP, language="sql")
         if st.button("Top を読み込む", use_container_width=True):
-            df = query_df(SQL_YOY_TOP, params={"login_email": role.login_email},
-                          label="当月YoY Top", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_YOY_TOP, params={"login_email": role.login_email},
+                          label="当月YoY Top", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
     with c2:
-        st.markdown("#### 下がっている先（Bottom）")
+        st.markdown("#### Bottom（下落先）")
         if show_sql:
             st.code(SQL_YOY_BOTTOM, language="sql")
         if st.button("Bottom を読み込む", use_container_width=True):
-            df = query_df(SQL_YOY_BOTTOM, params={"login_email": role.login_email},
-                          label="当月YoY Bottom", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_YOY_BOTTOM, params={"login_email": role.login_email},
+                          label="当月YoY Bottom", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
     with c3:
@@ -479,76 +537,72 @@ def render_yoy_rankings(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, s
         if show_sql:
             st.code(SQL_YOY_UNCOMPARABLE, language="sql")
         if st.button("Uncomparable を読み込む", use_container_width=True):
-            df = query_df(SQL_YOY_UNCOMPARABLE, params={"login_email": role.login_email},
-                          label="当月YoY Uncomparable", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_YOY_UNCOMPARABLE, params={"login_email": role.login_email},
+                          label="当月YoY Uncomparable", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
 
-# =============================================================================
-# 入口：新規納品（昨日/7日/当月/FYTD）
-# =============================================================================
-
-def render_new_deliveries(role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
-    st.subheader("新規納品サマリー（入口固定：昨日 / 直近7日 / 当月 / FYTD）")
-
+def render_new_deliveries(client: bigquery.Client, cache_key: Tuple[str, str, str], role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
+    st.subheader("新規納品（入口固定：昨日 / 直近7日 / 当月 / FYTD）")
     tabs = st.tabs(["昨日", "直近7日", "当月", "FYTD"])
 
     with tabs[0]:
         if show_sql:
             st.code(SQL_NEW_DELIVERIES_YESTERDAY, language="sql")
         if st.button("昨日分を読み込む", use_container_width=True):
-            df = query_df(SQL_NEW_DELIVERIES_YESTERDAY, params={"login_email": role.login_email},
-                          label="新規納品（昨日）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_NEW_DELIVERIES_YESTERDAY, params={"login_email": role.login_email},
+                          label="新規納品（昨日）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
     with tabs[1]:
         if show_sql:
             st.code(SQL_NEW_DELIVERIES_LAST7D, language="sql")
         if st.button("直近7日を読み込む", use_container_width=True):
-            df = query_df(SQL_NEW_DELIVERIES_LAST7D, params={"login_email": role.login_email},
-                          label="新規納品（直近7日）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_NEW_DELIVERIES_LAST7D, params={"login_email": role.login_email},
+                          label="新規納品（直近7日）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
     with tabs[2]:
         if show_sql:
             st.code(SQL_NEW_DELIVERIES_THIS_MONTH, language="sql")
         if st.button("当月を読み込む", use_container_width=True):
-            df = query_df(SQL_NEW_DELIVERIES_THIS_MONTH, params={"login_email": role.login_email},
-                          label="新規納品（当月）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_NEW_DELIVERIES_THIS_MONTH, params={"login_email": role.login_email},
+                          label="新規納品（当月）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
     with tabs[3]:
         if show_sql:
             st.code(SQL_NEW_DELIVERIES_FYTD, language="sql")
         if st.button("FYTD を読み込む", use_container_width=True):
-            df = query_df(SQL_NEW_DELIVERIES_FYTD, params={"login_email": role.login_email},
-                          label="新規納品（FYTD）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec)
+            df = query_df(client, SQL_NEW_DELIVERIES_FYTD, params={"login_email": role.login_email},
+                          label="新規納品（FYTD）", use_bqstorage=use_bqstorage, timeout_sec=timeout_sec, cache_key=cache_key)
             st.dataframe(df, use_container_width=True)
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main():
     set_page()
 
-    # ★ Secrets 未設定なら、ここでガイドを出して停止（クラッシュさせない）
-    if not _secrets_ready():
-        render_secrets_setup_guide_and_stop()
+    # 1) 接続情報の確定（Secrets or JSON貼り付け）
+    project_id, location, sa = ensure_credentials_ui()
+    sa_json = json.dumps(sa, ensure_ascii=False, sort_keys=True)
+    cache_key = (project_id, location, sa_json)
 
+    # 2) クライアント作成
+    client = get_bq_client(project_id, location, sa)
+
+    # 3) UI設定
     opts = sidebar_controls()
     login_email = get_login_email_ui()
 
-    # ヘルスチェック
-    render_health_check(use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+    # 4) ヘルスチェック（最優先）
+    render_health_check(client, cache_key, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
     st.divider()
 
-    # ロール & 表示名（ここは軽い想定。重ければボタン化してもOK）
+    # 5) ロール/氏名（軽いはず。重ければボタン化可能）
     st.subheader("ログイン情報")
     with st.spinner("ロール・氏名を取得中..."):
-        role = resolve_role(login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
-        display_name = resolve_display_name(login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+        role = resolve_role(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+        display_name = resolve_display_name(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
 
     st.write(f"**ログイン:** {display_name}")
     st.write(f"**メール:** {role.login_email}")
@@ -558,15 +612,15 @@ def main():
 
     st.divider()
 
-    # 入口順序（OS v1.4.6）
+    # 6) 入口（OS v1.4.6 順）
     st.header("管理者入口（判断専用・高速）")
-    render_fytd_org_summary(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+    render_fytd_org_summary(client, cache_key, role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
     st.divider()
 
-    render_yoy_rankings(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+    render_yoy_rankings(client, cache_key, role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
     st.divider()
 
-    render_new_deliveries(role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
+    render_new_deliveries(client, cache_key, role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
 
     st.divider()
     st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（Streamlitの赤塗り回避）。")
