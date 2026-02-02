@@ -4,8 +4,11 @@
 SFA｜入口高速版（判断専用） - OS v1.4.6
 
 ★今回の変更（重要）
-- FYTD（組織）など scoped VIEW で、viewer_email=@login_email が0件のとき
-  viewer_email="all" を自動fallbackして「入口が必ず出る」ようにした
+- 0件のときの fallback を全ブロックで標準化
+  1) scope_col=@login_email → 0件なら
+  2) viewer_email系は "all" を試す → まだ0件なら
+  3) WHEREを外して全社表示（管理者fallback）
+- 取得row数を常に表示（空かどうかを即判定）
 """
 
 from __future__ import annotations
@@ -353,7 +356,6 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
 
 
 def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> Tuple[str, Dict[str, Any], Optional[str]]:
-    # スコープキー候補（優先順）
     scope_col = pick_first_existing(
         cols,
         ["login_email", "viewer_email", "viewer_mail", "viewer", "user_email", "email"],
@@ -380,7 +382,7 @@ LIMIT {limit}
     return sql, params, None
 
 
-def render_table_block_with_fallback_all(
+def render_table_block_with_universal_fallback(
     title: str,
     client: bigquery.Client,
     cache_key: Tuple[str, str, str],
@@ -406,6 +408,7 @@ def render_table_block_with_fallback_all(
         st.caption(f"columns({len(cols)}): " + ", ".join(cols) if cols else "columns(0)")
 
     if st.button(button_label, use_container_width=True):
+        # 1) 通常（scope）
         df = query_df_safe(
             client,
             sql,
@@ -416,7 +419,10 @@ def render_table_block_with_fallback_all(
             cache_key=cache_key,
         )
 
-        # ★ fallback：scoped列があるのに 0件なら viewer_email="all" を試す（入口を落とさない）
+        # ★row数の見える化
+        st.caption(f"取得件数: {len(df)} 件（1st try）")
+
+        # 2) viewer_email系なら all fallback
         if df.empty and scope_col in ("viewer_email", "viewer_mail", "viewer"):
             st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
             sql2 = f"""
@@ -435,52 +441,32 @@ LIMIT 2000
                 timeout_sec=timeout_sec,
                 cache_key=cache_key,
             )
+            st.caption(f"取得件数: {len(df)} 件（fallback all）")
+
+        # 3) それでも空なら WHERE無しで全社表示（管理者fallback）
+        if df.empty:
+            st.warning("それでも0件です。WHEREを外して全社表示（管理者fallback）を試します。")
+            sql3 = f"""
+SELECT
+  *
+FROM `{table_fqn}`
+LIMIT 2000
+"""
+            df = query_df_safe(
+                client,
+                sql3,
+                params=None,
+                label=title + "（fallback no-filter）",
+                use_bqstorage=use_bqstorage,
+                timeout_sec=timeout_sec,
+                cache_key=cache_key,
+            )
+            st.caption(f"取得件数: {len(df)} 件（fallback no-filter）")
 
         if df.empty:
             st.info("データが空、またはクエリ失敗（上にエラー詳細が表示されています）。")
             return
 
-        st.dataframe(df, use_container_width=True)
-
-
-def render_table_block_simple(
-    title: str,
-    client: bigquery.Client,
-    cache_key: Tuple[str, str, str],
-    project_id: str,
-    location: str,
-    sa_json: str,
-    table_fqn: str,
-    login_email: str,
-    use_bqstorage: bool,
-    timeout_sec: int,
-    show_sql: bool,
-    button_label: str,
-):
-    st.subheader(title)
-
-    cols = get_table_columns(project_id, location, sa_json, table_fqn)
-    sql, params, _ = build_scoped_select_sql(table_fqn, cols, limit=2000)
-    if "login_email" in params:
-        params["login_email"] = login_email
-
-    if show_sql:
-        st.code(sql, language="sql")
-        st.caption(f"columns({len(cols)}): " + ", ".join(cols) if cols else "columns(0)")
-
-    if st.button(button_label, use_container_width=True):
-        df = query_df_safe(
-            client,
-            sql,
-            params=params if params else None,
-            label=title,
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-            cache_key=cache_key,
-        )
-        if df.empty:
-            st.info("データが空、またはクエリ失敗（上にエラー詳細が表示されています）。")
-            return
         st.dataframe(df, use_container_width=True)
 
 
@@ -506,8 +492,7 @@ def main():
     st.divider()
     st.header("管理者入口（判断専用・高速）")
 
-    # ★FYTDは必ず出す：all fallback
-    render_table_block_with_fallback_all(
+    render_table_block_with_universal_fallback(
         title="年度累計（FYTD）｜組織サマリー",
         client=client,
         cache_key=cache_key,
@@ -523,10 +508,9 @@ def main():
     )
 
     st.divider()
-
     c1, c2, c3 = st.columns(3)
     with c1:
-        render_table_block_simple(
+        render_table_block_with_universal_fallback(
             title="当月YoY｜Top（伸び先）",
             client=client,
             cache_key=cache_key,
@@ -541,7 +525,7 @@ def main():
             button_label="Top を読み込む",
         )
     with c2:
-        render_table_block_simple(
+        render_table_block_with_universal_fallback(
             title="当月YoY｜Bottom（下落先）",
             client=client,
             cache_key=cache_key,
@@ -556,7 +540,7 @@ def main():
             button_label="Bottom を読み込む",
         )
     with c3:
-        render_table_block_simple(
+        render_table_block_with_universal_fallback(
             title="当月YoY｜比較不能（Uncomparable）",
             client=client,
             cache_key=cache_key,
