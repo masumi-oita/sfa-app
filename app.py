@@ -9,8 +9,9 @@ SFA｜入口高速版（判断専用） - OS v1.4.6
 - BadRequest の詳細（job.errors, SQL, params）を必ず画面に表示
 - st.secrets が未設定でも、画面で「サービスアカウントJSON貼り付け」で一時起動可能（セッション限定）
 
-推奨（本番）:
-- Streamlit Cloud -> Manage app -> Settings -> Secrets に secrets.toml を設定
+★ v1.4.6 patch:
+- ロール列名の差分対応：role_key が無い場合 role_tier を使用（role_tier AS role_key）
+- ロール取得に失敗してもアプリを落とさず SALES デフォルトで継続
 """
 
 from __future__ import annotations
@@ -111,10 +112,11 @@ WHERE login_email = @login_email
 LIMIT 2000
 """
 
+# ★ role_key が無い環境があるため role_tier を role_key として扱う
 SQL_ROLE_LOOKUP = """
 SELECT
   login_email,
-  role_key,
+  role_tier AS role_key,
   role_admin_view,
   role_admin_edit,
   role_sales_view,
@@ -176,13 +178,9 @@ def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
 
 
 def _parse_service_account_json(text: str) -> Dict[str, Any]:
-    """
-    画面貼り付け用。JSON文字列を dict にするだけ。
-    """
     obj = json.loads(text)
     if not isinstance(obj, dict):
         raise ValueError("JSONの形式が不正です（dictではありません）")
-    # 最低限チェック
     for k in ["type", "project_id", "private_key", "client_email"]:
         if k not in obj:
             raise ValueError(f"サービスアカウントJSONに {k} がありません")
@@ -252,7 +250,6 @@ default_login_email = "masumi@example.com"
         st.write(str(e))
         st.stop()
 
-    # project_id は JSON にもあるが、上で入力した方を優先（誤差吸収）
     sa["project_id"] = project_id.strip() or sa.get("project_id")
     st.sidebar.success("貼り付けJSON: OK（このセッション中のみ有効）")
     return str(project_id), str(location), sa
@@ -320,10 +317,6 @@ def cached_query_df(
     use_bqstorage: bool,
     timeout_sec: int,
 ) -> pd.DataFrame:
-    """
-    cache_data 内で session_state を触らない（OS v1.4.6）
-    sa は hash 安定化のため JSON 文字列で受ける
-    """
     sa = json.loads(sa_json)
     client = get_bq_client(project_id, location, sa)
 
@@ -348,15 +341,10 @@ def query_df(
     timeout_sec: int = 60,
     cache_key: Optional[Tuple[str, str, str]] = None,
 ) -> pd.DataFrame:
-    """
-    UI層でエラーを確実に表示するラッパー
-    cache_key = (project_id, location, sa_json)
-    """
     params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
 
     try:
         if cache_key is None:
-            # キャッシュを使わず直実行（例: 緊急切り分け）
             job_config = bigquery.QueryJobConfig()
             qparams = _build_query_parameters(params or {})
             if qparams:
@@ -377,7 +365,6 @@ def query_df(
         )
 
     except BadRequest as e:
-        # job.errors を取るため、ノーキャッシュで再実行して job を表示
         job = None
         try:
             job_config = bigquery.QueryJobConfig()
@@ -453,44 +440,54 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
         st.dataframe(df, use_container_width=True)
 
 
+# ★ ロール取得は失敗しても落とさず SALES で継続
 def resolve_role(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
-    df_role = query_df(
-        client,
-        SQL_ROLE_LOOKUP,
-        params={"login_email": login_email},
-        label="ロール取得",
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
-    )
-    if df_role.empty:
-        return RoleInfo(login_email=login_email, role_key="SALES", role_sales_view=True)
+    try:
+        df_role = query_df(
+            client,
+            SQL_ROLE_LOOKUP,
+            params={"login_email": login_email},
+            label="ロール取得",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+        if df_role.empty:
+            st.warning("ロール取得：該当なし。SALES として継続します。")
+            return RoleInfo(login_email=login_email, role_key="SALES", role_sales_view=True)
 
-    r = df_role.iloc[0].to_dict()
-    return RoleInfo(
-        login_email=str(r.get("login_email", login_email)),
-        role_key=str(r.get("role_key", "SALES")),
-        role_admin_view=bool(r.get("role_admin_view", False)),
-        role_admin_edit=bool(r.get("role_admin_edit", False)),
-        role_sales_view=bool(r.get("role_sales_view", True)),
-        area_key=str(r.get("area_key", "")) if r.get("area_key") is not None else "",
-    )
+        r = df_role.iloc[0].to_dict()
+        return RoleInfo(
+            login_email=str(r.get("login_email", login_email)),
+            role_key=str(r.get("role_key", "SALES")),
+            role_admin_view=bool(r.get("role_admin_view", False)),
+            role_admin_edit=bool(r.get("role_admin_edit", False)),
+            role_sales_view=bool(r.get("role_sales_view", True)),
+            area_key=str(r.get("area_key", "")) if r.get("area_key") is not None else "",
+        )
+
+    except Exception:
+        st.warning("ロール取得に失敗しました。暫定的に SALES として継続します（原因は画面のエラー詳細を参照）。")
+        return RoleInfo(login_email=login_email, role_key="SALES", role_sales_view=True)
 
 
 def resolve_display_name(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> str:
-    df = query_df(
-        client,
-        SQL_STAFF_NAME,
-        params={"login_email": login_email},
-        label="氏名表示取得",
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
-    )
-    if df.empty:
+    try:
+        df = query_df(
+            client,
+            SQL_STAFF_NAME,
+            params={"login_email": login_email},
+            label="氏名表示取得",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+        if df.empty:
+            return login_email
+        v = df.iloc[0].to_dict()
+        return str(v.get("display_name") or login_email)
+    except Exception:
         return login_email
-    v = df.iloc[0].to_dict()
-    return str(v.get("display_name") or login_email)
 
 
 def render_fytd_org_summary(client: bigquery.Client, cache_key: Tuple[str, str, str], role: RoleInfo, use_bqstorage: bool, timeout_sec: int, show_sql: bool):
@@ -582,23 +579,18 @@ def render_new_deliveries(client: bigquery.Client, cache_key: Tuple[str, str, st
 def main():
     set_page()
 
-    # 1) 接続情報の確定（Secrets or JSON貼り付け）
     project_id, location, sa = ensure_credentials_ui()
     sa_json = json.dumps(sa, ensure_ascii=False, sort_keys=True)
     cache_key = (project_id, location, sa_json)
 
-    # 2) クライアント作成
     client = get_bq_client(project_id, location, sa)
 
-    # 3) UI設定
     opts = sidebar_controls()
     login_email = get_login_email_ui()
 
-    # 4) ヘルスチェック（最優先）
     render_health_check(client, cache_key, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
     st.divider()
 
-    # 5) ロール/氏名（軽いはず。重ければボタン化可能）
     st.subheader("ログイン情報")
     with st.spinner("ロール・氏名を取得中..."):
         role = resolve_role(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
@@ -612,7 +604,6 @@ def main():
 
     st.divider()
 
-    # 6) 入口（OS v1.4.6 順）
     st.header("管理者入口（判断専用・高速）")
     render_fytd_org_summary(client, cache_key, role, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"], show_sql=opts["show_sql"])
     st.divider()
