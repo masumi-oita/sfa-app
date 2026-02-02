@@ -4,11 +4,10 @@
 SFA｜入口高速版（判断専用） - OS v1.4.6
 
 ★今回の変更（重要）
-- 0件のときの fallback を全ブロックで標準化
-  1) scope_col=@login_email → 0件なら
-  2) viewer_email系は "all" を試す → まだ0件なら
-  3) WHEREを外して全社表示（管理者fallback）
-- 取得row数を常に表示（空かどうかを即判定）
+- ロールで見える範囲を制御（HQ_ADMIN / AREA_MANAGER / SALES）
+- SALES は全社fallback禁止（一般が全社しか見れない事故防止）
+- FYTD：全社 + 自分 の2ブロックを表示
+- 表示カラムを日本語に変換
 """
 
 from __future__ import annotations
@@ -33,22 +32,85 @@ CACHE_TTL_SEC = 300
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
+# Views
+VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
+
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month"
 
 
+# -----------------------------
+# 日本語ラベル（表示専用）
+# -----------------------------
+JP_COLS_FYTD = {
+    "viewer_email": "閲覧者メール",
+    "login_email": "ログインメール",
+    "role_tier": "ロール",
+    "area_name": "エリア",
+    "current_month": "当月（月初）",
+    "fy_start": "年度開始",
+    "sales_amount_fytd": "売上（FYTD）",
+    "gross_profit_fytd": "粗利（FYTD）",
+    "gross_profit_rate_fytd": "粗利率（FYTD）",
+    "sales_amount_py_fytd": "売上（前年差FYTD）",
+    "gross_profit_py_fytd": "粗利（前年差FYTD）",
+    "sales_diff_fytd": "前年差（売上）",
+    "gp_diff_fytd": "前年差（粗利）",
+}
+
+JP_COLS_YOY = {
+    "login_email": "ログインメール",
+    "month": "対象月（月初）",
+    "customer_code": "得意先コード",
+    "customer_name": "得意先名",
+    "sales_amount": "売上（当月）",
+    "gross_profit": "粗利（当月）",
+    "gross_profit_rate": "粗利率（当月）",
+    "sales_amount_py": "売上（前年同月）",
+    "gross_profit_py": "粗利（前年同月）",
+    "gross_profit_rate_py": "粗利率（前年同月）",
+    "sales_diff_yoy": "前年差（売上）",
+    "gp_diff_yoy": "前年差（粗利）",
+    "sales_yoy_rate": "前年同月比（売上）",
+    "gp_yoy_rate": "前年同月比（粗利）",
+    "pri_gp_abs": "優先度：粗利額",
+    "pri_gp_rate_abs": "優先度：粗利率",
+    "pri_sales_abs": "優先度：売上",
+}
+
+
+def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    cols = {c: mapping.get(c, c) for c in df.columns}
+    return df.rename(columns=cols)
+
+
+# -----------------------------
+# Role
+# -----------------------------
 @dataclass(frozen=True)
 class RoleInfo:
     login_email: str
-    role_key: str = "SALES"
+    role_key: str = "SALES"  # HQ_ADMIN / AREA_MANAGER / SALES
     role_admin_view: bool = False
     role_admin_edit: bool = False
     role_sales_view: bool = True
-    area_key: str = ""
+    area_name: str = "未設定"
 
 
+def normalize_role_key(role_key: str) -> str:
+    rk = (role_key or "").strip().upper()
+    if rk in ("HQ_ADMIN", "AREA_MANAGER", "SALES"):
+        return rk
+    return "SALES"
+
+
+# -----------------------------
+# Secrets / Client
+# -----------------------------
 def _secrets_has_bigquery() -> bool:
     if "bigquery" not in st.secrets:
         return False
@@ -264,47 +326,6 @@ def query_df_safe(
         return pd.DataFrame()
 
 
-def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
-    parts = table_fqn.split(".")
-    if len(parts) != 3:
-        raise ValueError(f"FQN が不正です: {table_fqn}")
-    return parts[0], parts[1], parts[2]
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_table_columns(project_id: str, location: str, sa_json: str, table_fqn: str) -> List[str]:
-    sa = json.loads(sa_json)
-    client = get_bq_client(project_id, location, sa)
-
-    p, d, t = _split_table_fqn(table_fqn)
-    sql = f"""
-    SELECT column_name
-    FROM `{p}.{d}.INFORMATION_SCHEMA.COLUMNS`
-    WHERE table_name = @table_name
-    ORDER BY ordinal_position
-    """
-    df = query_df_safe(
-        client,
-        sql,
-        params={"table_name": t},
-        label=f"列一覧取得（{table_fqn}）",
-        use_bqstorage=False,
-        timeout_sec=30,
-        cache_key=(project_id, location, sa_json),
-    )
-    if df.empty:
-        return []
-    return [str(x) for x in df["column_name"].tolist()]
-
-
-def pick_first_existing(cols: List[str], candidates: List[str]) -> Optional[str]:
-    s = set(cols)
-    for c in candidates:
-        if c in s:
-            return c
-    return None
-
-
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -335,6 +356,45 @@ def get_login_email_ui() -> str:
     return login_email
 
 
+def resolve_role(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
+    # v_dim_staff_role_dedup の列に合わせる（あなたの環境で role_tier が存在）
+    sql = f"""
+SELECT
+  login_email,
+  role_tier AS role_key,
+  role_admin_view,
+  role_admin_edit,
+  role_sales_view,
+  IFNULL(area_name, "未設定") AS area_name
+FROM `{VIEW_ROLE}`
+WHERE login_email = @login_email
+LIMIT 1
+"""
+    df = query_df_safe(
+        client,
+        sql,
+        params={"login_email": login_email},
+        label="ロール取得",
+        use_bqstorage=use_bqstorage,
+        timeout_sec=timeout_sec,
+        cache_key=cache_key,
+    )
+    if df.empty:
+        # ★ロールが取れない＝事故防止で SALES 扱い（全社を見せない）
+        return RoleInfo(login_email=login_email, role_key="SALES", role_admin_view=False, role_admin_edit=False, role_sales_view=True, area_name="未設定")
+
+    r = df.iloc[0].to_dict()
+    role_key = normalize_role_key(str(r.get("role_key", "SALES")))
+    return RoleInfo(
+        login_email=login_email,
+        role_key=role_key,
+        role_admin_view=bool(r.get("role_admin_view", False)),
+        role_admin_edit=bool(r.get("role_admin_edit", False)),
+        role_sales_view=bool(r.get("role_sales_view", True)),
+        area_name=str(r.get("area_name", "未設定")),
+    )
+
+
 def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str], use_bqstorage: bool, timeout_sec: int):
     st.subheader("ヘルスチェック")
     st.write("まずここで BigQuery 接続を確定させます（SELECT 1）。")
@@ -355,119 +415,76 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
         st.dataframe(df, use_container_width=True)
 
 
-def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> Tuple[str, Dict[str, Any], Optional[str]]:
-    scope_col = pick_first_existing(
-        cols,
-        ["login_email", "viewer_email", "viewer_mail", "viewer", "user_email", "email"],
-    )
-
-    params: Dict[str, Any] = {}
-    if scope_col:
-        sql = f"""
-SELECT
-  *
-FROM `{table_fqn}`
-WHERE {scope_col} = @login_email
-LIMIT {limit}
-"""
-        params["login_email"] = None
-        return sql, params, scope_col
-
-    sql = f"""
-SELECT
-  *
-FROM `{table_fqn}`
-LIMIT {limit}
-"""
-    return sql, params, None
-
-
-def render_table_block_with_universal_fallback(
+def run_scoped_then_fallback(
     title: str,
     client: bigquery.Client,
     cache_key: Tuple[str, str, str],
-    project_id: str,
-    location: str,
-    sa_json: str,
     table_fqn: str,
+    scope_col: str,
     login_email: str,
+    allow_org_fallback: bool,   # ★ロールで制御
     use_bqstorage: bool,
     timeout_sec: int,
-    show_sql: bool,
-    button_label: str,
-):
-    st.subheader(title)
+) -> pd.DataFrame:
+    # 1) scoped
+    sql1 = f"""
+SELECT *
+FROM `{table_fqn}`
+WHERE {scope_col} = @login_email
+LIMIT 2000
+"""
+    df = query_df_safe(
+        client,
+        sql1,
+        params={"login_email": login_email},
+        label=title,
+        use_bqstorage=use_bqstorage,
+        timeout_sec=timeout_sec,
+        cache_key=cache_key,
+    )
+    st.caption(f"取得件数: {len(df)} 件（scope: {scope_col}=@login_email）")
+    if not df.empty:
+        return df
 
-    cols = get_table_columns(project_id, location, sa_json, table_fqn)
-    sql, params, scope_col = build_scoped_select_sql(table_fqn, cols, limit=2000)
-    if "login_email" in params:
-        params["login_email"] = login_email
-
-    if show_sql:
-        st.code(sql, language="sql")
-        st.caption(f"columns({len(cols)}): " + ", ".join(cols) if cols else "columns(0)")
-
-    if st.button(button_label, use_container_width=True):
-        # 1) 通常（scope）
-        df = query_df_safe(
-            client,
-            sql,
-            params=params if params else None,
-            label=title,
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-            cache_key=cache_key,
-        )
-
-        # ★row数の見える化
-        st.caption(f"取得件数: {len(df)} 件（1st try）")
-
-        # 2) viewer_email系なら all fallback
-        if df.empty and scope_col in ("viewer_email", "viewer_mail", "viewer"):
-            st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
-            sql2 = f"""
-SELECT
-  *
+    # 2) viewer_email系の all fallback（ただし許可された場合のみ）
+    if allow_org_fallback and scope_col in ("viewer_email", "viewer_mail", "viewer"):
+        st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
+        sql2 = f"""
+SELECT *
 FROM `{table_fqn}`
 WHERE {scope_col} = "all"
 LIMIT 2000
 """
-            df = query_df_safe(
-                client,
-                sql2,
-                params=None,
-                label=title + "（fallback all）",
-                use_bqstorage=use_bqstorage,
-                timeout_sec=timeout_sec,
-                cache_key=cache_key,
-            )
-            st.caption(f"取得件数: {len(df)} 件（fallback all）")
+        df2 = query_df_safe(
+            client,
+            sql2,
+            params=None,
+            label=title + "（fallback all）",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+        st.caption(f"取得件数: {len(df2)} 件（fallback all）")
+        if not df2.empty:
+            return df2
 
-        # 3) それでも空なら WHERE無しで全社表示（管理者fallback）
-        if df.empty:
-            st.warning("それでも0件です。WHEREを外して全社表示（管理者fallback）を試します。")
-            sql3 = f"""
-SELECT
-  *
-FROM `{table_fqn}`
-LIMIT 2000
-"""
-            df = query_df_safe(
-                client,
-                sql3,
-                params=None,
-                label=title + "（fallback no-filter）",
-                use_bqstorage=use_bqstorage,
-                timeout_sec=timeout_sec,
-                cache_key=cache_key,
-            )
-            st.caption(f"取得件数: {len(df)} 件（fallback no-filter）")
+    # 3) WHERE無し fallback（管理者のみ許可）
+    if allow_org_fallback:
+        st.warning("それでも0件です。WHEREを外して全社表示（管理者fallback）を試します。")
+        sql3 = f"SELECT * FROM `{table_fqn}` LIMIT 2000"
+        df3 = query_df_safe(
+            client,
+            sql3,
+            params=None,
+            label=title + "（fallback no-filter）",
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+        st.caption(f"取得件数: {len(df3)} 件（fallback no-filter）")
+        return df3
 
-        if df.empty:
-            st.info("データが空、またはクエリ失敗（上にエラー詳細が表示されています）。")
-            return
-
-        st.dataframe(df, use_container_width=True)
+    return pd.DataFrame()
 
 
 def main():
@@ -484,76 +501,133 @@ def main():
     render_health_check(client, cache_key, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
     st.divider()
 
+    role = resolve_role(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+
     st.subheader("ログイン情報")
-    st.write(f"**ログイン:** {login_email}")
-    st.write(f"**メール:** {login_email}")
-    st.caption("入口はまず ‘表示できる’ を最優先（ロール・スコープの厳密化は次段）。")
+    st.write(f"**ログイン:** {role.login_email}")
+    st.write(f"**ロール:** {role.role_key}（admin_view={role.role_admin_view}, admin_edit={role.role_admin_edit}, sales_view={role.role_sales_view}）")
+    st.write(f"**エリア:** {role.area_name}")
+    st.caption("★ロール取得に失敗した場合は SALES 扱い（全社を見せない）で継続します。")
+
+    # ★全社fallback許可：管理系だけ
+    allow_org_fallback = role.role_key in ("HQ_ADMIN", "AREA_MANAGER")
 
     st.divider()
-    st.header("管理者入口（判断専用・高速）")
+    st.header("入口（判断専用・高速）")
 
-    render_table_block_with_universal_fallback(
-        title="年度累計（FYTD）｜組織サマリー",
-        client=client,
-        cache_key=cache_key,
-        project_id=project_id,
-        location=location,
-        sa_json=sa_json,
-        table_fqn=VIEW_FYTD_ORG,
-        login_email=login_email,
-        use_bqstorage=opts["use_bqstorage"],
-        timeout_sec=opts["timeout_sec"],
-        show_sql=opts["show_sql"],
-        button_label="年度累計（組織）を読み込む",
-    )
+    # -------------------------
+    # FYTD：全社（管理者のみ）
+    # -------------------------
+    st.subheader("年度累計（FYTD）｜全社")
+    if allow_org_fallback:
+        if st.button("全社FYTDを読み込む", use_container_width=True):
+            df_org = run_scoped_then_fallback(
+                title="全社FYTD",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_FYTD_ORG,
+                scope_col="viewer_email",  # このVIEWの列仕様は確定済み
+                login_email=login_email,
+                allow_org_fallback=True,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+            )
+            df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
+            if df_org.empty:
+                st.info("全社FYTDは0件です。VIEW側のデータを確認してください。")
+            else:
+                st.dataframe(df_org, use_container_width=True)
+    else:
+        st.info("あなたのロールでは全社FYTDは表示しません（SALESは自分のみ）。")
 
     st.divider()
+
+    # -------------------------
+    # FYTD：自分（全員）
+    # ※現状は v_admin_org_fytd_summary_scoped が個人行を持たないので
+    #   まずは“同VIEWを viewer_email=@login_email で試行”し、
+    #   0件なら「個人FYTDのVIEWが未実装」と明示する。
+    #   → 次段で v_staff_fytd_summary_scoped を作るのが本修正。
+    # -------------------------
+    st.subheader("年度累計（FYTD）｜自分")
+    if st.button("自分FYTDを読み込む", use_container_width=True):
+        df_me = run_scoped_then_fallback(
+            title="自分FYTD",
+            client=client,
+            cache_key=cache_key,
+            table_fqn=VIEW_FYTD_ORG,
+            scope_col="viewer_email",
+            login_email=login_email,
+            allow_org_fallback=False,  # ★自分は全社fallback禁止
+            use_bqstorage=opts["use_bqstorage"],
+            timeout_sec=opts["timeout_sec"],
+        )
+        df_me = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        if df_me.empty:
+            st.warning("自分FYTDが0件です。→ 個人FYTD用のVIEW（v_staff_fytd_summary_scoped）を作るのが次の本修正です。")
+        else:
+            st.dataframe(df_me, use_container_width=True)
+
+    st.divider()
+    st.subheader("当月YoY（得意先ランキング）")
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        render_table_block_with_universal_fallback(
-            title="当月YoY｜Top（伸び先）",
-            client=client,
-            cache_key=cache_key,
-            project_id=project_id,
-            location=location,
-            sa_json=sa_json,
-            table_fqn=VIEW_YOY_TOP,
-            login_email=login_email,
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-            button_label="Top を読み込む",
-        )
+        if st.button("YoY Top を読み込む", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Top",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_TOP,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,  # 管理者だけ全社fallback許可
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です（担当付与が未整備 or データなし）。")
+            else:
+                st.dataframe(df, use_container_width=True)
+
     with c2:
-        render_table_block_with_universal_fallback(
-            title="当月YoY｜Bottom（下落先）",
-            client=client,
-            cache_key=cache_key,
-            project_id=project_id,
-            location=location,
-            sa_json=sa_json,
-            table_fqn=VIEW_YOY_BOTTOM,
-            login_email=login_email,
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-            button_label="Bottom を読み込む",
-        )
+        if st.button("YoY Bottom を読み込む", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Bottom",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_BOTTOM,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です（担当付与が未整備 or データなし）。")
+            else:
+                st.dataframe(df, use_container_width=True)
+
     with c3:
-        render_table_block_with_universal_fallback(
-            title="当月YoY｜比較不能（Uncomparable）",
-            client=client,
-            cache_key=cache_key,
-            project_id=project_id,
-            location=location,
-            sa_json=sa_json,
-            table_fqn=VIEW_YOY_UNCOMP,
-            login_email=login_email,
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-            button_label="Uncomparable を読み込む",
-        )
+        if st.button("YoY 比較不能 を読み込む", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Uncomparable",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_UNCOMP,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です（担当付与が未整備 or データなし）。")
+            else:
+                st.dataframe(df, use_container_width=True)
 
     st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（アプリは落ちません）。")
 
