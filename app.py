@@ -3,10 +3,9 @@
 """
 SFA｜入口高速版（判断専用） - OS v1.4.6
 
-★今回の変更（前回からの差分）
-- scopedフィルタのキー候補を拡張：
-  login_email が無いVIEWでも viewer_email / viewer_mail などで絞れる
-- これにより v_admin_org_fytd_summary_scoped が空になりにくい
+★今回の変更（重要）
+- FYTD（組織）など scoped VIEW で、viewer_email=@login_email が0件のとき
+  viewer_email="all" を自動fallbackして「入口が必ず出る」ようにした
 """
 
 from __future__ import annotations
@@ -31,15 +30,10 @@ CACHE_TTL_SEC = 300
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
-VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
-VIEW_STAFF_NAME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_email_name"
-
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month"
-
-VIEW_NEW_DELIVERIES = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 
 
 @dataclass(frozen=True)
@@ -308,10 +302,6 @@ def pick_first_existing(cols: List[str], candidates: List[str]) -> Optional[str]
     return None
 
 
-def has_column(cols: List[str], col: str) -> bool:
-    return col in set(cols)
-
-
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -362,22 +352,11 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
         st.dataframe(df, use_container_width=True)
 
 
-def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> Tuple[str, Dict[str, Any]]:
-    """
-    ★ここが今回の肝：
-    login_email が無いVIEWでも viewer_email などがあれば絞る
-    """
+def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> Tuple[str, Dict[str, Any], Optional[str]]:
     # スコープキー候補（優先順）
     scope_col = pick_first_existing(
         cols,
-        [
-            "login_email",
-            "viewer_email",   # ★今回確定
-            "viewer_mail",
-            "viewer",
-            "user_email",
-            "email",
-        ],
+        ["login_email", "viewer_email", "viewer_mail", "viewer", "user_email", "email"],
     )
 
     params: Dict[str, Any] = {}
@@ -389,8 +368,8 @@ FROM `{table_fqn}`
 WHERE {scope_col} = @login_email
 LIMIT {limit}
 """
-        params["login_email"] = None  # 後で埋める
-        return sql, params
+        params["login_email"] = None
+        return sql, params, scope_col
 
     sql = f"""
 SELECT
@@ -398,10 +377,10 @@ SELECT
 FROM `{table_fqn}`
 LIMIT {limit}
 """
-    return sql, params
+    return sql, params, None
 
 
-def render_table_block(
+def render_table_block_with_fallback_all(
     title: str,
     client: bigquery.Client,
     cache_key: Tuple[str, str, str],
@@ -418,7 +397,70 @@ def render_table_block(
     st.subheader(title)
 
     cols = get_table_columns(project_id, location, sa_json, table_fqn)
-    sql, params = build_scoped_select_sql(table_fqn, cols, limit=2000)
+    sql, params, scope_col = build_scoped_select_sql(table_fqn, cols, limit=2000)
+    if "login_email" in params:
+        params["login_email"] = login_email
+
+    if show_sql:
+        st.code(sql, language="sql")
+        st.caption(f"columns({len(cols)}): " + ", ".join(cols) if cols else "columns(0)")
+
+    if st.button(button_label, use_container_width=True):
+        df = query_df_safe(
+            client,
+            sql,
+            params=params if params else None,
+            label=title,
+            use_bqstorage=use_bqstorage,
+            timeout_sec=timeout_sec,
+            cache_key=cache_key,
+        )
+
+        # ★ fallback：scoped列があるのに 0件なら viewer_email="all" を試す（入口を落とさない）
+        if df.empty and scope_col in ("viewer_email", "viewer_mail", "viewer"):
+            st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
+            sql2 = f"""
+SELECT
+  *
+FROM `{table_fqn}`
+WHERE {scope_col} = "all"
+LIMIT 2000
+"""
+            df = query_df_safe(
+                client,
+                sql2,
+                params=None,
+                label=title + "（fallback all）",
+                use_bqstorage=use_bqstorage,
+                timeout_sec=timeout_sec,
+                cache_key=cache_key,
+            )
+
+        if df.empty:
+            st.info("データが空、またはクエリ失敗（上にエラー詳細が表示されています）。")
+            return
+
+        st.dataframe(df, use_container_width=True)
+
+
+def render_table_block_simple(
+    title: str,
+    client: bigquery.Client,
+    cache_key: Tuple[str, str, str],
+    project_id: str,
+    location: str,
+    sa_json: str,
+    table_fqn: str,
+    login_email: str,
+    use_bqstorage: bool,
+    timeout_sec: int,
+    show_sql: bool,
+    button_label: str,
+):
+    st.subheader(title)
+
+    cols = get_table_columns(project_id, location, sa_json, table_fqn)
+    sql, params, _ = build_scoped_select_sql(table_fqn, cols, limit=2000)
     if "login_email" in params:
         params["login_email"] = login_email
 
@@ -459,13 +501,13 @@ def main():
     st.subheader("ログイン情報")
     st.write(f"**ログイン:** {login_email}")
     st.write(f"**メール:** {login_email}")
-    st.write("※ロール表示は既に成功しているので、この版では入口検証を優先（落とさない）。")
+    st.caption("入口はまず ‘表示できる’ を最優先（ロール・スコープの厳密化は次段）。")
 
     st.divider()
-
     st.header("管理者入口（判断専用・高速）")
 
-    render_table_block(
+    # ★FYTDは必ず出す：all fallback
+    render_table_block_with_fallback_all(
         title="年度累計（FYTD）｜組織サマリー",
         client=client,
         cache_key=cache_key,
@@ -484,7 +526,7 @@ def main():
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        render_table_block(
+        render_table_block_simple(
             title="当月YoY｜Top（伸び先）",
             client=client,
             cache_key=cache_key,
@@ -499,7 +541,7 @@ def main():
             button_label="Top を読み込む",
         )
     with c2:
-        render_table_block(
+        render_table_block_simple(
             title="当月YoY｜Bottom（下落先）",
             client=client,
             cache_key=cache_key,
@@ -514,7 +556,7 @@ def main():
             button_label="Bottom を読み込む",
         )
     with c3:
-        render_table_block(
+        render_table_block_simple(
             title="当月YoY｜比較不能（Uncomparable）",
             client=client,
             cache_key=cache_key,
@@ -528,10 +570,6 @@ def main():
             show_sql=opts["show_sql"],
             button_label="Uncomparable を読み込む",
         )
-
-    st.divider()
-    st.subheader("新規納品（入口固定：昨日 / 直近7日 / 当月 / FYTD）")
-    st.caption("このブロックは次の段。まずFYTD/YoYが出ることを確認してから整える。")
 
     st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（アプリは落ちません）。")
 
