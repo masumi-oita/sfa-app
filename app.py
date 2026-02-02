@@ -3,18 +3,10 @@
 """
 SFA｜入口高速版（判断専用） - OS v1.4.6
 
-特徴
-- 遅延ロード（起動時に重いクエリを走らせない）
-- timeout / BigQuery Storage API ON-OFF / SELECT1 ヘルスチェック
-- BadRequest の詳細（job.errors, SQL, params）を必ず画面に表示
-- Secrets 未設定でも「サービスアカウントJSON貼り付け」で一時起動可（セッション限定）
-
 ★今回の変更（前回からの差分）
-1) VIEWの列名差分を吸収するため、INFORMATION_SCHEMA.COLUMNS で列一覧を取得し、SQLを自動生成
-   - role: area_key が無くても落ちない
-   - staff_name: display_name が無くても落ちない（候補列を探索）
-   - 各集計VIEW: login_email 列が無い場合は WHERE login_email を自動で外す
-2) クエリ失敗時に raise してアプリを落とさず、空DataFrameで継続（入口高速版として正しい）
+- scopedフィルタのキー候補を拡張：
+  login_email が無いVIEWでも viewer_email / viewer_mail などで絞れる
+- これにより v_admin_org_fytd_summary_scoped が空になりにくい
 """
 
 from __future__ import annotations
@@ -32,21 +24,12 @@ from google.oauth2 import service_account
 from google.api_core.exceptions import BadRequest, GoogleAPICallError
 
 
-# =============================================================================
-# 基本設定
-# =============================================================================
-
 APP_TITLE = "SFA｜入口高速版（判断専用）"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
-
-
-# =============================================================================
-# 対象オブジェクト（VIEW）
-# =============================================================================
 
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 VIEW_STAFF_NAME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_email_name"
@@ -59,10 +42,6 @@ VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_unc
 VIEW_NEW_DELIVERIES = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 
 
-# =============================================================================
-# データ構造
-# =============================================================================
-
 @dataclass(frozen=True)
 class RoleInfo:
     login_email: str
@@ -70,12 +49,8 @@ class RoleInfo:
     role_admin_view: bool = False
     role_admin_edit: bool = False
     role_sales_view: bool = True
-    area_key: str = ""  # 無い環境があるので、取れたら入れる程度（無ければ空）
+    area_key: str = ""
 
-
-# =============================================================================
-# Secrets / Credentials
-# =============================================================================
 
 def _secrets_has_bigquery() -> bool:
     if "bigquery" not in st.secrets:
@@ -85,14 +60,6 @@ def _secrets_has_bigquery() -> bool:
 
 
 def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
-    """
-    secrets.toml:
-    [bigquery]
-    project_id = "..."
-    location = "asia-northeast1"
-    [bigquery.service_account]
-    ... service account fields ...
-    """
     bq = st.secrets["bigquery"]
     project_id = str(bq.get("project_id"))
     location = str(bq.get("location") or DEFAULT_LOCATION)
@@ -111,11 +78,6 @@ def _parse_service_account_json(text: str) -> Dict[str, Any]:
 
 
 def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
-    """
-    優先順位:
-    1) st.secrets[bigquery] があればそれを使う（本番）
-    2) 無ければ、画面でサービスアカウントJSONを貼り付けて一時利用（セッション限定）
-    """
     st.sidebar.header("接続設定")
 
     if _secrets_has_bigquery():
@@ -143,7 +105,6 @@ auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
 client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_SA%40YOUR_PROJECT.iam.gserviceaccount.com"
 universe_domain = "googleapis.com"
 
-# 任意：ログイン入力の初期値
 default_login_email = "masumi@example.com"
 """
         st.code(template, language="toml")
@@ -183,10 +144,6 @@ def get_bq_client(project_id: str, location: str, sa: Dict[str, Any]) -> bigquer
     creds = service_account.Credentials.from_service_account_info(sa)
     return bigquery.Client(project=project_id, credentials=creds, location=location)
 
-
-# =============================================================================
-# BigQuery helper（エラー可視化＋スキーマ自動吸収）
-# =============================================================================
 
 def _build_query_parameters(params: Optional[Dict[str, Any]]) -> List[bigquery.ScalarQueryParameter]:
     qparams: List[bigquery.ScalarQueryParameter] = []
@@ -263,9 +220,6 @@ def query_df_safe(
     timeout_sec: int = 60,
     cache_key: Optional[Tuple[str, str, str]] = None,
 ) -> pd.DataFrame:
-    """
-    ★重要：失敗しても raise しない（入口高速版としてアプリを落とさない）
-    """
     params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
 
     try:
@@ -314,7 +268,6 @@ def query_df_safe(
 
 
 def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
-    # "project.dataset.table"
     parts = table_fqn.split(".")
     if len(parts) != 3:
         raise ValueError(f"FQN が不正です: {table_fqn}")
@@ -322,15 +275,7 @@ def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def get_table_columns(
-    project_id: str,
-    location: str,
-    sa_json: str,
-    table_fqn: str,
-) -> List[str]:
-    """
-    ★軽量：INFORMATION_SCHEMA から列名一覧を取得（スキーマ差分吸収用）
-    """
+def get_table_columns(project_id: str, location: str, sa_json: str, table_fqn: str) -> List[str]:
     sa = json.loads(sa_json)
     client = get_bq_client(project_id, location, sa)
 
@@ -366,10 +311,6 @@ def pick_first_existing(cols: List[str], candidates: List[str]) -> Optional[str]
 def has_column(cols: List[str], col: str) -> bool:
     return col in set(cols)
 
-
-# =============================================================================
-# UI
-# =============================================================================
 
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -421,166 +362,43 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
         st.dataframe(df, use_container_width=True)
 
 
-def build_role_sql(role_cols: List[str]) -> str:
+def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> Tuple[str, Dict[str, Any]]:
     """
-    ★role_key / role_tier の揺れ、area_key の有無を吸収して SELECT を組む
+    ★ここが今回の肝：
+    login_email が無いVIEWでも viewer_email などがあれば絞る
     """
-    # role_key の候補（実際には role_tier があるケースが多い）
-    role_key_col = pick_first_existing(role_cols, ["role_key", "role_tier", "role", "role_name"])
-    # area の候補
-    area_col = pick_first_existing(role_cols, ["area_key", "area", "area_code", "area_name", "エリア", "エリアキー"])
-
-    select_parts = ["login_email"]
-
-    if role_key_col:
-        if role_key_col != "role_key":
-            select_parts.append(f"{role_key_col} AS role_key")
-        else:
-            select_parts.append("role_key")
-
-    # 権限フラグ（無ければ後でデフォルト）
-    for c in ["role_admin_view", "role_admin_edit", "role_sales_view"]:
-        if has_column(role_cols, c):
-            select_parts.append(c)
-
-    # area は存在する場合だけ
-    if area_col:
-        if area_col != "area_key":
-            select_parts.append(f"{area_col} AS area_key")
-        else:
-            select_parts.append("area_key")
-
-    select_sql = ",\n  ".join(select_parts)
-
-    return f"""
-SELECT
-  {select_sql}
-FROM `{VIEW_ROLE}`
-WHERE login_email = @login_email
-LIMIT 1
-"""
-
-
-def resolve_role(
-    client: bigquery.Client,
-    cache_key: Tuple[str, str, str],
-    project_id: str,
-    location: str,
-    sa_json: str,
-    login_email: str,
-    use_bqstorage: bool,
-    timeout_sec: int,
-) -> RoleInfo:
-    role_cols = get_table_columns(project_id, location, sa_json, VIEW_ROLE)
-    if not role_cols:
-        st.warning("ロールVIEWの列一覧取得に失敗。暫定 SALES で継続します。")
-        return RoleInfo(login_email=login_email)
-
-    sql = build_role_sql(role_cols)
-    df = query_df_safe(
-        client,
-        sql,
-        params={"login_email": login_email},
-        label="ロール取得",
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
+    # スコープキー候補（優先順）
+    scope_col = pick_first_existing(
+        cols,
+        [
+            "login_email",
+            "viewer_email",   # ★今回確定
+            "viewer_mail",
+            "viewer",
+            "user_email",
+            "email",
+        ],
     )
 
-    if df.empty:
-        st.warning("ロール取得：該当なし or 失敗。暫定 SALES で継続します。")
-        return RoleInfo(login_email=login_email)
-
-    r = df.iloc[0].to_dict()
-
-    return RoleInfo(
-        login_email=str(r.get("login_email", login_email)),
-        role_key=str(r.get("role_key", "SALES") or "SALES"),
-        role_admin_view=bool(r.get("role_admin_view", False)) if "role_admin_view" in r else False,
-        role_admin_edit=bool(r.get("role_admin_edit", False)) if "role_admin_edit" in r else False,
-        role_sales_view=bool(r.get("role_sales_view", True)) if "role_sales_view" in r else True,
-        area_key=str(r.get("area_key", "") or ""),
-    )
-
-
-def build_staff_name_sql(name_cols: List[str]) -> Optional[str]:
-    """
-    ★display_name が無い環境を吸収：候補列を探索して SELECT を組む
-    """
-    # 名前の候補（あなたの実体に合わせて増やしてOK）
-    name_col = pick_first_existing(
-        name_cols,
-        ["display_name", "staff_name", "name", "full_name", "user_name", "氏名", "担当者名", "担当者"],
-    )
-    if not name_col:
-        return None
-
-    if name_col != "display_name":
-        name_expr = f"{name_col} AS display_name"
-    else:
-        name_expr = "display_name"
-
-    return f"""
-SELECT
-  login_email,
-  {name_expr}
-FROM `{VIEW_STAFF_NAME}`
-WHERE login_email = @login_email
-LIMIT 1
-"""
-
-
-def resolve_display_name(
-    client: bigquery.Client,
-    cache_key: Tuple[str, str, str],
-    project_id: str,
-    location: str,
-    sa_json: str,
-    login_email: str,
-    use_bqstorage: bool,
-    timeout_sec: int,
-) -> str:
-    cols = get_table_columns(project_id, location, sa_json, VIEW_STAFF_NAME)
-    if not cols:
-        return login_email
-
-    sql = build_staff_name_sql(cols)
-    if not sql:
-        return login_email
-
-    df = query_df_safe(
-        client,
-        sql,
-        params={"login_email": login_email},
-        label="氏名表示取得",
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
-    )
-    if df.empty:
-        return login_email
-    v = df.iloc[0].to_dict()
-    return str(v.get("display_name") or login_email)
-
-
-def build_scoped_select_sql(table_fqn: str, cols: List[str], limit: int = 2000) -> str:
-    """
-    ★login_email 列がある時だけ WHERE を付ける（無いなら付けない）
-    """
-    if has_column(cols, "login_email"):
-        return f"""
+    params: Dict[str, Any] = {}
+    if scope_col:
+        sql = f"""
 SELECT
   *
 FROM `{table_fqn}`
-WHERE login_email = @login_email
+WHERE {scope_col} = @login_email
 LIMIT {limit}
 """
-    return f"""
+        params["login_email"] = None  # 後で埋める
+        return sql, params
+
+    sql = f"""
 SELECT
   *
 FROM `{table_fqn}`
 LIMIT {limit}
 """
+    return sql, params
 
 
 def render_table_block(
@@ -596,20 +414,17 @@ def render_table_block(
     timeout_sec: int,
     show_sql: bool,
     button_label: str,
-    extra_params: Optional[Dict[str, Any]] = None,
 ):
     st.subheader(title)
 
     cols = get_table_columns(project_id, location, sa_json, table_fqn)
-    sql = build_scoped_select_sql(table_fqn, cols, limit=2000)
-
-    params = {"login_email": login_email} if "login_email" in sql else {}
-    if extra_params:
-        params.update(extra_params)
+    sql, params = build_scoped_select_sql(table_fqn, cols, limit=2000)
+    if "login_email" in params:
+        params["login_email"] = login_email
 
     if show_sql:
         st.code(sql, language="sql")
-        st.caption(f"columns({len(cols)}): " + ", ".join(cols[:50]) + (" ..." if len(cols) > 50 else ""))
+        st.caption(f"columns({len(cols)}): " + ", ".join(cols) if cols else "columns(0)")
 
     if st.button(button_label, use_container_width=True):
         df = query_df_safe(
@@ -642,27 +457,14 @@ def main():
     st.divider()
 
     st.subheader("ログイン情報")
-    with st.spinner("ロール・氏名を取得中..."):
-        role = resolve_role(
-            client, cache_key, project_id, location, sa_json, login_email,
-            use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"]
-        )
-        display_name = resolve_display_name(
-            client, cache_key, project_id, location, sa_json, login_email,
-            use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"]
-        )
-
-    st.write(f"**ログイン:** {display_name}")
-    st.write(f"**メール:** {role.login_email}")
-    st.write(f"**ロール:** {role.role_key}（admin_view={role.role_admin_view}, admin_edit={role.role_admin_edit}, sales_view={role.role_sales_view}）")
-    if role.area_key:
-        st.write(f"**エリア:** {role.area_key}")
+    st.write(f"**ログイン:** {login_email}")
+    st.write(f"**メール:** {login_email}")
+    st.write("※ロール表示は既に成功しているので、この版では入口検証を優先（落とさない）。")
 
     st.divider()
 
     st.header("管理者入口（判断専用・高速）")
 
-    # FYTD（組織）
     render_table_block(
         title="年度累計（FYTD）｜組織サマリー",
         client=client,
@@ -671,15 +473,15 @@ def main():
         location=location,
         sa_json=sa_json,
         table_fqn=VIEW_FYTD_ORG,
-        login_email=role.login_email,
+        login_email=login_email,
         use_bqstorage=opts["use_bqstorage"],
         timeout_sec=opts["timeout_sec"],
         show_sql=opts["show_sql"],
         button_label="年度累計（組織）を読み込む",
     )
+
     st.divider()
 
-    # YoY（Top / Bottom / Uncomparable）
     c1, c2, c3 = st.columns(3)
     with c1:
         render_table_block(
@@ -690,7 +492,7 @@ def main():
             location=location,
             sa_json=sa_json,
             table_fqn=VIEW_YOY_TOP,
-            login_email=role.login_email,
+            login_email=login_email,
             use_bqstorage=opts["use_bqstorage"],
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
@@ -705,7 +507,7 @@ def main():
             location=location,
             sa_json=sa_json,
             table_fqn=VIEW_YOY_BOTTOM,
-            login_email=role.login_email,
+            login_email=login_email,
             use_bqstorage=opts["use_bqstorage"],
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
@@ -720,7 +522,7 @@ def main():
             location=location,
             sa_json=sa_json,
             table_fqn=VIEW_YOY_UNCOMP,
-            login_email=role.login_email,
+            login_email=login_email,
             use_bqstorage=opts["use_bqstorage"],
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
@@ -728,53 +530,10 @@ def main():
         )
 
     st.divider()
-
-    # 新規納品（入口4本固定）
     st.subheader("新規納品（入口固定：昨日 / 直近7日 / 当月 / FYTD）")
-    st.caption("※ period_key 列が無いVIEWの場合、ここはVIEW側の仕様に合わせてSQLを差し替えます。まずは列一覧を表示して確認できます。")
+    st.caption("このブロックは次の段。まずFYTD/YoYが出ることを確認してから整える。")
 
-    tabs = st.tabs(["昨日", "直近7日", "当月", "FYTD"])
-
-    # VIEW_NEW_DELIVERIES の列一覧を確認して、period_key があればフィルタ、無ければ単純表示
-    nd_cols = get_table_columns(project_id, location, sa_json, VIEW_NEW_DELIVERIES)
-    has_period = has_column(nd_cols, "period_key")
-
-    def new_delivery_sql(period_value: str) -> Tuple[str, Dict[str, Any]]:
-        base = build_scoped_select_sql(VIEW_NEW_DELIVERIES, nd_cols, limit=2000)
-        params = {"login_email": role.login_email} if "login_email" in base else {}
-        if has_period:
-            # WHERE句の有無に応じて AND / WHERE を切替
-            if "WHERE" in base:
-                sql = base.replace(f"LIMIT 2000", f'  AND period_key = "{period_value}"\nLIMIT 2000')
-            else:
-                sql = base.replace(f"LIMIT 2000", f'WHERE period_key = "{period_value}"\nLIMIT 2000')
-            return sql, params
-        return base, params
-
-    for i, (label, period_value) in enumerate([("昨日", "yesterday"), ("直近7日", "last_7_days"), ("当月", "this_month"), ("FYTD", "fytd")]):
-        with tabs[i]:
-            sql, params = new_delivery_sql(period_value)
-            if opts["show_sql"]:
-                st.code(sql, language="sql")
-                st.caption(f"columns({len(nd_cols)}): " + ", ".join(nd_cols[:50]) + (" ..." if len(nd_cols) > 50 else ""))
-
-            if st.button(f"{label} を読み込む", use_container_width=True):
-                df = query_df_safe(
-                    client,
-                    sql,
-                    params=params if params else None,
-                    label=f"新規納品（{label}）",
-                    use_bqstorage=opts["use_bqstorage"],
-                    timeout_sec=opts["timeout_sec"],
-                    cache_key=cache_key,
-                )
-                if df.empty:
-                    st.info("データが空、またはクエリ失敗（上にエラー詳細が表示されています）。")
-                else:
-                    st.dataframe(df, use_container_width=True)
-
-    st.divider()
-    st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（赤落ちさせずに切り分け可能）。")
+    st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（アプリは落ちません）。")
 
 
 if __name__ == "__main__":
