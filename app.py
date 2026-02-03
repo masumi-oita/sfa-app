@@ -4,10 +4,10 @@
 SFA｜入口高速版（判断専用） - OS v1.4.6
 
 ★今回の変更（重要）
-- ロールで見える範囲を制御（HQ_ADMIN / AREA_MANAGER / SALES）
-- SALES は全社fallback禁止（一般が全社しか見れない事故防止）
-- FYTD：全社 + 自分 の2ブロックを表示
-- 表示カラムを日本語に変換
+- YoY 3本を “named VIEW” に差し替え（display_name 付与済み）
+- ログイン表示を「氏名優先（display_name）」に統一（無い場合はメール）
+- 表示カラム日本語変換に display_name（担当者名）を追加
+- SALES は全社fallback禁止（一般が全社しか見れない事故防止：踏襲）
 """
 
 from __future__ import annotations
@@ -36,9 +36,13 @@ DATASET_DEFAULT = "sales_data"
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 
-VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month"
-VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month"
-VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month"
+# ★ YoY は “named” を使う（display_name JOIN済み）
+VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
+VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
+VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
+
+# ★ 表示名（担当者名）取得：固定VIEW
+VIEW_STAFF_NAME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_email_name_fixed"
 
 
 # -----------------------------
@@ -62,6 +66,7 @@ JP_COLS_FYTD = {
 
 JP_COLS_YOY = {
     "login_email": "ログインメール",
+    "display_name": "担当者名",  # ★追加
     "month": "対象月（月初）",
     "customer_code": "得意先コード",
     "customer_name": "得意先名",
@@ -356,8 +361,13 @@ def get_login_email_ui() -> str:
     return login_email
 
 
-def resolve_role(client: bigquery.Client, cache_key: Tuple[str, str, str], login_email: str, use_bqstorage: bool, timeout_sec: int) -> RoleInfo:
-    # v_dim_staff_role_dedup の列に合わせる（あなたの環境で role_tier が存在）
+def resolve_role(
+    client: bigquery.Client,
+    cache_key: Tuple[str, str, str],
+    login_email: str,
+    use_bqstorage: bool,
+    timeout_sec: int
+) -> RoleInfo:
     sql = f"""
 SELECT
   login_email,
@@ -381,7 +391,14 @@ LIMIT 1
     )
     if df.empty:
         # ★ロールが取れない＝事故防止で SALES 扱い（全社を見せない）
-        return RoleInfo(login_email=login_email, role_key="SALES", role_admin_view=False, role_admin_edit=False, role_sales_view=True, area_name="未設定")
+        return RoleInfo(
+            login_email=login_email,
+            role_key="SALES",
+            role_admin_view=False,
+            role_admin_edit=False,
+            role_sales_view=True,
+            area_name="未設定",
+        )
 
     r = df.iloc[0].to_dict()
     role_key = normalize_role_key(str(r.get("role_key", "SALES")))
@@ -393,6 +410,36 @@ LIMIT 1
         role_sales_view=bool(r.get("role_sales_view", True)),
         area_name=str(r.get("area_name", "未設定")),
     )
+
+
+def resolve_display_name(
+    client: bigquery.Client,
+    cache_key: Tuple[str, str, str],
+    login_email: str,
+    use_bqstorage: bool,
+    timeout_sec: int,
+) -> str:
+    sql = f"""
+SELECT
+  login_email,
+  display_name
+FROM `{VIEW_STAFF_NAME}`
+WHERE login_email = @login_email
+LIMIT 1
+"""
+    df = query_df_safe(
+        client,
+        sql,
+        params={"login_email": login_email},
+        label="氏名表示取得",
+        use_bqstorage=use_bqstorage,
+        timeout_sec=timeout_sec,
+        cache_key=cache_key,
+    )
+    if df.empty:
+        return ""
+    v = df.iloc[0].get("display_name")
+    return (str(v).strip() if v is not None else "")
 
 
 def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str], use_bqstorage: bool, timeout_sec: int):
@@ -446,7 +493,7 @@ LIMIT 2000
     if not df.empty:
         return df
 
-    # 2) viewer_email系の all fallback（ただし許可された場合のみ）
+    # 2) viewer系の all fallback（許可された場合のみ）
     if allow_org_fallback and scope_col in ("viewer_email", "viewer_mail", "viewer"):
         st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
         sql2 = f"""
@@ -503,7 +550,12 @@ def main():
 
     role = resolve_role(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
 
+    # ★氏名優先（無ければメール）
+    display_name = resolve_display_name(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+    display_label = display_name if display_name else role.login_email
+
     st.subheader("ログイン情報")
+    st.write(f"**担当者:** {display_label}")
     st.write(f"**ログイン:** {role.login_email}")
     st.write(f"**ロール:** {role.role_key}（admin_view={role.role_admin_view}, admin_edit={role.role_admin_edit}, sales_view={role.role_sales_view}）")
     st.write(f"**エリア:** {role.area_name}")
@@ -526,7 +578,7 @@ def main():
                 client=client,
                 cache_key=cache_key,
                 table_fqn=VIEW_FYTD_ORG,
-                scope_col="viewer_email",  # このVIEWの列仕様は確定済み
+                scope_col="viewer_email",
                 login_email=login_email,
                 allow_org_fallback=True,
                 use_bqstorage=opts["use_bqstorage"],
@@ -544,10 +596,6 @@ def main():
 
     # -------------------------
     # FYTD：自分（全員）
-    # ※現状は v_admin_org_fytd_summary_scoped が個人行を持たないので
-    #   まずは“同VIEWを viewer_email=@login_email で試行”し、
-    #   0件なら「個人FYTDのVIEWが未実装」と明示する。
-    #   → 次段で v_staff_fytd_summary_scoped を作るのが本修正。
     # -------------------------
     st.subheader("年度累計（FYTD）｜自分")
     if st.button("自分FYTDを読み込む", use_container_width=True):
@@ -581,7 +629,7 @@ def main():
                 table_fqn=VIEW_YOY_TOP,
                 scope_col="login_email",
                 login_email=login_email,
-                allow_org_fallback=allow_org_fallback,  # 管理者だけ全社fallback許可
+                allow_org_fallback=allow_org_fallback,
                 use_bqstorage=opts["use_bqstorage"],
                 timeout_sec=opts["timeout_sec"],
             )
