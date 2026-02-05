@@ -1,14 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.4.9
+SFA｜入口高速版（判断専用） - OS v1.5.0
 
-★今回のアップデート（全社・粗利予測対応版）
-- BigQuery VIEW (v_admin_org_fytd_summary_scoped) の新カラムに対応
-    - gp_forecast_total (粗利着地予測)
-    - gp_pacing_rate (粗利対前年ペース)
-    - gross_profit_py_total (前年粗利実績)
-- UI: 全社タブにて「売上」と「粗利」の着地予測を並列表示
+★今回のアップデート（減少要因分析の実装）
+- BigQuery VIEW (v_admin_product_yoy_worst_ranking) を連携
+- 全社タブの下部に「売上減少要因（ワースト商品ランキング）」を追加
+- どの商品が前年比で大きく落ち込んでいるかを金額（Impact）順に表示
 """
 
 from __future__ import annotations
@@ -40,6 +38,9 @@ VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 
 # 全社FYTD（管理者用）
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
+# ★売上減少要因（ワーストランキング）
+VIEW_WORST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_worst_ranking"
+
 # 自分FYTD（全員用）
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 
@@ -67,14 +68,26 @@ JP_COLS_FYTD = {
     "gross_profit_py_fytd": "粗利（前年FYTD）",
     "sales_diff_fytd": "前年差（売上）",
     "gp_diff_fytd": "前年差（粗利）",
-    # ★追加カラム（売上予測）
+    # 着地予測
     "sales_forecast_total": "売上着地予測（年）",
     "pacing_rate": "売上対前年ペース",
     "sales_amount_py_total": "前年売上実績（年）",
-    # ★追加カラム（粗利予測）
     "gp_forecast_total": "粗利着地予測（年）",
     "gp_pacing_rate": "粗利対前年ペース",
     "gross_profit_py_total": "前年粗利実績（年）",
+}
+
+# ★ワーストランキング用ラベル
+JP_COLS_RANK = {
+    "jan": "JANコード",
+    "product_name": "商品名",
+    "maker_name": "メーカー",
+    "sales_cur": "売上(今年)",
+    "sales_prev": "売上(前年)",
+    "sales_diff": "売上差額(Impact)",
+    "sales_rate": "前年比",
+    "gp_cur": "粗利(今年)",
+    "gp_diff": "粗利差額(Impact)"
 }
 
 JP_COLS_YOY = {
@@ -347,7 +360,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜全社・粗利予測KPI｜ロール別タブ｜遅延ロード")
+    st.caption("OS v1.5.0｜全社ワースト分析｜着地予測｜ロール別")
 
 
 def sidebar_controls() -> Dict[str, Any]:
@@ -518,7 +531,8 @@ def render_fytd_org_section(
     client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
 ):
     st.subheader("🏢 年度累計（FYTD）｜全社")
-    if st.button("全社FYTDを読み込む", key="btn_fytd_org", use_container_width=True):
+    if st.button("全社データを読み込む（KPI・ワースト分析）", key="btn_fytd_org", use_container_width=True):
+        # 1. KPI取得
         df_org = run_scoped_then_fallback(
             title="全社FYTD",
             client=client,
@@ -532,67 +546,64 @@ def render_fytd_org_section(
             show_sql=opts["show_sql"],
         )
         
-        if df_org.empty:
-            st.info("全社FYTDは0件です。")
-            return
+        if not df_org.empty:
+            # --- KPI表示 (既存ロジック) ---
+            row = df_org.iloc[0]
+            sales_forecast = row.get("sales_forecast_total")
+            sales_pacing = row.get("pacing_rate")
+            sales_py = row.get("sales_amount_py_total")
+            gp_forecast = row.get("gp_forecast_total")
+            gp_pacing = row.get("gp_pacing_rate")
+            gp_py = row.get("gross_profit_py_total")
+            
+            st.markdown("##### ■ 売上予測")
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("売上 着地予測（年）", f"¥{float(sales_forecast):,.0f}" if pd.notnull(sales_forecast) else "-")
+            with c2: 
+                val = float(sales_pacing) if pd.notnull(sales_pacing) else 0
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{(val-1)*100:+.1f}%")
+            with c3: st.metric("昨年度実績（年）", f"¥{float(sales_py):,.0f}" if pd.notnull(sales_py) else "-")
 
-        # KPIデータ取得
-        row = df_org.iloc[0]
+            st.markdown("##### ■ 粗利予測")
+            c4, c5, c6 = st.columns(3)
+            with c4: st.metric("粗利 着地予測（年）", f"¥{float(gp_forecast):,.0f}" if pd.notnull(gp_forecast) else "-")
+            with c5:
+                val = float(gp_pacing) if pd.notnull(gp_pacing) else 0
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{(val-1)*100:+.1f}%")
+            with c6: st.metric("昨年度実績（年）", f"¥{float(gp_py):,.0f}" if pd.notnull(gp_py) else "-")
+            
+            st.divider()
+
+        # 2. ワーストランキング取得 (New!)
+        st.subheader("📉 売上減少要因（ワースト商品ランキング）")
+        st.caption("前年同期と比較して、売上減少額が大きい商品トップ50")
         
-        # --- 売上 KPI ---
-        sales_forecast = row.get("sales_forecast_total")
-        sales_pacing = row.get("pacing_rate")
-        sales_py = row.get("sales_amount_py_total")
+        df_rank = query_df_safe(
+            client,
+            f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 50", # Top 50
+            label="ワーストランキング",
+            use_bqstorage=opts["use_bqstorage"],
+            timeout_sec=opts["timeout_sec"],
+            cache_key=cache_key
+        )
         
-        st.markdown("##### ■ 売上予測")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if pd.notnull(sales_forecast):
-                st.metric("売上 着地予測（年）", f"¥{float(sales_forecast):,.0f}")
-            else:
-                st.metric("売上 着地予測（年）", "-")
-        with c2:
-            if pd.notnull(sales_pacing):
-                val = float(sales_pacing)
-                delta = (val - 1.0) * 100
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
-            else:
-                st.metric("対前年ペース", "-")
-        with c3:
-            if pd.notnull(sales_py):
-                st.metric("昨年度実績（年）", f"¥{float(sales_py):,.0f}")
-            else:
-                st.metric("昨年度実績（年）", "-")
-
-        # --- 粗利 KPI ---
-        gp_forecast = row.get("gp_forecast_total")
-        gp_pacing = row.get("gp_pacing_rate")
-        gp_py = row.get("gross_profit_py_total")
-
-        st.markdown("##### ■ 粗利予測")
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            if pd.notnull(gp_forecast):
-                st.metric("粗利 着地予測（年）", f"¥{float(gp_forecast):,.0f}", help="現在の利益率ベースでの年度末見込み")
-            else:
-                st.metric("粗利 着地予測（年）", "-")
-        with c5:
-            if pd.notnull(gp_pacing):
-                val = float(gp_pacing)
-                delta = (val - 1.0) * 100
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
-            else:
-                st.metric("対前年ペース", "-")
-        with c6:
-            if pd.notnull(gp_py):
-                st.metric("昨年度実績（年）", f"¥{float(gp_py):,.0f}")
-            else:
-                st.metric("昨年度実績（年）", "-")
-
-        st.divider()
-
-        df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
-        st.dataframe(df_org, use_container_width=True)
+        if df_rank.empty:
+            st.info("減少商品データはありません。")
+        else:
+            # 表示用に整形
+            df_disp = rename_columns_for_display(df_rank, JP_COLS_RANK)
+            # フォーマット指定
+            st.dataframe(
+                df_disp,
+                column_config={
+                    "売上差額(Impact)": st.column_config.NumberColumn(format="¥%d", help="前年同期との差額（マイナスが大きいほど悪影響）"),
+                    "売上(今年)": st.column_config.NumberColumn(format="¥%d"),
+                    "売上(前年)": st.column_config.NumberColumn(format="¥%d"),
+                    "前年比": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+                use_container_width=True,
+                height=400
+            )
 
 
 def render_fytd_me_section(
