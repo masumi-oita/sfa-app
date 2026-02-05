@@ -516,9 +516,6 @@ LIMIT 2000
     return pd.DataFrame()
 
 
-# ----------------------------------------
-# UI Components
-# ----------------------------------------
 def render_fytd_org_section(
     client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
 ):
@@ -536,75 +533,44 @@ def render_fytd_org_section(
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
         )
-        df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
+        
         if df_org.empty:
             st.info("全社FYTDは0件です。")
-        else:
-            st.dataframe(df_org, use_container_width=True)
-
-
-def render_fytd_me_section(
-    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
-):
-    st.subheader("👤 年度累計（FYTD）｜自分")
-    if st.button("自分FYTDを読み込む", key="btn_fytd_me", use_container_width=True):
-        df_me = run_scoped_then_fallback(
-            title="自分FYTD",
-            client=client,
-            cache_key=cache_key,
-            table_fqn=VIEW_FYTD_ME,      # ★v_staff_fytd_summary_scoped
-            scope_col="login_email",     # ★login_email
-            login_email=login_email,
-            allow_org_fallback=False,    # ★自分用はfallback禁止
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-        )
-        
-        if df_me.empty:
-            st.warning("自分FYTDが0件です。")
             return
 
-        # ★ KPI表示: 着地予測 & ペース
-        # 1行目（自分のデータ）を使用
-        row = df_me.iloc[0]
-        
-        # 数値取得（安全に）
+        # ★ KPI表示: 着地予測 & ペース (全社版)
+        row = df_org.iloc[0]
         forecast = row.get("sales_forecast_total")
         pacing = row.get("pacing_rate")
         sales_py_total = row.get("sales_amount_py_total")
         
-        # メトリクス表示
         kpi_cols = st.columns(3)
         with kpi_cols[0]:
             if pd.notnull(forecast):
                 val = float(forecast)
-                st.metric("着地予測（年）", f"¥{val:,.0f}", help="現在のペースで推移した場合の年度末予測")
+                st.metric("全社着地予測（年）", f"¥{val:,.0f}", help="全社の年度末着地見込み")
             else:
-                st.metric("着地予測（年）", "-")
+                st.metric("全社着地予測（年）", "-")
                 
         with kpi_cols[1]:
             if pd.notnull(pacing):
                 val = float(pacing)
-                # 1.05 -> +5.0%
                 delta = (val - 1.0) * 100
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%", help="前年同期間に対する進捗率（季節性考慮済）")
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
             else:
                 st.metric("対前年ペース", "-")
 
         with kpi_cols[2]:
              if pd.notnull(sales_py_total):
                 val = float(sales_py_total)
-                st.metric("前年実績（年）", f"¥{val:,.0f}", help="前年度の年間確定数字")
+                st.metric("昨年度実績（年）", f"¥{val:,.0f}", help="昨年度の全社確定売上")
              else:
-                st.metric("前年実績（年）", "-")
+                st.metric("昨年度実績（年）", "-")
 
         st.divider()
-        
-        # テーブル表示
-        df_display = rename_columns_for_display(df_me, JP_COLS_FYTD)
-        st.dataframe(df_display, use_container_width=True)
 
+        df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
+        st.dataframe(df_org, use_container_width=True)
 
 def render_yoy_section(
     client: bigquery.Client, cache_key: Any, login_email: str, allow_org_fallback: bool, opts: Dict[str, Any]
