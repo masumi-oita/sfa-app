@@ -1,15 +1,11 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.4.8
+SFA｜入口高速版（判断専用） - OS v1.4.8 (Fix)
 
-★今回のアップデート（着地予測 & GAS連携完全対応版）
-- 心臓部（GAS）による日次更新データを前提に動作
-- BigQuery VIEW (v_staff_fytd_summary_scoped) の新カラムに対応
-    - sales_forecast_total (着地予測)
-    - pacing_rate (対前年ペース)
-    - sales_amount_py_total (前年実績)
-- UI: 自分FYTDセクションにKPIメトリクス（着地予測）を強調表示
+★修正点
+- 欠落していた render_fytd_me_section 関数を復元
+- 着地予測KPI（全社・個人）表示ロジックを完備
 """
 
 from __future__ import annotations
@@ -41,7 +37,7 @@ VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 
 # 全社FYTD（管理者用）
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-# 自分FYTD（全員用）★着地予測入り本線
+# 自分FYTD（全員用）
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 
 # 当月YoY（得意先ランキング）
@@ -516,6 +512,9 @@ LIMIT 2000
     return pd.DataFrame()
 
 
+# ----------------------------------------
+# UI Components
+# ----------------------------------------
 def render_fytd_org_section(
     client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
 ):
@@ -571,6 +570,64 @@ def render_fytd_org_section(
 
         df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
         st.dataframe(df_org, use_container_width=True)
+
+
+def render_fytd_me_section(
+    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
+):
+    st.subheader("👤 年度累計（FYTD）｜自分")
+    if st.button("自分FYTDを読み込む", key="btn_fytd_me", use_container_width=True):
+        df_me = run_scoped_then_fallback(
+            title="自分FYTD",
+            client=client,
+            cache_key=cache_key,
+            table_fqn=VIEW_FYTD_ME,
+            scope_col="login_email",
+            login_email=login_email,
+            allow_org_fallback=False,
+            use_bqstorage=opts["use_bqstorage"],
+            timeout_sec=opts["timeout_sec"],
+            show_sql=opts["show_sql"],
+        )
+        
+        if df_me.empty:
+            st.warning("自分FYTDが0件です。")
+            return
+
+        # ★ KPI表示: 着地予測 & ペース (自分用)
+        row = df_me.iloc[0]
+        forecast = row.get("sales_forecast_total")
+        pacing = row.get("pacing_rate")
+        sales_py_total = row.get("sales_amount_py_total")
+        
+        kpi_cols = st.columns(3)
+        with kpi_cols[0]:
+            if pd.notnull(forecast):
+                val = float(forecast)
+                st.metric("着地予測（年）", f"¥{val:,.0f}", help="現在のペースで推移した場合の年度末予測")
+            else:
+                st.metric("着地予測（年）", "-")
+                
+        with kpi_cols[1]:
+            if pd.notnull(pacing):
+                val = float(pacing)
+                delta = (val - 1.0) * 100
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
+            else:
+                st.metric("対前年ペース", "-")
+
+        with kpi_cols[2]:
+             if pd.notnull(sales_py_total):
+                val = float(sales_py_total)
+                st.metric("前年実績（年）", f"¥{val:,.0f}", help="前年度の年間確定数字")
+             else:
+                st.metric("前年実績（年）", "-")
+
+        st.divider()
+        
+        df_display = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        st.dataframe(df_display, use_container_width=True)
+
 
 def render_yoy_section(
     client: bigquery.Client, cache_key: Any, login_email: str, allow_org_fallback: bool, opts: Dict[str, Any]
