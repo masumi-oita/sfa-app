@@ -1,11 +1,14 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.4.8 (Fix)
+SFA｜入口高速版（判断専用） - OS v1.4.9
 
-★修正点
-- 欠落していた render_fytd_me_section 関数を復元
-- 着地予測KPI（全社・個人）表示ロジックを完備
+★今回のアップデート（全社・粗利予測対応版）
+- BigQuery VIEW (v_admin_org_fytd_summary_scoped) の新カラムに対応
+    - gp_forecast_total (粗利着地予測)
+    - gp_pacing_rate (粗利対前年ペース)
+    - gross_profit_py_total (前年粗利実績)
+- UI: 全社タブにて「売上」と「粗利」の着地予測を並列表示
 """
 
 from __future__ import annotations
@@ -64,10 +67,14 @@ JP_COLS_FYTD = {
     "gross_profit_py_fytd": "粗利（前年FYTD）",
     "sales_diff_fytd": "前年差（売上）",
     "gp_diff_fytd": "前年差（粗利）",
-    # ★追加カラム（着地予測）
-    "sales_forecast_total": "着地予測（年）",
-    "pacing_rate": "対前年ペース",
-    "sales_amount_py_total": "前年実績（年）",
+    # ★追加カラム（売上予測）
+    "sales_forecast_total": "売上着地予測（年）",
+    "pacing_rate": "売上対前年ペース",
+    "sales_amount_py_total": "前年売上実績（年）",
+    # ★追加カラム（粗利予測）
+    "gp_forecast_total": "粗利着地予測（年）",
+    "gp_pacing_rate": "粗利対前年ペース",
+    "gross_profit_py_total": "前年粗利実績（年）",
 }
 
 JP_COLS_YOY = {
@@ -314,7 +321,6 @@ def query_df_safe(
         )
 
     except BadRequest as e:
-        # 例外時もエラー詳細を表示して落とさない
         job = None
         try:
             job_config = bigquery.QueryJobConfig()
@@ -341,7 +347,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.8｜着地予測KPI｜ロール別タブ｜遅延ロード")
+    st.caption("OS v1.4.9｜全社・粗利予測KPI｜ロール別タブ｜遅延ロード")
 
 
 def sidebar_controls() -> Dict[str, Any]:
@@ -397,7 +403,6 @@ LIMIT 1
         cache_key=cache_key,
     )
     if df.empty:
-        # ロール取得失敗時はSALES扱い
         return RoleInfo(
             login_email=login_email,
             role_key="SALES",
@@ -449,7 +454,6 @@ def run_scoped_then_fallback(
     timeout_sec: int,
     show_sql: bool,
 ) -> pd.DataFrame:
-    # 1) scoped
     sql1 = f"""
 SELECT *
 FROM `{table_fqn}`
@@ -471,7 +475,6 @@ LIMIT 2000
     if not df.empty:
         return df
 
-    # 2) fallback all
     if allow_org_fallback and scope_col in ("viewer_email", "viewer_mail", "viewer"):
         sql2 = f"""
 SELECT *
@@ -493,7 +496,6 @@ LIMIT 2000
         if not df2.empty:
             return df2
 
-    # 3) fallback no-filter
     if allow_org_fallback:
         sql3 = f"SELECT * FROM `{table_fqn}` LIMIT 2000"
         if show_sql:
@@ -512,9 +514,6 @@ LIMIT 2000
     return pd.DataFrame()
 
 
-# ----------------------------------------
-# UI Components
-# ----------------------------------------
 def render_fytd_org_section(
     client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
 ):
@@ -527,7 +526,7 @@ def render_fytd_org_section(
             table_fqn=VIEW_FYTD_ORG,
             scope_col="viewer_email",
             login_email=login_email,
-            allow_org_fallback=True,  # 全社タブなのでfallback許可
+            allow_org_fallback=True,
             use_bqstorage=opts["use_bqstorage"],
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
@@ -537,33 +536,57 @@ def render_fytd_org_section(
             st.info("全社FYTDは0件です。")
             return
 
-        # ★ KPI表示: 着地予測 & ペース (全社版)
+        # KPIデータ取得
         row = df_org.iloc[0]
-        forecast = row.get("sales_forecast_total")
-        pacing = row.get("pacing_rate")
-        sales_py_total = row.get("sales_amount_py_total")
         
-        kpi_cols = st.columns(3)
-        with kpi_cols[0]:
-            if pd.notnull(forecast):
-                val = float(forecast)
-                st.metric("全社着地予測（年）", f"¥{val:,.0f}", help="全社の年度末着地見込み")
+        # --- 売上 KPI ---
+        sales_forecast = row.get("sales_forecast_total")
+        sales_pacing = row.get("pacing_rate")
+        sales_py = row.get("sales_amount_py_total")
+        
+        st.markdown("##### ■ 売上予測")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if pd.notnull(sales_forecast):
+                st.metric("売上 着地予測（年）", f"¥{float(sales_forecast):,.0f}")
             else:
-                st.metric("全社着地予測（年）", "-")
-                
-        with kpi_cols[1]:
-            if pd.notnull(pacing):
-                val = float(pacing)
+                st.metric("売上 着地予測（年）", "-")
+        with c2:
+            if pd.notnull(sales_pacing):
+                val = float(sales_pacing)
                 delta = (val - 1.0) * 100
                 st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
             else:
                 st.metric("対前年ペース", "-")
+        with c3:
+            if pd.notnull(sales_py):
+                st.metric("昨年度実績（年）", f"¥{float(sales_py):,.0f}")
+            else:
+                st.metric("昨年度実績（年）", "-")
 
-        with kpi_cols[2]:
-             if pd.notnull(sales_py_total):
-                val = float(sales_py_total)
-                st.metric("昨年度実績（年）", f"¥{val:,.0f}", help="昨年度の全社確定売上")
-             else:
+        # --- 粗利 KPI ---
+        gp_forecast = row.get("gp_forecast_total")
+        gp_pacing = row.get("gp_pacing_rate")
+        gp_py = row.get("gross_profit_py_total")
+
+        st.markdown("##### ■ 粗利予測")
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            if pd.notnull(gp_forecast):
+                st.metric("粗利 着地予測（年）", f"¥{float(gp_forecast):,.0f}", help="現在の利益率ベースでの年度末見込み")
+            else:
+                st.metric("粗利 着地予測（年）", "-")
+        with c5:
+            if pd.notnull(gp_pacing):
+                val = float(gp_pacing)
+                delta = (val - 1.0) * 100
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
+            else:
+                st.metric("対前年ペース", "-")
+        with c6:
+            if pd.notnull(gp_py):
+                st.metric("昨年度実績（年）", f"¥{float(gp_py):,.0f}")
+            else:
                 st.metric("昨年度実績（年）", "-")
 
         st.divider()
@@ -594,7 +617,6 @@ def render_fytd_me_section(
             st.warning("自分FYTDが0件です。")
             return
 
-        # ★ KPI表示: 着地予測 & ペース (自分用)
         row = df_me.iloc[0]
         forecast = row.get("sales_forecast_total")
         pacing = row.get("pacing_rate")
@@ -721,11 +743,7 @@ def main():
     
     st.divider()
     
-    # -----------------------------
-    # ロール別 タブ表示切り替え
-    # -----------------------------
     if allow_org_fallback:
-        # 管理者系: [全社] [自分の担当]
         t1, t2 = st.tabs(["🏢 全社状況 (経営)", "👤 担当エリア/個人の成績 (行動)"])
         
         with t1:
@@ -737,7 +755,6 @@ def main():
             render_yoy_section(client, cache_key, login_email, allow_org_fallback, opts)
             
     else:
-        # SALES: [今年の成績] [得意先別] (全社は見せない)
         t1, t2 = st.tabs(["👤 今年の成績 (FYTD)", "📊 得意先別 (YoY)"])
         
         with t1:
