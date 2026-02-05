@@ -1,13 +1,15 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.4.7
+SFA｜入口高速版（判断専用） - OS v1.4.8
 
-★今回の修正（Step 1: 入口UIの洗練）
-- ロジック・データ・接続周りは v1.4.6 を完全踏襲
-- ロールに応じてタブ構成を動的に変更
-    - HQ_ADMIN / AREA_MANAGER: [全社状況] [自分の担当]
-    - SALES: [今年の成績(FYTD)] [得意先別(YoY)]
+★今回のアップデート（着地予測 & GAS連携完全対応版）
+- 心臓部（GAS）による日次更新データを前提に動作
+- BigQuery VIEW (v_staff_fytd_summary_scoped) の新カラムに対応
+    - sales_forecast_total (着地予測)
+    - pacing_rate (対前年ペース)
+    - sales_amount_py_total (前年実績)
+- UI: 自分FYTDセクションにKPIメトリクス（着地予測）を強調表示
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 
 # 全社FYTD（管理者用）
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-# 自分FYTD（全員用）★前年差が出る本線
+# 自分FYTD（全員用）★着地予測入り本線
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 
 # 当月YoY（得意先ランキング）
@@ -57,7 +59,7 @@ JP_COLS_FYTD = {
     "display_name": "担当者名",
     "role_tier": "ロール",
     "area_name": "エリア",
-    "current_month": "当月（月初）",
+    "current_month": "基準日",
     "fy_start": "年度開始",
     "sales_amount_fytd": "売上（FYTD）",
     "gross_profit_fytd": "粗利（FYTD）",
@@ -66,6 +68,10 @@ JP_COLS_FYTD = {
     "gross_profit_py_fytd": "粗利（前年FYTD）",
     "sales_diff_fytd": "前年差（売上）",
     "gp_diff_fytd": "前年差（粗利）",
+    # ★追加カラム（着地予測）
+    "sales_forecast_total": "着地予測（年）",
+    "pacing_rate": "対前年ペース",
+    "sales_amount_py_total": "前年実績（年）",
 }
 
 JP_COLS_YOY = {
@@ -339,7 +345,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.7｜UI洗練（ロール別タブ）｜遅延ロード｜timeout/Storage API 切替")
+    st.caption("OS v1.4.8｜着地予測KPI｜ロール別タブ｜遅延ロード")
 
 
 def sidebar_controls() -> Dict[str, Any]:
@@ -395,7 +401,7 @@ LIMIT 1
         cache_key=cache_key,
     )
     if df.empty:
-        # ★ロールが取れない＝事故防止で SALES 扱い（全社を見せない）
+        # ロール取得失敗時はSALES扱い
         return RoleInfo(
             login_email=login_email,
             role_key="SALES",
@@ -466,13 +472,11 @@ LIMIT 2000
         timeout_sec=timeout_sec,
         cache_key=cache_key,
     )
-    st.caption(f"取得件数: {len(df)} 件（scope: {scope_col}=@login_email）")
     if not df.empty:
         return df
 
-    # 2) viewer_email系の all fallback（ただし許可された場合のみ）
+    # 2) fallback all
     if allow_org_fallback and scope_col in ("viewer_email", "viewer_mail", "viewer"):
-        st.warning("0件でした。viewer_email='all' の全社fallbackを試します。")
         sql2 = f"""
 SELECT *
 FROM `{table_fqn}`
@@ -481,7 +485,6 @@ LIMIT 2000
 """
         if show_sql:
             st.code(sql2.strip(), language="sql")
-
         df2 = query_df_safe(
             client,
             sql2,
@@ -491,17 +494,14 @@ LIMIT 2000
             timeout_sec=timeout_sec,
             cache_key=cache_key,
         )
-        st.caption(f"取得件数: {len(df2)} 件（fallback all）")
         if not df2.empty:
             return df2
 
-    # 3) WHERE無し fallback（管理者のみ許可）
+    # 3) fallback no-filter
     if allow_org_fallback:
-        st.warning("それでも0件です。WHEREを外して全社表示（管理者fallback）を試します。")
         sql3 = f"SELECT * FROM `{table_fqn}` LIMIT 2000"
         if show_sql:
             st.code(sql3.strip(), language="sql")
-
         df3 = query_df_safe(
             client,
             sql3,
@@ -511,7 +511,6 @@ LIMIT 2000
             timeout_sec=timeout_sec,
             cache_key=cache_key,
         )
-        st.caption(f"取得件数: {len(df3)} 件（fallback no-filter）")
         return df3
 
     return pd.DataFrame()
@@ -561,11 +560,50 @@ def render_fytd_me_section(
             timeout_sec=opts["timeout_sec"],
             show_sql=opts["show_sql"],
         )
-        df_me = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        
         if df_me.empty:
             st.warning("自分FYTDが0件です。")
-        else:
-            st.dataframe(df_me, use_container_width=True)
+            return
+
+        # ★ KPI表示: 着地予測 & ペース
+        # 1行目（自分のデータ）を使用
+        row = df_me.iloc[0]
+        
+        # 数値取得（安全に）
+        forecast = row.get("sales_forecast_total")
+        pacing = row.get("pacing_rate")
+        sales_py_total = row.get("sales_amount_py_total")
+        
+        # メトリクス表示
+        kpi_cols = st.columns(3)
+        with kpi_cols[0]:
+            if pd.notnull(forecast):
+                val = float(forecast)
+                st.metric("着地予測（年）", f"¥{val:,.0f}", help="現在のペースで推移した場合の年度末予測")
+            else:
+                st.metric("着地予測（年）", "-")
+                
+        with kpi_cols[1]:
+            if pd.notnull(pacing):
+                val = float(pacing)
+                # 1.05 -> +5.0%
+                delta = (val - 1.0) * 100
+                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%", help="前年同期間に対する進捗率（季節性考慮済）")
+            else:
+                st.metric("対前年ペース", "-")
+
+        with kpi_cols[2]:
+             if pd.notnull(sales_py_total):
+                val = float(sales_py_total)
+                st.metric("前年実績（年）", f"¥{val:,.0f}", help="前年度の年間確定数字")
+             else:
+                st.metric("前年実績（年）", "-")
+
+        st.divider()
+        
+        # テーブル表示
+        df_display = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        st.dataframe(df_display, use_container_width=True)
 
 
 def render_yoy_section(
