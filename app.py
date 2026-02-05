@@ -1,15 +1,13 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.4.6
+SFA｜入口高速版（判断専用） - OS v1.4.7
 
-★今回の確定修正（重要）
-- ロールで見える範囲を制御（HQ_ADMIN / AREA_MANAGER / SALES）
-- SALES は全社fallback禁止（一般が全社しか見れない事故防止）
-- FYTD：全社 + 自分 の2ブロックを表示
-- 自分FYTDは v_staff_fytd_summary_scoped を参照（前年差が出る本線）
-- 表示カラムを日本語に変換（担当者名 display_name も反映）
-- BadRequest 時は job.errors / SQL / params を画面表示し、アプリを落とさない
+★今回の修正（Step 1: 入口UIの洗練）
+- ロジック・データ・接続周りは v1.4.6 を完全踏襲
+- ロールに応じてタブ構成を動的に変更
+    - HQ_ADMIN / AREA_MANAGER: [全社状況] [自分の担当]
+    - SALES: [今年の成績(FYTD)] [得意先別(YoY)]
 """
 
 from __future__ import annotations
@@ -341,7 +339,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.6｜遅延ロード｜timeout/Storage API 切替｜BadRequest詳細表示｜Secrets/貼り付け起動対応")
+    st.caption("OS v1.4.7｜UI洗練（ロール別タブ）｜遅延ロード｜timeout/Storage API 切替")
 
 
 def sidebar_controls() -> Dict[str, Any]:
@@ -420,10 +418,8 @@ LIMIT 1
 
 
 def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str], use_bqstorage: bool, timeout_sec: int):
-    st.subheader("ヘルスチェック")
-    st.write("まずここで BigQuery 接続を確定させます（SELECT 1）。")
-
-    if st.button("SELECT 1（接続チェック）", use_container_width=True, type="primary"):
+    st.sidebar.divider()
+    if st.sidebar.button("ヘルスチェック (SELECT 1)"):
         df = query_df_safe(
             client,
             "SELECT 1 AS ok",
@@ -433,10 +429,10 @@ def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str]
             timeout_sec=timeout_sec,
             cache_key=cache_key,
         )
-        if df.empty:
-            return
-        st.success("OK（BigQuery 接続成功）")
-        st.dataframe(df, use_container_width=True)
+        if not df.empty:
+            st.sidebar.success("BigQuery: OK")
+        else:
+            st.sidebar.error("BigQuery: NG")
 
 
 def run_scoped_then_fallback(
@@ -521,6 +517,125 @@ LIMIT 2000
     return pd.DataFrame()
 
 
+# ----------------------------------------
+# UI Components
+# ----------------------------------------
+def render_fytd_org_section(
+    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
+):
+    st.subheader("🏢 年度累計（FYTD）｜全社")
+    if st.button("全社FYTDを読み込む", key="btn_fytd_org", use_container_width=True):
+        df_org = run_scoped_then_fallback(
+            title="全社FYTD",
+            client=client,
+            cache_key=cache_key,
+            table_fqn=VIEW_FYTD_ORG,
+            scope_col="viewer_email",
+            login_email=login_email,
+            allow_org_fallback=True,  # 全社タブなのでfallback許可
+            use_bqstorage=opts["use_bqstorage"],
+            timeout_sec=opts["timeout_sec"],
+            show_sql=opts["show_sql"],
+        )
+        df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
+        if df_org.empty:
+            st.info("全社FYTDは0件です。")
+        else:
+            st.dataframe(df_org, use_container_width=True)
+
+
+def render_fytd_me_section(
+    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
+):
+    st.subheader("👤 年度累計（FYTD）｜自分")
+    if st.button("自分FYTDを読み込む", key="btn_fytd_me", use_container_width=True):
+        df_me = run_scoped_then_fallback(
+            title="自分FYTD",
+            client=client,
+            cache_key=cache_key,
+            table_fqn=VIEW_FYTD_ME,      # ★v_staff_fytd_summary_scoped
+            scope_col="login_email",     # ★login_email
+            login_email=login_email,
+            allow_org_fallback=False,    # ★自分用はfallback禁止
+            use_bqstorage=opts["use_bqstorage"],
+            timeout_sec=opts["timeout_sec"],
+            show_sql=opts["show_sql"],
+        )
+        df_me = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        if df_me.empty:
+            st.warning("自分FYTDが0件です。")
+        else:
+            st.dataframe(df_me, use_container_width=True)
+
+
+def render_yoy_section(
+    client: bigquery.Client, cache_key: Any, login_email: str, allow_org_fallback: bool, opts: Dict[str, Any]
+):
+    st.subheader("📊 当月YoY（得意先ランキング）")
+    c1, c2, c3 = st.columns(3)
+    
+    with c1:
+        if st.button("YoY Top", key="btn_yoy_top", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Top",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_TOP,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+                show_sql=opts["show_sql"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です。")
+            else:
+                st.dataframe(df, use_container_width=True)
+    with c2:
+        if st.button("YoY Bottom", key="btn_yoy_btm", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Bottom",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_BOTTOM,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+                show_sql=opts["show_sql"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です。")
+            else:
+                st.dataframe(df, use_container_width=True)
+    with c3:
+        if st.button("YoY 比較不能", key="btn_yoy_unc", use_container_width=True):
+            df = run_scoped_then_fallback(
+                title="YoY Uncomparable",
+                client=client,
+                cache_key=cache_key,
+                table_fqn=VIEW_YOY_UNCOMP,
+                scope_col="login_email",
+                login_email=login_email,
+                allow_org_fallback=allow_org_fallback,
+                use_bqstorage=opts["use_bqstorage"],
+                timeout_sec=opts["timeout_sec"],
+                show_sql=opts["show_sql"],
+            )
+            df = rename_columns_for_display(df, JP_COLS_YOY)
+            if df.empty:
+                st.info("0件です。")
+            else:
+                st.dataframe(df, use_container_width=True)
+
+
+# ----------------------------------------
+# Main
+# ----------------------------------------
 def main():
     set_page()
 
@@ -539,133 +654,37 @@ def main():
 
     st.subheader("ログイン情報")
     st.write(f"**ログイン:** {role.login_email}")
-    st.write(f"**ロール:** {role.role_key}（admin_view={role.role_admin_view}, admin_edit={role.role_admin_edit}, sales_view={role.role_sales_view}）")
-    st.write(f"**エリア:** {role.area_name}")
-    st.caption("★ロール取得に失敗した場合は SALES 扱い（全社を見せない）で継続します。")
+    st.write(f"**ロール:** {role.role_key} (エリア: {role.area_name})")
 
-    # ★全社fallback許可：管理系だけ
     allow_org_fallback = role.role_key in ("HQ_ADMIN", "AREA_MANAGER")
-
+    
     st.divider()
-    st.header("入口（判断専用・高速）")
-
-    # -------------------------
-    # FYTD：全社（管理者のみ）
-    # -------------------------
-    st.subheader("年度累計（FYTD）｜全社")
+    
+    # -----------------------------
+    # ロール別 タブ表示切り替え
+    # -----------------------------
     if allow_org_fallback:
-        if st.button("全社FYTDを読み込む", use_container_width=True):
-            df_org = run_scoped_then_fallback(
-                title="全社FYTD",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_FYTD_ORG,
-                scope_col="viewer_email",
-                login_email=login_email,
-                allow_org_fallback=True,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df_org = rename_columns_for_display(df_org, JP_COLS_FYTD)
-            if df_org.empty:
-                st.info("全社FYTDは0件です。VIEW側のデータ（viewer_email='all' 等）を確認してください。")
-            else:
-                st.dataframe(df_org, use_container_width=True)
+        # 管理者系: [全社] [自分の担当]
+        t1, t2 = st.tabs(["🏢 全社状況 (経営)", "👤 担当エリア/個人の成績 (行動)"])
+        
+        with t1:
+            render_fytd_org_section(client, cache_key, login_email, opts)
+            
+        with t2:
+            render_fytd_me_section(client, cache_key, login_email, opts)
+            st.divider()
+            render_yoy_section(client, cache_key, login_email, allow_org_fallback, opts)
+            
     else:
-        st.info("あなたのロールでは全社FYTDは表示しません（SALESは自分のみ）。")
+        # SALES: [今年の成績] [得意先別] (全社は見せない)
+        t1, t2 = st.tabs(["👤 今年の成績 (FYTD)", "📊 得意先別 (YoY)"])
+        
+        with t1:
+            render_fytd_me_section(client, cache_key, login_email, opts)
+            
+        with t2:
+            render_yoy_section(client, cache_key, login_email, allow_org_fallback, opts)
 
-    st.divider()
-
-    # -------------------------
-    # FYTD：自分（全員）
-    # ★ v_staff_fytd_summary_scoped を参照（前年差が出る）
-    # -------------------------
-    st.subheader("年度累計（FYTD）｜自分")
-    if st.button("自分FYTDを読み込む", use_container_width=True):
-        df_me = run_scoped_then_fallback(
-            title="自分FYTD",
-            client=client,
-            cache_key=cache_key,
-            table_fqn=VIEW_FYTD_ME,     # ★ここが本線
-            scope_col="login_email",    # ★viewer_emailではない
-            login_email=login_email,
-            allow_org_fallback=False,   # ★自分は全社fallback禁止
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-        )
-        df_me = rename_columns_for_display(df_me, JP_COLS_FYTD)
-        if df_me.empty:
-            st.warning("自分FYTDが0件です。→ v_staff_fytd_summary_scoped の WHERE login_email を確認してください。")
-        else:
-            st.dataframe(df_me, use_container_width=True)
-
-    st.divider()
-    st.subheader("当月YoY（得意先ランキング）")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("YoY Top を読み込む", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Top",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_TOP,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,  # 管理者だけ全社fallback許可
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です（担当付与が未整備 or データなし）。")
-            else:
-                st.dataframe(df, use_container_width=True)
-
-    with c2:
-        if st.button("YoY Bottom を読み込む", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Bottom",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_BOTTOM,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です（担当付与が未整備 or データなし）。")
-            else:
-                st.dataframe(df, use_container_width=True)
-
-    with c3:
-        if st.button("YoY 比較不能 を読み込む", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Uncomparable",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_UNCOMP,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です（担当付与が未整備 or データなし）。")
-            else:
-                st.dataframe(df, use_container_width=True)
-
-    st.caption("BadRequest が出たら job.errors / SQL / params を画面に出します（アプリは落ちません）。")
     st.caption("※ VIEWを置き換えた直後に表示がズレる場合は『キャッシュをクリア（cache_data）』→再読込してください。")
 
 
