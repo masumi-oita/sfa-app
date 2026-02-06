@@ -1,12 +1,24 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.5.0
+SFA｜入口高速版（判断専用） - OS v1.6.0
 
-★今回のアップデート（減少要因分析の実装）
-- BigQuery VIEW (v_admin_product_yoy_worst_ranking) を連携
-- 全社タブの下部に「売上減少要因（ワースト商品ランキング）」を追加
-- どの商品が前年比で大きく落ち込んでいるかを金額（Impact）順に表示
+【システム構成定義】
+- Backend: Google BigQuery (asia-northeast1)
+- Frontend: Streamlit
+- Logic:
+    1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
+    2. Forecasting: Pacing Method (Sales & Gross Profit)
+    3. Analysis: Worst Impact Ranking (Direct Raw Access)
+    4. Recommendation: Gap Analysis (Manufacturer Based) ★New!
+
+【参照VIEW一覧】
+- v_dim_staff_role_dedup: 権限管理
+- v_admin_org_fytd_summary_scoped: 全社KPI・着地予測
+- v_admin_product_yoy_worst_ranking: 全社減少要因分析
+- v_staff_fytd_summary_scoped: 個人KPI
+- v_sales_customer_yoy_*: 得意先別ランキング
+- v_sales_recommendation_engine: 戦略提案エンジン ★New!
 """
 
 from __future__ import annotations
@@ -24,6 +36,9 @@ from google.oauth2 import service_account
 from google.api_core.exceptions import BadRequest, GoogleAPICallError
 
 
+# -----------------------------
+# Configuration & Constants
+# -----------------------------
 APP_TITLE = "SFA｜入口高速版（判断専用）"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
@@ -31,28 +46,29 @@ CACHE_TTL_SEC = 300
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
-# -----------------------------
-# BigQuery Views（FQN）
-# -----------------------------
+# BigQuery Views (FQN)
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 
-# 全社FYTD（管理者用）
+# Admin / Org Views
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-# ★売上減少要因（ワーストランキング）
 VIEW_WORST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_worst_ranking"
 
-# 自分FYTD（全員用）
+# Staff / Personal Views
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
-
-# 当月YoY（得意先ランキング）
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 
+# ★ Recommendation View
+VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
+# Fact table for Drilldown List
+VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
+
 
 # -----------------------------
-# 日本語ラベル（表示専用）
+# Display Mappings (Japanese)
 # -----------------------------
+# KPI Card Columns
 JP_COLS_FYTD = {
     "viewer_email": "閲覧者メール",
     "login_email": "ログインメール",
@@ -68,7 +84,7 @@ JP_COLS_FYTD = {
     "gross_profit_py_fytd": "粗利（前年FYTD）",
     "sales_diff_fytd": "前年差（売上）",
     "gp_diff_fytd": "前年差（粗利）",
-    # 着地予測
+    # Forecasts
     "sales_forecast_total": "売上着地予測（年）",
     "pacing_rate": "売上対前年ペース",
     "sales_amount_py_total": "前年売上実績（年）",
@@ -77,7 +93,7 @@ JP_COLS_FYTD = {
     "gross_profit_py_total": "前年粗利実績（年）",
 }
 
-# ★ワーストランキング用ラベル
+# Ranking Columns (Worst Analysis)
 JP_COLS_RANK = {
     "jan": "JANコード",
     "product_name": "商品名",
@@ -90,6 +106,7 @@ JP_COLS_RANK = {
     "gp_diff": "粗利差額(Impact)"
 }
 
+# Customer Ranking Columns
 JP_COLS_YOY = {
     "login_email": "ログインメール",
     "display_name": "担当者名",
@@ -106,12 +123,12 @@ JP_COLS_YOY = {
     "gp_diff_yoy": "前年差（粗利）",
     "sales_yoy_rate": "前年同月比（売上）",
     "gp_yoy_rate": "前年同月比（粗利）",
-    "pri_gp_abs": "優先度：粗利額",
-    "pri_gp_rate_abs": "優先度：粗利率",
-    "pri_sales_abs": "優先度：売上",
 }
 
 
+# -----------------------------
+# Utility Functions
+# -----------------------------
 def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -120,7 +137,7 @@ def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.
 
 
 # -----------------------------
-# Role
+# Role Management
 # -----------------------------
 @dataclass(frozen=True)
 class RoleInfo:
@@ -140,7 +157,7 @@ def normalize_role_key(role_key: str) -> str:
 
 
 # -----------------------------
-# Secrets / Client
+# BigQuery Client & Auth
 # -----------------------------
 def _secrets_has_bigquery() -> bool:
     if "bigquery" not in st.secrets:
@@ -160,10 +177,10 @@ def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
 def _parse_service_account_json(text: str) -> Dict[str, Any]:
     obj = json.loads(text)
     if not isinstance(obj, dict):
-        raise ValueError("JSONの形式が不正です（dictではありません）")
+        raise ValueError("JSON format invalid.")
     for k in ["type", "project_id", "private_key", "client_email"]:
         if k not in obj:
-            raise ValueError(f"サービスアカウントJSONに {k} がありません")
+            raise ValueError(f"Service Account JSON missing key: {k}")
     return obj
 
 
@@ -172,60 +189,26 @@ def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
 
     if _secrets_has_bigquery():
         project_id, location, sa = _get_bq_from_secrets()
-        st.sidebar.success("Secrets: OK（st.secrets から BigQuery 設定を読み込み）")
+        st.sidebar.success("Secrets: OK")
         return project_id, location, sa
 
-    st.sidebar.warning("Secrets が未設定です。下で『サービスアカウントJSON貼り付け』で暫定接続できます。")
+    st.sidebar.warning("Secrets 未設定。JSON貼り付けモードで動作します。")
 
-    with st.expander("（推奨）Streamlit Cloud Secrets 設定テンプレ", expanded=False):
-        template = f"""[bigquery]
-project_id = "{PROJECT_DEFAULT}"
-location = "{DEFAULT_LOCATION}"
-
-[bigquery.service_account]
-type = "service_account"
-project_id = "{PROJECT_DEFAULT}"
-private_key_id = "YOUR_PRIVATE_KEY_ID"
-private_key = "-----BEGIN PRIVATE KEY-----\\nYOUR_KEY_BODY\\n-----END PRIVATE KEY-----\\n"
-client_email = "YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com"
-client_id = "YOUR_CLIENT_ID"
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/YOUR_SA%40YOUR_PROJECT.iam.gserviceaccount.com"
-universe_domain = "googleapis.com"
-
-default_login_email = "masumi@example.com"
-"""
-        st.code(template, language="toml")
-        st.caption("private_key は複数行ではなく \\n を含む1行文字列にしてください。")
-
-    st.markdown("### サービスアカウントJSON貼り付け（暫定・セッション限定）")
-    st.caption("※ Secrets に入れるのが本番推奨。ここは“いま動かして原因切り分け”用です。")
-
-    project_id = st.sidebar.text_input("project_id（暫定）", value=PROJECT_DEFAULT)
-    location = st.sidebar.text_input("location（暫定）", value=DEFAULT_LOCATION)
-
-    sa_text = st.sidebar.text_area(
-        "サービスアカウントJSON（貼り付け）",
-        value="",
-        height=200,
-        placeholder='{"type":"service_account", ... } を丸ごと貼り付け',
-    )
+    project_id = st.sidebar.text_input("project_id (Temporary)", value=PROJECT_DEFAULT)
+    location = st.sidebar.text_input("location (Temporary)", value=DEFAULT_LOCATION)
+    sa_text = st.sidebar.text_area("Service Account JSON", height=100)
 
     if not sa_text.strip():
-        st.info("左サイドバーにサービスアカウントJSONを貼り付けると接続できるようになります。")
+        st.info("SA JSONを入力してください。")
         st.stop()
 
     try:
         sa = _parse_service_account_json(sa_text.strip())
     except Exception as e:
-        st.error("サービスアカウントJSONの読み取りに失敗しました。")
-        st.write(str(e))
+        st.error(f"JSON Parse Error: {e}")
         st.stop()
 
     sa["project_id"] = project_id.strip() or sa.get("project_id")
-    st.sidebar.success("貼り付けJSON: OK（このセッション中のみ有効）")
     return str(project_id), str(location), sa
 
 
@@ -235,8 +218,11 @@ def get_bq_client(project_id: str, location: str, sa: Dict[str, Any]) -> bigquer
     return bigquery.Client(project=project_id, credentials=creds, location=location)
 
 
+# -----------------------------
+# Query Execution Helpers
+# -----------------------------
 def _build_query_parameters(params: Optional[Dict[str, Any]]) -> List[bigquery.ScalarQueryParameter]:
-    qparams: List[bigquery.ScalarQueryParameter] = []
+    qparams = []
     if not params:
         return qparams
     for k, v in params.items():
@@ -253,43 +239,20 @@ def _build_query_parameters(params: Optional[Dict[str, Any]]) -> List[bigquery.S
     return qparams
 
 
-def _show_bq_error_context(
-    title: str,
-    sql: str,
-    params: Optional[Dict[str, Any]],
-    job: Optional[bigquery.job.QueryJob],
-    exc: Exception,
-) -> None:
-    st.error(f"BigQuery クエリ失敗：{title}")
-    st.write("**発生時刻:**", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    st.write("**params:**")
-    st.code(json.dumps(params or {}, ensure_ascii=False, indent=2), language="json")
-
-    if job is not None:
-        st.write("**job_id:**", getattr(job, "job_id", None))
-        st.write("**location:**", getattr(job, "location", None))
-        if getattr(job, "errors", None):
-            st.write("**job.errors（最重要）:**")
-            st.json(job.errors)
-
-    st.write("**sql:**")
-    st.code(sql, language="sql")
-    st.write("**exception:**", str(exc))
+def _show_bq_error_context(title: str, sql: str, exc: Exception):
+    st.error(f"Query Failed: {title}")
+    st.write(f"Exception: {exc}")
+    # st.code(sql, language="sql") # Debug
 
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
 def cached_query_df(
-    project_id: str,
-    location: str,
-    sa_json: str,
-    sql: str,
-    params_json: str,
-    use_bqstorage: bool,
-    timeout_sec: int,
+    project_id: str, location: str, sa_json: str, sql: str, params_json: str,
+    use_bqstorage: bool, timeout_sec: int
 ) -> pd.DataFrame:
     sa = json.loads(sa_json)
     client = get_bq_client(project_id, location, sa)
-
+    
     params = json.loads(params_json) if params_json else {}
     job_config = bigquery.QueryJobConfig()
     qparams = _build_query_parameters(params)
@@ -302,18 +265,18 @@ def cached_query_df(
 
 
 def query_df_safe(
-    client: bigquery.Client,
-    sql: str,
-    params: Optional[Dict[str, Any]] = None,
-    label: str = "",
-    use_bqstorage: bool = True,
-    timeout_sec: int = 60,
-    cache_key: Optional[Tuple[str, str, str]] = None,
+    client: bigquery.Client, sql: str, params: Optional[Dict[str, Any]] = None,
+    label: str = "", use_bqstorage: bool = True, timeout_sec: int = 60,
+    cache_key: Optional[Tuple[str, str, str]] = None
 ) -> pd.DataFrame:
     params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
-
     try:
-        if cache_key is None:
+        if cache_key:
+            project_id, location, sa_json = cache_key
+            return cached_query_df(
+                project_id, location, sa_json, sql, params_json, use_bqstorage, timeout_sec
+            )
+        else:
             job_config = bigquery.QueryJobConfig()
             qparams = _build_query_parameters(params or {})
             if qparams:
@@ -322,281 +285,122 @@ def query_df_safe(
             job.result(timeout=timeout_sec)
             return job.to_dataframe(create_bqstorage_client=use_bqstorage)
 
-        project_id, location, sa_json = cache_key
-        return cached_query_df(
-            project_id=project_id,
-            location=location,
-            sa_json=sa_json,
-            sql=sql,
-            params_json=params_json,
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-        )
-
-    except BadRequest as e:
-        job = None
-        try:
-            job_config = bigquery.QueryJobConfig()
-            qparams = _build_query_parameters(params or {})
-            if qparams:
-                job_config.query_parameters = qparams
-            job = client.query(sql, job_config=job_config)
-            job.result(timeout=timeout_sec)
-        except Exception as e2:
-            _show_bq_error_context(label or "query_df_safe", sql, params, job, e2)
-            return pd.DataFrame()
-        _show_bq_error_context(label or "query_df_safe", sql, params, job, e)
-        return pd.DataFrame()
-
-    except GoogleAPICallError as e:
-        _show_bq_error_context(label or "query_df_safe", sql, params, None, e)
-        return pd.DataFrame()
-
-    except Exception as e:
-        _show_bq_error_context(label or "query_df_safe", sql, params, None, e)
+    except (BadRequest, GoogleAPICallError, Exception) as e:
+        _show_bq_error_context(label, sql, e)
         return pd.DataFrame()
 
 
+# -----------------------------
+# Component: User Interface
+# -----------------------------
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.5.0｜全社ワースト分析｜着地予測｜ロール別")
-
+    st.caption("OS v1.6.0｜戦略提案｜ワースト分析｜着地予測")
 
 def sidebar_controls() -> Dict[str, Any]:
-    st.sidebar.header("設定（切り分け）")
-    use_bqstorage = st.sidebar.toggle("BigQuery Storage API を使う（高速）", value=True)
-    timeout_sec = st.sidebar.slider("クエリタイムアウト（秒）", min_value=10, max_value=300, value=60, step=10)
-    show_sql = st.sidebar.toggle("SQL を表示する（デバッグ）", value=False)
-    if st.sidebar.button("キャッシュをクリア（cache_data）"):
+    st.sidebar.header("System Settings")
+    use_bqstorage = st.sidebar.toggle("Use Storage API (Fast)", value=True)
+    timeout_sec = st.sidebar.slider("Query Timeout (sec)", 10, 300, 60, 10)
+    show_sql = st.sidebar.toggle("Show SQL (Debug)", value=False)
+    if st.sidebar.button("Clear Cache"):
         st.cache_data.clear()
-        st.sidebar.success("cache_data をクリアしました")
+        st.sidebar.success("Cache Cleared.")
     return {"use_bqstorage": use_bqstorage, "timeout_sec": timeout_sec, "show_sql": show_sql}
 
-
 def get_login_email_ui() -> str:
-    st.sidebar.header("ログイン（暫定）")
-    default_email = ""
-    if "default_login_email" in st.secrets:
-        default_email = st.secrets.get("default_login_email", "")
-    login_email = st.sidebar.text_input("login_email（メール）", value=default_email, placeholder="例: masumi@example.com")
-    login_email = (login_email or "").strip()
+    st.sidebar.header("Login Simulation")
+    default_email = st.secrets.get("default_login_email", "") if "default_login_email" in st.secrets else ""
+    login_email = st.sidebar.text_input("Login Email", value=default_email).strip()
     if not login_email:
-        st.info("左サイドバーで login_email を入力してください（暫定ログイン）。")
+        st.info("Please enter login email.")
         st.stop()
     return login_email
 
-
-def resolve_role(
-    client: bigquery.Client,
-    cache_key: Tuple[str, str, str],
-    login_email: str,
-    use_bqstorage: bool,
-    timeout_sec: int,
-) -> RoleInfo:
+def resolve_role(client, cache_key, login_email, opts) -> RoleInfo:
     sql = f"""
-SELECT
-  login_email,
-  role_tier AS role_key,
-  role_admin_view,
-  role_admin_edit,
-  role_sales_view,
-  IFNULL(area_name, "未設定") AS area_name
-FROM `{VIEW_ROLE}`
-WHERE login_email = @login_email
-LIMIT 1
-"""
-    df = query_df_safe(
-        client,
-        sql,
-        params={"login_email": login_email},
-        label="ロール取得",
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
-    )
+    SELECT login_email, role_tier, role_admin_view, area_name
+    FROM `{VIEW_ROLE}` WHERE login_email = @login_email LIMIT 1
+    """
+    df = query_df_safe(client, sql, {"login_email": login_email}, "Role Check",
+                       opts["use_bqstorage"], opts["timeout_sec"], cache_key)
     if df.empty:
-        return RoleInfo(
-            login_email=login_email,
-            role_key="SALES",
-            role_admin_view=False,
-            role_admin_edit=False,
-            role_sales_view=True,
-            area_name="未設定",
-        )
-
-    r = df.iloc[0].to_dict()
-    role_key = normalize_role_key(str(r.get("role_key", "SALES")))
+        return RoleInfo(login_email=login_email)
+    
+    r = df.iloc[0]
     return RoleInfo(
         login_email=login_email,
-        role_key=role_key,
-        role_admin_view=bool(r.get("role_admin_view", False)),
-        role_admin_edit=bool(r.get("role_admin_edit", False)),
-        role_sales_view=bool(r.get("role_sales_view", True)),
-        area_name=str(r.get("area_name", "未設定")),
+        role_key=normalize_role_key(str(r.get("role_tier"))),
+        role_admin_view=bool(r.get("role_admin_view")),
+        area_name=str(r.get("area_name", "未設定"))
     )
 
+def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, opts, allow_fallback=False):
+    sql = sql_template.replace("__WHERE__", f"WHERE {scope_col} = @login_email")
+    if opts["show_sql"]: st.code(sql, language="sql")
+    df = query_df_safe(client, sql, {"login_email": login_email}, "Scoped Query",
+                       opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    if not df.empty: return df
 
-def render_health_check(client: bigquery.Client, cache_key: Tuple[str, str, str], use_bqstorage: bool, timeout_sec: int):
-    st.sidebar.divider()
-    if st.sidebar.button("ヘルスチェック (SELECT 1)"):
-        df = query_df_safe(
-            client,
-            "SELECT 1 AS ok",
-            params=None,
-            label="SELECT 1 ヘルスチェック",
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-            cache_key=cache_key,
-        )
-        if not df.empty:
-            st.sidebar.success("BigQuery: OK")
-        else:
-            st.sidebar.error("BigQuery: NG")
-
-
-def run_scoped_then_fallback(
-    title: str,
-    client: bigquery.Client,
-    cache_key: Tuple[str, str, str],
-    table_fqn: str,
-    scope_col: str,
-    login_email: str,
-    allow_org_fallback: bool,
-    use_bqstorage: bool,
-    timeout_sec: int,
-    show_sql: bool,
-) -> pd.DataFrame:
-    sql1 = f"""
-SELECT *
-FROM `{table_fqn}`
-WHERE {scope_col} = @login_email
-LIMIT 2000
-"""
-    if show_sql:
-        st.code(sql1.strip(), language="sql")
-
-    df = query_df_safe(
-        client,
-        sql1,
-        params={"login_email": login_email},
-        label=title,
-        use_bqstorage=use_bqstorage,
-        timeout_sec=timeout_sec,
-        cache_key=cache_key,
-    )
-    if not df.empty:
-        return df
-
-    if allow_org_fallback and scope_col in ("viewer_email", "viewer_mail", "viewer"):
-        sql2 = f"""
-SELECT *
-FROM `{table_fqn}`
-WHERE {scope_col} = "all"
-LIMIT 2000
-"""
-        if show_sql:
-            st.code(sql2.strip(), language="sql")
-        df2 = query_df_safe(
-            client,
-            sql2,
-            params=None,
-            label=title + "（fallback all）",
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-            cache_key=cache_key,
-        )
-        if not df2.empty:
-            return df2
-
-    if allow_org_fallback:
-        sql3 = f"SELECT * FROM `{table_fqn}` LIMIT 2000"
-        if show_sql:
-            st.code(sql3.strip(), language="sql")
-        df3 = query_df_safe(
-            client,
-            sql3,
-            params=None,
-            label=title + "（fallback no-filter）",
-            use_bqstorage=use_bqstorage,
-            timeout_sec=timeout_sec,
-            cache_key=cache_key,
-        )
-        return df3
-
+    if allow_fallback:
+        sql_all = sql_template.replace("__WHERE__", f'WHERE {scope_col} = "all" OR {scope_col} IS NULL')
+        if opts["show_sql"]: st.code(sql_all, language="sql")
+        df_all = query_df_safe(client, sql_all, None, "Fallback Query",
+                               opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+        return df_all
+        
     return pd.DataFrame()
 
 
-def render_fytd_org_section(
-    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
-):
+# -----------------------------
+# Component: Render Sections
+# -----------------------------
+
+def render_fytd_org_section(client, cache_key, login_email, opts):
     st.subheader("🏢 年度累計（FYTD）｜全社")
-    if st.button("全社データを読み込む（KPI・ワースト分析）", key="btn_fytd_org", use_container_width=True):
-        # 1. KPI取得
-        df_org = run_scoped_then_fallback(
-            title="全社FYTD",
-            client=client,
-            cache_key=cache_key,
-            table_fqn=VIEW_FYTD_ORG,
-            scope_col="viewer_email",
-            login_email=login_email,
-            allow_org_fallback=True,
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-        )
+    
+    if st.button("全社データを読み込む", key="btn_org", use_container_width=True):
+        # KPI Card
+        sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
+        df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
         
         if not df_org.empty:
-            # --- KPI表示 (既存ロジック) ---
             row = df_org.iloc[0]
-            sales_forecast = row.get("sales_forecast_total")
-            sales_pacing = row.get("pacing_rate")
-            sales_py = row.get("sales_amount_py_total")
-            gp_forecast = row.get("gp_forecast_total")
-            gp_pacing = row.get("gp_pacing_rate")
-            gp_py = row.get("gross_profit_py_total")
             
             st.markdown("##### ■ 売上予測")
             c1, c2, c3 = st.columns(3)
-            with c1: st.metric("売上 着地予測（年）", f"¥{float(sales_forecast):,.0f}" if pd.notnull(sales_forecast) else "-")
+            with c1: st.metric("売上 着地予測（年）", f"¥{float(row.get('sales_forecast_total', 0)):,.0f}")
             with c2: 
-                val = float(sales_pacing) if pd.notnull(sales_pacing) else 0
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{(val-1)*100:+.1f}%")
-            with c3: st.metric("昨年度実績（年）", f"¥{float(sales_py):,.0f}" if pd.notnull(sales_py) else "-")
+                pace = float(row.get('pacing_rate', 0))
+                st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
+            with c3: st.metric("昨年度実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
 
             st.markdown("##### ■ 粗利予測")
             c4, c5, c6 = st.columns(3)
-            with c4: st.metric("粗利 着地予測（年）", f"¥{float(gp_forecast):,.0f}" if pd.notnull(gp_forecast) else "-")
+            with c4: st.metric("粗利 着地予測（年）", f"¥{float(row.get('gp_forecast_total', 0)):,.0f}")
             with c5:
-                val = float(gp_pacing) if pd.notnull(gp_pacing) else 0
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{(val-1)*100:+.1f}%")
-            with c6: st.metric("昨年度実績（年）", f"¥{float(gp_py):,.0f}" if pd.notnull(gp_py) else "-")
+                pace_gp = float(row.get('gp_pacing_rate', 0))
+                st.metric("対前年ペース", f"{pace_gp*100:.1f}%", f"{(pace_gp-1.0)*100:+.1f}%")
+            with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
             
             st.divider()
 
-        # 2. ワーストランキング取得 (New!)
+        # Worst Ranking
         st.subheader("📉 売上減少要因（ワースト商品ランキング）")
-        st.caption("前年同期と比較して、売上減少額が大きい商品トップ50")
+        st.caption("前年同期と比較して、売上減少額（Impact）が大きい商品トップ50")
         
-        df_rank = query_df_safe(
-            client,
-            f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 50", # Top 50
-            label="ワーストランキング",
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            cache_key=cache_key
-        )
+        sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 50"
+        df_rank = query_df_safe(client, sql_rank, None, "Worst Ranking",
+                                opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
         if df_rank.empty:
             st.info("減少商品データはありません。")
         else:
-            # 表示用に整形
             df_disp = rename_columns_for_display(df_rank, JP_COLS_RANK)
-            # フォーマット指定
             st.dataframe(
                 df_disp,
                 column_config={
-                    "売上差額(Impact)": st.column_config.NumberColumn(format="¥%d", help="前年同期との差額（マイナスが大きいほど悪影響）"),
+                    "売上差額(Impact)": st.column_config.NumberColumn(format="¥%d"),
                     "売上(今年)": st.column_config.NumberColumn(format="¥%d"),
                     "売上(前年)": st.column_config.NumberColumn(format="¥%d"),
                     "前年比": st.column_config.NumberColumn(format="%.1f%%"),
@@ -605,177 +409,182 @@ def render_fytd_org_section(
                 height=400
             )
 
-
-def render_fytd_me_section(
-    client: bigquery.Client, cache_key: Any, login_email: str, opts: Dict[str, Any]
-):
+def render_fytd_me_section(client, cache_key, login_email, opts):
     st.subheader("👤 年度累計（FYTD）｜自分")
-    if st.button("自分FYTDを読み込む", key="btn_fytd_me", use_container_width=True):
-        df_me = run_scoped_then_fallback(
-            title="自分FYTD",
-            client=client,
-            cache_key=cache_key,
-            table_fqn=VIEW_FYTD_ME,
-            scope_col="login_email",
-            login_email=login_email,
-            allow_org_fallback=False,
-            use_bqstorage=opts["use_bqstorage"],
-            timeout_sec=opts["timeout_sec"],
-            show_sql=opts["show_sql"],
-        )
+    if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
+        sql = f"SELECT * FROM `{VIEW_FYTD_ME}` __WHERE__ LIMIT 100"
+        df_me = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts)
         
         if df_me.empty:
-            st.warning("自分FYTDが0件です。")
+            st.warning("データがありません。")
             return
 
         row = df_me.iloc[0]
-        forecast = row.get("sales_forecast_total")
-        pacing = row.get("pacing_rate")
-        sales_py_total = row.get("sales_amount_py_total")
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("着地予測（年）", f"¥{float(row.get('sales_forecast_total', 0)):,.0f}")
+        with c2: 
+            pace = float(row.get('pacing_rate', 0))
+            st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
+        with c3: st.metric("前年実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
         
-        kpi_cols = st.columns(3)
-        with kpi_cols[0]:
-            if pd.notnull(forecast):
-                val = float(forecast)
-                st.metric("着地予測（年）", f"¥{val:,.0f}", help="現在のペースで推移した場合の年度末予測")
-            else:
-                st.metric("着地予測（年）", "-")
-                
-        with kpi_cols[1]:
-            if pd.notnull(pacing):
-                val = float(pacing)
-                delta = (val - 1.0) * 100
-                st.metric("対前年ペース", f"{val*100:.1f}%", f"{delta:+.1f}%")
-            else:
-                st.metric("対前年ペース", "-")
-
-        with kpi_cols[2]:
-             if pd.notnull(sales_py_total):
-                val = float(sales_py_total)
-                st.metric("前年実績（年）", f"¥{val:,.0f}", help="前年度の年間確定数字")
-             else:
-                st.metric("前年実績（年）", "-")
-
         st.divider()
-        
-        df_display = rename_columns_for_display(df_me, JP_COLS_FYTD)
-        st.dataframe(df_display, use_container_width=True)
+        st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
 
-
-def render_yoy_section(
-    client: bigquery.Client, cache_key: Any, login_email: str, allow_org_fallback: bool, opts: Dict[str, Any]
-):
+def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
     st.subheader("📊 当月YoY（得意先ランキング）")
     c1, c2, c3 = st.columns(3)
     
+    def _show_table(title, view_name, key):
+        if st.button(title, key=key, use_container_width=True):
+            sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
+            df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
+            if not df.empty:
+                st.dataframe(rename_columns_for_display(df, JP_COLS_YOY), use_container_width=True)
+            else:
+                st.info("0件です。")
+
+    with c1: _show_table("YoY Top (伸び)", VIEW_YOY_TOP, "btn_top")
+    with c2: _show_table("YoY Bottom (落ち)", VIEW_YOY_BOTTOM, "btn_btm")
+    with c3: _show_table("新規/比較不能", VIEW_YOY_UNCOMP, "btn_unc")
+
+def render_customer_drilldown(client, cache_key, login_email, opts):
+    """
+    v1.6.0 New Feature: Customer Gap Analysis & Recommendation
+    """
+    st.subheader("🎯 得意先別・戦略提案（AI Gap Analysis）")
+    
+    # 1. Get Customer List from Fact
+    sql_cust = f"""
+    SELECT DISTINCT customer_code, customer_name
+    FROM `{VIEW_FACT_DAILY}`
+    WHERE login_email = @login_email
+    ORDER BY customer_code
+    """
+    df_cust = query_df_safe(client, sql_cust, {"login_email": login_email}, "Cust List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    
+    if df_cust.empty:
+        st.info("担当得意先データがありません（またはログインメール不一致）。")
+        return
+
+    # 2. Select Customer
+    cust_options = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in df_cust.iterrows()}
+    selected_code = st.selectbox("分析する得意先を選択してください", options=cust_options.keys(), format_func=lambda x: cust_options[x])
+    
+    if not selected_code:
+        return
+
+    st.divider()
+    
+    # 3. Get Recommendation
+    sql_rec = f"""
+    SELECT * FROM `{VIEW_RECOMMEND}`
+    WHERE customer_code = @cust_code
+    ORDER BY priority_rank ASC
+    """
+    df_rec = query_df_safe(client, sql_rec, {"cust_code": selected_code}, "Recommendation", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    
+    # 4. Display Logic
+    c1, c2 = st.columns([1, 2])
+    
     with c1:
-        if st.button("YoY Top", key="btn_yoy_top", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Top",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_TOP,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です。")
-            else:
-                st.dataframe(df, use_container_width=True)
+        st.markdown("#### 🏥 得意先プロファイル")
+        if not df_rec.empty:
+            strong_cat = df_rec.iloc[0].get("strong_category", "-")
+            st.info(f"この得意先の主力領域(メーカー): **{strong_cat}**")
+            st.caption("※購入実績シェアNo.1のメーカー")
+        else:
+            st.warning("プロファイルデータ不足（または主要品完納済み）")
+            strong_cat = "(不明)"
+
     with c2:
-        if st.button("YoY Bottom", key="btn_yoy_btm", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Bottom",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_BOTTOM,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
+        st.markdown("#### 💡 AI提案リスト（未採用のチャンス商品）")
+        st.caption(f"全社の **{strong_cat}** 売上TOP10のうち、**未採用**の商品")
+        
+        if df_rec.empty:
+            st.success("🎉 この領域の主要商品はすべて採用済みです。")
+        else:
+            disp_df = df_rec[[
+                "priority_rank", "recommend_product", "manufacturer", "market_scale"
+            ]].rename(columns={
+                "priority_rank": "優先順位",
+                "recommend_product": "推奨商品名",
+                "manufacturer": "メーカー",
+                "market_scale": "全社売上規模"
+            })
+            
+            st.dataframe(
+                disp_df,
+                column_config={
+                    "全社売上規模": st.column_config.NumberColumn(format="¥%d")
+                },
+                use_container_width=True,
+                hide_index=True
             )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です。")
-            else:
-                st.dataframe(df, use_container_width=True)
-    with c3:
-        if st.button("YoY 比較不能", key="btn_yoy_unc", use_container_width=True):
-            df = run_scoped_then_fallback(
-                title="YoY Uncomparable",
-                client=client,
-                cache_key=cache_key,
-                table_fqn=VIEW_YOY_UNCOMP,
-                scope_col="login_email",
-                login_email=login_email,
-                allow_org_fallback=allow_org_fallback,
-                use_bqstorage=opts["use_bqstorage"],
-                timeout_sec=opts["timeout_sec"],
-                show_sql=opts["show_sql"],
-            )
-            df = rename_columns_for_display(df, JP_COLS_YOY)
-            if df.empty:
-                st.info("0件です。")
-            else:
-                st.dataframe(df, use_container_width=True)
+            
+    # 5. Reference: Adopted List
+    with st.expander("参考: 現在の採用品リストを見る"):
+        sql_adopted = f"""
+        SELECT 
+            m.product_name, 
+            SUM(t.sales_amount) as sales_fytd
+        FROM `{VIEW_FACT_DAILY}` t
+        LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m 
+            ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING)
+        WHERE t.customer_code = @cust_code
+          AND t.fiscal_year = 2025
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 100
+        """
+        df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+        st.dataframe(df_adopted, use_container_width=True)
 
 
-# ----------------------------------------
-# Main
-# ----------------------------------------
+# -----------------------------
+# Main Execution
+# -----------------------------
 def main():
     set_page()
-
+    
+    # 1. Connection
     project_id, location, sa = ensure_credentials_ui()
-    sa_json = json.dumps(sa, ensure_ascii=False, sort_keys=True)
+    sa_json = json.dumps(sa)
     cache_key = (project_id, location, sa_json)
     client = get_bq_client(project_id, location, sa)
-
+    
+    # 2. Controls
     opts = sidebar_controls()
     login_email = get_login_email_ui()
-
-    render_health_check(client, cache_key, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
+    
     st.divider()
 
-    role = resolve_role(client, cache_key, login_email, use_bqstorage=opts["use_bqstorage"], timeout_sec=opts["timeout_sec"])
-
-    st.subheader("ログイン情報")
-    st.write(f"**ログイン:** {role.login_email}")
-    st.write(f"**ロール:** {role.role_key} (エリア: {role.area_name})")
-
-    allow_org_fallback = role.role_key in ("HQ_ADMIN", "AREA_MANAGER")
+    # 3. Role Check
+    role = resolve_role(client, cache_key, login_email, opts)
+    st.write(f"**Login:** {role.login_email} / **Role:** {role.role_key} ({role.area_name})")
+    
+    is_admin = role.role_key in ("HQ_ADMIN", "AREA_MANAGER")
     
     st.divider()
     
-    if allow_org_fallback:
-        t1, t2 = st.tabs(["🏢 全社状況 (経営)", "👤 担当エリア/個人の成績 (行動)"])
-        
-        with t1:
-            render_fytd_org_section(client, cache_key, login_email, opts)
-            
+    # 4. Routing with New Tabs
+    if is_admin:
+        t1, t2, t3 = st.tabs(["🏢 全社状況", "👤 エリア/個人", "🎯 戦略提案(Beta)"])
+        with t1: render_fytd_org_section(client, cache_key, login_email, opts)
         with t2:
             render_fytd_me_section(client, cache_key, login_email, opts)
             st.divider()
-            render_yoy_section(client, cache_key, login_email, allow_org_fallback, opts)
-            
+            render_yoy_section(client, cache_key, login_email, is_admin, opts)
+        with t3:
+            # Admin sees all (or specific)
+            render_customer_drilldown(client, cache_key, login_email, opts)
+
     else:
-        t1, t2 = st.tabs(["👤 今年の成績 (FYTD)", "📊 得意先別 (YoY)"])
-        
-        with t1:
-            render_fytd_me_section(client, cache_key, login_email, opts)
-            
-        with t2:
-            render_yoy_section(client, cache_key, login_email, allow_org_fallback, opts)
+        t1, t2, t3 = st.tabs(["👤 今年の成績", "📊 得意先分析", "🎯 提案を作る"])
+        with t1: render_fytd_me_section(client, cache_key, login_email, opts)
+        with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
+        with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("※ VIEWを置き換えた直後に表示がズレる場合は『キャッシュをクリア（cache_data）』→再読込してください。")
-
+    st.caption("Updated: v1.6.0 Strategy & Recommendation")
 
 if __name__ == "__main__":
     main()
