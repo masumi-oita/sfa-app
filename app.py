@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.4 (Bug Fix: Button State Persistence)
+SFA｜入口高速版（判断専用） - OS v1.6.5 (Feature: Gross Profit Ranking)
 
-【更新内容 v1.6.4】
-- [Fix] ドリルダウン時に「全社データを読み込む」状態が解除され、初期画面に戻るバグを修正
-- データ読み込み状態を session_state で管理するように変更
-- その他、UI表示の安定化
+【更新履歴 v1.6.5】
+- ワースト分析に「利益軸（粗利）」を追加
+- 売上減少だけでなく、粗利減少（値引き過多・薬価差益縮小）の要因を特定可能に
+- ドリルダウンの挙動安定化とUIの視認性向上（カンマ区切り）を継承
 """
 
 from __future__ import annotations
@@ -243,7 +243,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.6.4｜戦略提案｜ワースト分析（Bug Fix）｜着地予測")
+    st.caption("OS v1.6.5｜戦略提案｜ワースト分析（売上・粗利）｜着地予測")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -305,15 +305,14 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
-    全社KPI + ワーストランキング分析
+    全社KPI + ワーストランキング分析 (売上・粗利対応版)
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
-    # ★修正点: ボタンの状態を session_state に保存して、再描画後も維持する
+    # ボタンの状態維持
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
         st.session_state.org_data_loaded = True
     
-    # 読み込み済みの場合のみ表示する
     if st.session_state.org_data_loaded:
         
         # KPI Card
@@ -329,10 +328,18 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 pace = float(row.get('pacing_rate', 0))
                 st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
             with c3: st.metric("昨年度実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
+            
+            st.markdown("##### ■ 粗利予測")
+            c4, c5, c6 = st.columns(3)
+            with c4: st.metric("粗利 着地予測（年）", f"¥{float(row.get('gp_forecast_total', 0)):,.0f}")
+            with c5:
+                pace_gp = float(row.get('gp_pacing_rate', 0))
+                st.metric("対前年ペース", f"{pace_gp*100:.1f}%", f"{(pace_gp-1.0)*100:+.1f}%")
+            with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
             st.divider()
 
-        # --- Interactive Worst Ranking (Stateful) ---
-        st.subheader("📉 売上減少要因（ワースト分析）")
+        # --- Interactive Worst Ranking (Sales & Profit) ---
+        st.subheader("📉 減少要因分析 (ワーストランキング)")
         
         # 1. データ取得
         sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 3000"
@@ -342,50 +349,64 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 2. 分析軸の選択
-        axis_mode = st.radio("分析軸:", ["📦 商品軸で見る", "🏥 得意先軸で見る"], horizontal=True, key="worst_axis_radio")
-        is_product_mode = "商品" in axis_mode
+        # 2. 分析軸の選択 (2軸)
+        c_axis1, c_axis2 = st.columns(2)
+        with c_axis1:
+            axis_mode = st.radio("① 集計軸:", ["📦 商品軸", "🏥 得意先軸"], horizontal=True, key="worst_axis_radio")
+            is_product_mode = "商品" in axis_mode
+        with c_axis2:
+            value_mode = st.radio("② 評価指標:", ["💰 売上金額", "💹 粗利金額"], horizontal=True, key="worst_value_radio")
+            is_sales_mode = "売上" in value_mode
+
+        # 評価指標に応じたカラム定義
+        if is_sales_mode:
+            col_target = "sales_diff"
+            col_cur = "sales_cur"
+            col_prev = "sales_prev"
+            label_diff = "売上減少額"
+            label_cur = "今年売上"
+            label_prev = "前年売上"
+        else:
+            col_target = "gp_diff"
+            col_cur = "gp_cur"
+            col_prev = "gp_prev"
+            label_diff = "粗利減少額"
+            label_cur = "今年粗利"
+            label_prev = "前年粗利"
 
         # 3. 画面分岐
         if st.session_state.worst_view_mode == 'ranking':
             # === ランキング一覧 ===
-            if is_product_mode:
-                st.markdown("**① 商品ワーストランキング**")
-                df_group = df_raw.groupby("product_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_group = df_group.sort_values("sales_diff", ascending=True)
-                
-                col_cfg = {
-                    "product_name": st.column_config.TextColumn("商品名", width="medium"),
-                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
-                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
-                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d")
-                }
-                disp_cols = ["product_name", "sales_diff", "sales_cur", "sales_prev"]
-                target_key = "product_name"
-            else:
-                st.markdown("**① 得意先ワーストランキング**")
-                df_group = df_raw.groupby("customer_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_group = df_group.sort_values("sales_diff", ascending=True)
-
-                col_cfg = {
-                    "customer_name": st.column_config.TextColumn("得意先名", width="medium"),
-                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
-                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
-                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d")
-                }
-                disp_cols = ["customer_name", "sales_diff", "sales_cur", "sales_prev"]
-                target_key = "customer_name"
-
-            st.dataframe(df_group[disp_cols], column_config=col_cfg, use_container_width=True, hide_index=True, height=400)
+            target_key = "product_name" if is_product_mode else "customer_name"
+            target_label = "商品名" if is_product_mode else "得意先名"
+            
+            st.markdown(f"**ワーストランキング ({label_diff}順)**")
+            
+            # グルーピング集計
+            df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
+            df_group = df_group.sort_values(col_target, ascending=True) # 減少額順 (マイナスが大きい順)
+            
+            col_cfg = {
+                target_key: st.column_config.TextColumn(target_label, width="medium"),
+                col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
+                col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
+                col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
+            }
+            
+            st.dataframe(
+                df_group[[target_key, col_target, col_cur, col_prev]], 
+                column_config=col_cfg, 
+                use_container_width=True, 
+                hide_index=True, 
+                height=400
+            )
 
             st.divider()
-            st.info("👇 詳細を見たい項目を選んでボタンを押してください")
             
-            # 選択ボックス
+            # ドリルダウン選択
             options_list = df_group[target_key].tolist()
-            selected_item = st.selectbox(f"分析対象を選択:", options_list, key="worst_selectbox")
+            selected_item = st.selectbox(f"詳細分析する対象を選択:", options_list, key="worst_selectbox")
 
-            # ★ここが重要: ボタンを押すと rerun するが、org_data_loaded が True なのでここに戻ってくる
             if st.button("詳細分析へ移動 ➡", type="primary"):
                 st.session_state.worst_selected_name = selected_item
                 st.session_state.worst_view_mode = 'detail'
@@ -401,34 +422,31 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 st.rerun()
 
             st.title(f"🔍 詳細分析: {target_name}")
+            st.caption(f"指標: {label_diff}")
             
             if is_product_mode:
                 df_detail = df_raw[df_raw["product_name"] == target_name].copy()
-                st.markdown("##### 得意先別 減少内訳")
                 main_col = "customer_name"
                 col_label = "得意先名"
             else:
                 df_detail = df_raw[df_raw["customer_name"] == target_name].copy()
-                st.markdown("##### 商品別 減少内訳")
                 main_col = "product_name"
                 col_label = "商品名"
             
-            df_detail = df_detail.sort_values("sales_diff", ascending=True)
+            df_detail = df_detail.sort_values(col_target, ascending=True)
 
             st.dataframe(
-                df_detail[[main_col, "sales_diff", "sales_cur", "sales_prev", "sales_rate"]],
+                df_detail[[main_col, col_target, col_cur, col_prev]],
                 column_config={
                     main_col: st.column_config.TextColumn(col_label),
-                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
-                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
-                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d"),
-                    "sales_rate": st.column_config.NumberColumn("前年比", format="%.2f")
+                    col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
+                    col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
+                    col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
                 },
                 use_container_width=True,
                 hide_index=True
             )
     else:
-        # データがまだ読み込まれていない時
         st.info("👆 上のボタンを押して全社データを読み込んでください")
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
@@ -570,8 +588,6 @@ def main():
         st.session_state.worst_view_mode = 'ranking'
     if 'worst_selected_name' not in st.session_state:
         st.session_state.worst_selected_name = None
-    
-    # ★追加: 「全社データが読み込まれたかどうか」を記憶するフラグ
     if 'org_data_loaded' not in st.session_state:
         st.session_state.org_data_loaded = False
 
@@ -615,7 +631,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.4 (Fix: Button Persistence)")
+    st.caption("Updated: v1.6.5 (Gross Profit & Stability)")
 
 if __name__ == "__main__":
     main()
