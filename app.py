@@ -1,12 +1,13 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.5 (Feature: Gross Profit Ranking)
+SFA｜戦略ダッシュボード - OS v1.7.0 (Dashboard Edition)
 
-【更新履歴 v1.6.5】
-- ワースト分析に「利益軸（粗利）」を追加
-- 売上減少だけでなく、粗利減少（値引き過多・薬価差益縮小）の要因を特定可能に
-- ドリルダウンの挙動安定化とUIの視認性向上（カンマ区切り）を継承
+【更新履歴 v1.7.0】
+- [UI] アプリ名を「SFA｜戦略ダッシュボード」に変更
+- [UI] サービスアカウントJSONの画面入力を廃止 (Secrets必須化)
+- [KPI] 売上・粗利の表示項目を拡充 (現状・昨年・予測・ギャップ)
+- [KPI] 着地予測ロジックの注釈を追加
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from google.api_core.exceptions import BadRequest, GoogleAPICallError
 # -----------------------------
 # Configuration & Constants
 # -----------------------------
-APP_TITLE = "SFA｜入口高速版（判断専用）"
+# ★変更: アプリ名をシンプルに
+APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
@@ -47,7 +49,7 @@ VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_d
 
 
 # -----------------------------
-# Display Mappings (Japanese)
+# Display Mappings
 # -----------------------------
 JP_COLS_FYTD = {
     "viewer_email": "閲覧者メール",
@@ -136,40 +138,22 @@ def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
     sa = dict(bq.get("service_account"))
     return project_id, location, sa
 
-def _parse_service_account_json(text: str) -> Dict[str, Any]:
-    obj = json.loads(text)
-    if not isinstance(obj, dict):
-        raise ValueError("JSON format invalid.")
-    for k in ["type", "project_id", "private_key", "client_email"]:
-        if k not in obj:
-            raise ValueError(f"Service Account JSON missing key: {k}")
-    return obj
-
-def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
-    st.sidebar.header("接続設定")
-    if _secrets_has_bigquery():
-        project_id, location, sa = _get_bq_from_secrets()
-        return project_id, location, sa
+# ★変更: JSON手動入力ロジックを削除し、Secretsのみにする
+def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
+    if not _secrets_has_bigquery():
+        st.error("❌ Secrets設定が見つかりません。管理者にお問い合わせください。")
+        st.stop()
+        
+    project_id, location, sa = _get_bq_from_secrets()
     
-    st.sidebar.warning("Secrets 未設定。JSON貼り付けモードで動作します。")
-    project_id = st.sidebar.text_input("project_id (Temporary)", value=PROJECT_DEFAULT)
-    location = st.sidebar.text_input("location (Temporary)", value=DEFAULT_LOCATION)
-    sa_text = st.sidebar.text_area("Service Account JSON", height=100)
-    if not sa_text.strip():
-        st.info("SA JSONを入力してください。")
-        st.stop()
-    try:
-        sa = _parse_service_account_json(sa_text.strip())
-    except Exception as e:
-        st.error(f"JSON Parse Error: {e}")
-        st.stop()
-    sa["project_id"] = project_id.strip() or sa.get("project_id")
-    return str(project_id), str(location), sa
-
-@st.cache_resource(show_spinner=False)
-def get_bq_client(project_id: str, location: str, sa: Dict[str, Any]) -> bigquery.Client:
+    # Cache key creation
+    sa_json = json.dumps(sa)
+    cache_key = (project_id, location, sa_json)
+    
     creds = service_account.Credentials.from_service_account_info(sa)
-    return bigquery.Client(project=project_id, credentials=creds, location=location)
+    client = bigquery.Client(project=project_id, credentials=creds, location=location)
+    
+    return client, project_id, location, sa_json
 
 
 # -----------------------------
@@ -202,7 +186,9 @@ def cached_query_df(
     use_bqstorage: bool, timeout_sec: int
 ) -> pd.DataFrame:
     sa = json.loads(sa_json)
-    client = get_bq_client(project_id, location, sa)
+    creds = service_account.Credentials.from_service_account_info(sa)
+    client = bigquery.Client(project=project_id, credentials=creds, location=location)
+    
     params = json.loads(params_json) if params_json else {}
     job_config = bigquery.QueryJobConfig()
     qparams = _build_query_parameters(params)
@@ -243,7 +229,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.6.5｜戦略提案｜ワースト分析（売上・粗利）｜着地予測")
+    st.caption("OS v1.7.0｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -305,7 +291,7 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
-    全社KPI + ワーストランキング分析 (売上・粗利対応版)
+    全社KPI + ワーストランキング分析 (KPI拡張版)
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
@@ -315,30 +301,50 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
     
     if st.session_state.org_data_loaded:
         
-        # KPI Card
+        # KPI Data Fetch
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
         df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
         
         if not df_org.empty:
             row = df_org.iloc[0]
-            st.markdown("##### ■ 売上予測")
-            c1, c2, c3 = st.columns(3)
-            with c1: st.metric("売上 着地予測（年）", f"¥{float(row.get('sales_forecast_total', 0)):,.0f}")
-            with c2: 
-                pace = float(row.get('pacing_rate', 0))
-                st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
-            with c3: st.metric("昨年度実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
             
-            st.markdown("##### ■ 粗利予測")
-            c4, c5, c6 = st.columns(3)
-            with c4: st.metric("粗利 着地予測（年）", f"¥{float(row.get('gp_forecast_total', 0)):,.0f}")
-            with c5:
-                pace_gp = float(row.get('gp_pacing_rate', 0))
-                st.metric("対前年ペース", f"{pace_gp*100:.1f}%", f"{(pace_gp-1.0)*100:+.1f}%")
-            with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
+            # --- 値の取得 ---
+            # 売上
+            s_cur_fytd = float(row.get('sales_amount_fytd', 0)) # ①現状
+            s_py_total = float(row.get('sales_amount_py_total', 0)) # ②昨年実績
+            s_forecast = float(row.get('sales_forecast_total', 0)) # ③着地予測
+            s_gap = s_forecast - s_py_total # ④GAP
+            
+            # 粗利
+            gp_cur_fytd = float(row.get('gross_profit_fytd', 0))
+            gp_py_total = float(row.get('gross_profit_py_total', 0))
+            gp_forecast = float(row.get('gp_forecast_total', 0))
+            gp_gap = gp_forecast - gp_py_total
+
+            # --- KPI表示 (4カラム x 2行) ---
+            
+            # Row 1: 売上
+            st.markdown("##### ■ 売上 (Sales)")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("① 現状 (FYTD)", f"¥{s_cur_fytd:,.0f}")
+            c2.metric("② 昨年度実績 (通年)", f"¥{s_py_total:,.0f}")
+            c3.metric("③ 着地予測 (通年)", f"¥{s_forecast:,.0f}", delta_color="normal")
+            c4.metric("④ GAP (予測 - 昨年)", f"¥{s_gap:,.0f}", delta=None, delta_color="off") # GAPは単純数値で
+
+            # Row 2: 粗利
+            st.markdown("##### ■ 粗利 (Gross Profit)")
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("① 現状 (FYTD)", f"¥{gp_cur_fytd:,.0f}")
+            c6.metric("② 昨年度実績 (通年)", f"¥{gp_py_total:,.0f}")
+            c7.metric("③ 着地予測 (通年)", f"¥{gp_forecast:,.0f}", delta_color="normal")
+            c8.metric("④ GAP (予測 - 昨年)", f"¥{gp_gap:,.0f}", delta=None, delta_color="off")
+
+            # 着地予測ロジックの説明
+            st.caption("※ 着地予測ロジック: 「現在の対前年進捗率」に基づき、残りの期間も同ペースで推移すると仮定して算出")
+            
             st.divider()
 
-        # --- Interactive Worst Ranking (Sales & Profit) ---
+        # --- Interactive Worst Ranking ---
         st.subheader("📉 減少要因分析 (ワーストランキング)")
         
         # 1. データ取得
@@ -349,7 +355,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 2. 分析軸の選択 (2軸)
+        # 2. 分析軸の選択
         c_axis1, c_axis2 = st.columns(2)
         with c_axis1:
             axis_mode = st.radio("① 集計軸:", ["📦 商品軸", "🏥 得意先軸"], horizontal=True, key="worst_axis_radio")
@@ -460,12 +466,16 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             return
 
         row = df_me.iloc[0]
+        
+        # 個人のKPIも同様に拡張可能ですが、スペースの都合上、一旦既存の3カラム構成を維持しつつ調整
+        s_forecast = float(row.get('sales_forecast_total', 0))
+        s_py_total = float(row.get('sales_amount_py_total', 0))
+        pace = float(row.get('pacing_rate', 0))
+
         c1, c2, c3 = st.columns(3)
-        with c1: st.metric("着地予測（年）", f"¥{float(row.get('sales_forecast_total', 0)):,.0f}")
-        with c2: 
-            pace = float(row.get('pacing_rate', 0))
-            st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
-        with c3: st.metric("前年実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
+        with c1: st.metric("着地予測（年）", f"¥{s_forecast:,.0f}")
+        with c2: st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
+        with c3: st.metric("前年実績（年）", f"¥{s_py_total:,.0f}")
         
         st.divider()
         st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
@@ -593,11 +603,9 @@ def main():
 
     set_page()
     
-    # 1. Connection
-    project_id, location, sa = ensure_credentials_ui()
-    sa_json = json.dumps(sa)
+    # 1. Connection (Secrets Only)
+    client, project_id, location, sa_json = setup_bigquery_client()
     cache_key = (project_id, location, sa_json)
-    client = get_bq_client(project_id, location, sa)
     
     # 2. Controls
     opts = sidebar_controls()
@@ -631,7 +639,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.5 (Gross Profit & Stability)")
+    st.caption("Updated: v1.7.0 (Dashboard Edition)")
 
 if __name__ == "__main__":
     main()
