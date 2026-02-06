@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.2 (UI Polish: Names over Emails)
+SFA｜戦略ダッシュボード - OS v1.7.3 (UI Polish: Commas & Totals)
 
-【更新履歴 v1.7.2】
-- [UI] 「エリア/個人」タブのテーブル表示を改善
-- 無機質な「ログインメール」を非表示にし、「担当者名」を先頭列に配置
-- YoYランキングなどのリストも担当者名ベースで可視化
+【更新履歴 v1.7.3】
+- [UI] 全ての数値テーブルに3桁カンマ区切り（¥1,234,567）を適用
+- [UI] YoYランキングや詳細分析テーブルの最下行に「合計（Total）」行を自動追加
+- [Logic] パーセント値の合計行は誤解を招くため空欄にする処理を実装
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+from pandas.api.types import is_numeric_dtype
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -99,6 +100,64 @@ def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.
         return df
     cols = {c: mapping.get(c, c) for c in df.columns}
     return df.rename(columns=cols)
+
+def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
+    """
+    データフレームの数値列を合計し、最下行に「合計」行を追加する関数
+    """
+    if df.empty:
+        return df
+        
+    # 数値カラムを特定
+    num_cols = df.select_dtypes(include=['number']).columns
+    
+    # 合計を計算
+    total_data = {}
+    for col in df.columns:
+        if col in num_cols:
+            # パーセント系の列（率、比、ペース）は合計しても意味がないのでNoneにする
+            if any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
+                total_data[col] = None
+            else:
+                total_data[col] = df[col].sum()
+        else:
+            total_data[col] = "" # 文字列カラムは空文字
+
+    # 合計行のラベル設定
+    # 指定がなければ、一番左の列に「合計」と入れる
+    target_label_col = label_col if label_col and label_col in df.columns else df.columns[0]
+    total_data[target_label_col] = "=== 合計 ==="
+    
+    # 行を追加
+    df_total = pd.DataFrame([total_data])
+    return pd.concat([df, df_total], ignore_index=True)
+
+def get_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
+    """
+    カラム名に基づいて、Streamlitの表示フォーマット（カンマ区切り等）を自動生成する関数
+    """
+    config = {}
+    for col in df.columns:
+        # 金額・数値系 -> 3桁カンマ区切り (¥マーク付き)
+        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP", "amount", "profit", "diff"]):
+            config[col] = st.column_config.NumberColumn(
+                col, format="¥%d"
+            )
+        # 率・ペース系 -> パーセント表示
+        elif any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
+            config[col] = st.column_config.NumberColumn(
+                col, format="%.1f%%"
+            )
+        # その他数値
+        elif is_numeric_dtype(df[col]):
+            config[col] = st.column_config.NumberColumn(
+                col, format="%d"
+            )
+        # テキスト系
+        else:
+            config[col] = st.column_config.TextColumn(col)
+            
+    return config
 
 
 # -----------------------------
@@ -223,7 +282,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.2｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.3｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -371,15 +430,19 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
             df_group = df_group.sort_values(col_target, ascending=True)
             
-            col_cfg = {
-                target_key: st.column_config.TextColumn(target_label, width="medium"),
-                col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
-                col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
-                col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
-            }
+            # 合計行の追加
+            df_display = append_total_row(df_group, label_col=target_key)
+            
+            # 表示設定の自動生成
+            col_cfg = get_column_config(df_display)
+            # 特定列のラベル上書き
+            col_cfg[target_key].label = target_label
+            col_cfg[col_target].label = label_diff
+            col_cfg[col_cur].label = label_cur
+            col_cfg[col_prev].label = label_prev
             
             st.dataframe(
-                df_group[[target_key, col_target, col_cur, col_prev]], 
+                df_display[[target_key, col_target, col_cur, col_prev]], 
                 column_config=col_cfg, 
                 use_container_width=True, 
                 hide_index=True, 
@@ -417,15 +480,20 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 col_label = "商品名"
             
             df_detail = df_detail.sort_values(col_target, ascending=True)
+            
+            # 合計行追加
+            df_display = append_total_row(df_detail, label_col=main_col)
+            
+            # 設定生成
+            col_cfg = get_column_config(df_display)
+            col_cfg[main_col].label = col_label
+            col_cfg[col_target].label = label_diff
+            col_cfg[col_cur].label = label_cur
+            col_cfg[col_prev].label = label_prev
 
             st.dataframe(
-                df_detail[[main_col, col_target, col_cur, col_prev]],
-                column_config={
-                    main_col: st.column_config.TextColumn(col_label),
-                    col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
-                    col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
-                    col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
-                },
+                df_display[[main_col, col_target, col_cur, col_prev]],
+                column_config=col_cfg,
                 use_container_width=True,
                 hide_index=True
             )
@@ -478,19 +546,23 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         # --- テーブル表示 (改善版) ---
         df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
         
-        # 列の並び替えロジック
+        # 列の並び替え
         cols = list(df_disp.columns)
-        
-        # 1. ログインメール、閲覧者メールを除外する
         if "ログインメール" in cols: cols.remove("ログインメール")
         if "閲覧者メール" in cols: cols.remove("閲覧者メール")
-        
-        # 2. 担当者名を先頭に移動する
         if "担当者名" in cols:
             cols.remove("担当者名")
             cols.insert(0, "担当者名")
-            
-        st.dataframe(df_disp[cols], use_container_width=True, hide_index=True)
+        
+        # カンマ区切り適用
+        col_cfg = get_column_config(df_disp[cols])
+        
+        st.dataframe(
+            df_disp[cols], 
+            use_container_width=True, 
+            hide_index=True, 
+            column_config=col_cfg
+        )
 
 def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
     st.subheader("📊 当月YoY（得意先ランキング）")
@@ -505,14 +577,23 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
                 df_disp = rename_columns_for_display(df, JP_COLS_YOY)
                 
                 cols = list(df_disp.columns)
-                # 1. メール非表示
                 if "ログインメール" in cols: cols.remove("ログインメール")
-                # 2. 担当者名を先頭へ
                 if "担当者名" in cols:
                     cols.remove("担当者名")
                     cols.insert(0, "担当者名")
                 
-                st.dataframe(df_disp[cols], use_container_width=True, hide_index=True)
+                # 合計行を追加
+                df_final = append_total_row(df_disp[cols], label_col="担当者名" if "担当者名" in cols else None)
+                
+                # カンマ区切り適用
+                col_cfg = get_column_config(df_final)
+                
+                st.dataframe(
+                    df_final, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config=col_cfg
+                )
             else:
                 st.info("0件です。")
 
@@ -578,13 +659,14 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 "market_scale": "全社売上規模"
             })
             
+            # フォーマット適用
+            col_cfg = get_column_config(disp_df)
+            
             st.dataframe(
                 disp_df,
-                column_config={
-                    "全社売上規模": st.column_config.NumberColumn(format="¥%d")
-                },
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
+                column_config=col_cfg
             )
             
     with st.expander("参考: 現在の採用品リストを見る"):
@@ -603,12 +685,13 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         """
         df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
+        renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)"})
+        col_cfg = get_column_config(renamed_df)
+        
         st.dataframe(
-            df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)"}),
+            renamed_df,
             use_container_width=True,
-            column_config={
-                "売上(FYTD)": st.column_config.NumberColumn(format="¥%d")
-            }
+            column_config=col_cfg
         )
 
 
@@ -662,7 +745,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.2 (UI Polish)")
+    st.caption("Updated: v1.7.3 (Totals & Commas)")
 
 if __name__ == "__main__":
     main()
