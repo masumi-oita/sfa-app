@@ -1,13 +1,11 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.0 (Dashboard Edition)
+SFA｜戦略ダッシュボード - OS v1.7.1 (Individual KPI Expanded)
 
-【更新履歴 v1.7.0】
-- [UI] アプリ名を「SFA｜戦略ダッシュボード」に変更
-- [UI] サービスアカウントJSONの画面入力を廃止 (Secrets必須化)
-- [KPI] 売上・粗利の表示項目を拡充 (現状・昨年・予測・ギャップ)
-- [KPI] 着地予測ロジックの注釈を追加
+【更新履歴 v1.7.1】
+- [UI] 「エリア/個人」タブのKPI表示を全社タブと同様の形式（売上/粗利 × 4指標）に拡張
+- [UI] 予算達成や昨年対比のギャップを可視化
 """
 
 from __future__ import annotations
@@ -28,7 +26,6 @@ from google.api_core.exceptions import BadRequest, GoogleAPICallError
 # -----------------------------
 # Configuration & Constants
 # -----------------------------
-# ★変更: アプリ名をシンプルに
 APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
@@ -138,7 +135,6 @@ def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
     sa = dict(bq.get("service_account"))
     return project_id, location, sa
 
-# ★変更: JSON手動入力ロジックを削除し、Secretsのみにする
 def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
     if not _secrets_has_bigquery():
         st.error("❌ Secrets設定が見つかりません。管理者にお問い合わせください。")
@@ -148,7 +144,6 @@ def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
     
     # Cache key creation
     sa_json = json.dumps(sa)
-    cache_key = (project_id, location, sa_json)
     
     creds = service_account.Credentials.from_service_account_info(sa)
     client = bigquery.Client(project=project_id, credentials=creds, location=location)
@@ -229,7 +224,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.0｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.1｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -295,7 +290,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
-    # ボタンの状態維持
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
         st.session_state.org_data_loaded = True
     
@@ -309,45 +303,36 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             row = df_org.iloc[0]
             
             # --- 値の取得 ---
-            # 売上
             s_cur_fytd = float(row.get('sales_amount_fytd', 0)) # ①現状
             s_py_total = float(row.get('sales_amount_py_total', 0)) # ②昨年実績
             s_forecast = float(row.get('sales_forecast_total', 0)) # ③着地予測
             s_gap = s_forecast - s_py_total # ④GAP
             
-            # 粗利
             gp_cur_fytd = float(row.get('gross_profit_fytd', 0))
             gp_py_total = float(row.get('gross_profit_py_total', 0))
             gp_forecast = float(row.get('gp_forecast_total', 0))
             gp_gap = gp_forecast - gp_py_total
 
-            # --- KPI表示 (4カラム x 2行) ---
-            
-            # Row 1: 売上
+            # --- KPI表示 ---
             st.markdown("##### ■ 売上 (Sales)")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("① 現状 (FYTD)", f"¥{s_cur_fytd:,.0f}")
             c2.metric("② 昨年度実績 (通年)", f"¥{s_py_total:,.0f}")
             c3.metric("③ 着地予測 (通年)", f"¥{s_forecast:,.0f}", delta_color="normal")
-            c4.metric("④ GAP (予測 - 昨年)", f"¥{s_gap:,.0f}", delta=None, delta_color="off") # GAPは単純数値で
+            c4.metric("④ GAP (予測 - 昨年)", f"¥{s_gap:,.0f}", delta=None, delta_color="off")
 
-            # Row 2: 粗利
             st.markdown("##### ■ 粗利 (Gross Profit)")
             c5, c6, c7, c8 = st.columns(4)
             c5.metric("① 現状 (FYTD)", f"¥{gp_cur_fytd:,.0f}")
             c6.metric("② 昨年度実績 (通年)", f"¥{gp_py_total:,.0f}")
             c7.metric("③ 着地予測 (通年)", f"¥{gp_forecast:,.0f}", delta_color="normal")
             c8.metric("④ GAP (予測 - 昨年)", f"¥{gp_gap:,.0f}", delta=None, delta_color="off")
-
-            # 着地予測ロジックの説明
-            st.caption("※ 着地予測ロジック: 「現在の対前年進捗率」に基づき、残りの期間も同ペースで推移すると仮定して算出")
             
             st.divider()
 
         # --- Interactive Worst Ranking ---
         st.subheader("📉 減少要因分析 (ワーストランキング)")
         
-        # 1. データ取得
         sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 3000"
         df_raw = query_df_safe(client, sql_rank, None, "Worst Raw", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
@@ -355,7 +340,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 2. 分析軸の選択
         c_axis1, c_axis2 = st.columns(2)
         with c_axis1:
             axis_mode = st.radio("① 集計軸:", ["📦 商品軸", "🏥 得意先軸"], horizontal=True, key="worst_axis_radio")
@@ -364,7 +348,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             value_mode = st.radio("② 評価指標:", ["💰 売上金額", "💹 粗利金額"], horizontal=True, key="worst_value_radio")
             is_sales_mode = "売上" in value_mode
 
-        # 評価指標に応じたカラム定義
         if is_sales_mode:
             col_target = "sales_diff"
             col_cur = "sales_cur"
@@ -380,17 +363,14 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             label_cur = "今年粗利"
             label_prev = "前年粗利"
 
-        # 3. 画面分岐
         if st.session_state.worst_view_mode == 'ranking':
-            # === ランキング一覧 ===
             target_key = "product_name" if is_product_mode else "customer_name"
             target_label = "商品名" if is_product_mode else "得意先名"
             
             st.markdown(f"**ワーストランキング ({label_diff}順)**")
             
-            # グルーピング集計
             df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
-            df_group = df_group.sort_values(col_target, ascending=True) # 減少額順 (マイナスが大きい順)
+            df_group = df_group.sort_values(col_target, ascending=True)
             
             col_cfg = {
                 target_key: st.column_config.TextColumn(target_label, width="medium"),
@@ -409,7 +389,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
 
             st.divider()
             
-            # ドリルダウン選択
             options_list = df_group[target_key].tolist()
             selected_item = st.selectbox(f"詳細分析する対象を選択:", options_list, key="worst_selectbox")
 
@@ -419,7 +398,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 st.rerun()
 
         elif st.session_state.worst_view_mode == 'detail':
-            # === 詳細分析 ===
             target_name = st.session_state.worst_selected_name
             
             if st.button("⬅ ランキングに戻る"):
@@ -456,6 +434,9 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
         st.info("👆 上のボタンを押して全社データを読み込んでください")
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
+    """
+    エリア/個人 KPI (全社と同じ4項目フォーマットに拡張)
+    """
     st.subheader("👤 年度累計（FYTD）｜自分")
     if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
         sql = f"SELECT * FROM `{VIEW_FYTD_ME}` __WHERE__ LIMIT 100"
@@ -467,15 +448,31 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
 
         row = df_me.iloc[0]
         
-        # 個人のKPIも同様に拡張可能ですが、スペースの都合上、一旦既存の3カラム構成を維持しつつ調整
-        s_forecast = float(row.get('sales_forecast_total', 0))
+        # --- 値の取得 (個人版) ---
+        s_cur_fytd = float(row.get('sales_amount_fytd', 0))
         s_py_total = float(row.get('sales_amount_py_total', 0))
-        pace = float(row.get('pacing_rate', 0))
+        s_forecast = float(row.get('sales_forecast_total', 0))
+        s_gap = s_forecast - s_py_total
+        
+        gp_cur_fytd = float(row.get('gross_profit_fytd', 0))
+        gp_py_total = float(row.get('gross_profit_py_total', 0))
+        gp_forecast = float(row.get('gp_forecast_total', 0))
+        gp_gap = gp_forecast - gp_py_total
 
-        c1, c2, c3 = st.columns(3)
-        with c1: st.metric("着地予測（年）", f"¥{s_forecast:,.0f}")
-        with c2: st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
-        with c3: st.metric("前年実績（年）", f"¥{s_py_total:,.0f}")
+        # --- KPI表示 (2x4 Grid) ---
+        st.markdown("##### ■ 売上 (Sales)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("① 現状 (FYTD)", f"¥{s_cur_fytd:,.0f}")
+        c2.metric("② 昨年度実績 (通年)", f"¥{s_py_total:,.0f}")
+        c3.metric("③ 着地予測 (通年)", f"¥{s_forecast:,.0f}")
+        c4.metric("④ GAP (予測 - 昨年)", f"¥{s_gap:,.0f}", delta_color="off")
+
+        st.markdown("##### ■ 粗利 (Gross Profit)")
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("① 現状 (FYTD)", f"¥{gp_cur_fytd:,.0f}")
+        c6.metric("② 昨年度実績 (通年)", f"¥{gp_py_total:,.0f}")
+        c7.metric("③ 着地予測 (通年)", f"¥{gp_forecast:,.0f}")
+        c8.metric("④ GAP (予測 - 昨年)", f"¥{gp_gap:,.0f}", delta_color="off")
         
         st.divider()
         st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
@@ -639,7 +636,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.0 (Dashboard Edition)")
+    st.caption("Updated: v1.7.1 (Individual KPI Expanded)")
 
 if __name__ == "__main__":
     main()
