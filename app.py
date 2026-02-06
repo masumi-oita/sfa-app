@@ -1,7 +1,7 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.0
+SFA｜入口高速版（判断専用） - OS v1.6.1
 
 【システム構成定義】
 - Backend: Google BigQuery (asia-northeast1)
@@ -9,17 +9,17 @@ SFA｜入口高速版（判断専用） - OS v1.6.0
 - Logic:
     1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
     2. Forecasting: Pacing Method (Sales & Gross Profit)
-    3. Analysis: Worst Impact Ranking (Direct Raw Access / JAN Strict)
-    4. Recommendation: Gap Analysis (JAN Based) ★New!
+    3. Analysis: Worst Impact Ranking (Customer x Product Axis / Backfilled JAN)
+    4. Recommendation: Gap Analysis (JAN Based)
 
 【参照VIEW一覧】
 - v_dim_staff_role_dedup: 権限管理
 - v_admin_org_fytd_summary_scoped: 全社KPI・着地予測
-- v_admin_product_yoy_worst_ranking: 全社減少要因分析
+- v_admin_product_yoy_worst_ranking: 全社減少要因分析（得意先・商品別）
 - v_staff_fytd_summary_scoped: 個人KPI
 - v_sales_customer_yoy_*: 得意先別ランキング
 - v_sales_fact_login_jan_daily: 日次ファクト（ドリルダウン用）
-- v_sales_recommendation_engine: 戦略提案エンジン ★New!
+- v_sales_recommendation_engine: 戦略提案エンジン
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_cu
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 
-# ★ Recommendation & Fact Views
+# Recommendation & Fact Views
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
 
@@ -93,9 +93,10 @@ JP_COLS_FYTD = {
     "gross_profit_py_total": "前年粗利実績（年）",
 }
 
-# Ranking Columns (Worst Analysis)
+# Ranking Columns (Worst Analysis) - Updated with Customer Name
 JP_COLS_RANK = {
     "jan": "JANコード",
+    "customer_name": "得意先名",  # ★New
     "product_name": "商品名",
     "maker_name": "メーカー",
     "sales_cur": "売上(今年)",
@@ -296,7 +297,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.6.0｜戦略提案｜ワースト分析｜着地予測")
+    st.caption("OS v1.6.1｜戦略提案｜ワースト分析（得意先軸）｜着地予測")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -385,11 +386,12 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             
             st.divider()
 
-        # Worst Ranking
-        st.subheader("📉 売上減少要因（ワースト商品ランキング）")
-        st.caption("前年同期と比較して、売上減少額（Impact）が大きい商品トップ50")
+        # Worst Ranking (Updated with Customer Name)
+        st.subheader("📉 売上減少要因（ワーストランキング）")
+        st.caption("前年同期と比較して、売上減少額（Impact）が大きい「商品×得意先」トップ1000")
         
-        sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 50"
+        # Limit increased to 1000 as requested
+        sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 1000"
         df_rank = query_df_safe(client, sql_rank, None, "Worst Ranking",
                                 opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
@@ -400,13 +402,15 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.dataframe(
                 df_disp,
                 column_config={
+                    "得意先名": st.column_config.TextColumn("得意先名", width="medium"),
+                    "商品名": st.column_config.TextColumn("商品名", width="medium"),
                     "売上差額(Impact)": st.column_config.NumberColumn(format="¥%d"),
                     "売上(今年)": st.column_config.NumberColumn(format="¥%d"),
                     "売上(前年)": st.column_config.NumberColumn(format="¥%d"),
                     "前年比": st.column_config.NumberColumn(format="%.1f%%"),
                 },
                 use_container_width=True,
-                height=400
+                height=500
             )
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
@@ -476,7 +480,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
     st.divider()
     
     # 3. Get Recommendation (Query VIEW_RECOMMEND by Customer)
-    # Note: Logic relies on JAN, but we display refined info
     sql_rec = f"""
     SELECT * FROM `{VIEW_RECOMMEND}`
     WHERE customer_code = @cust_code
@@ -586,7 +589,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.0 Strategy & Recommendation (Strict JAN)")
+    st.caption("Updated: v1.6.1 Strategy & Ranking (Full)")
 
 if __name__ == "__main__":
     main()
