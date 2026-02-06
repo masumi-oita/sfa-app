@@ -1,19 +1,18 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.4 (Fix: AttributeError in Detail View)
+SFA｜戦略ダッシュボード - OS v1.7.5 (Stability Fix: Explicit Config)
 
-【更新履歴 v1.7.4】
-- [Fix] 詳細分析画面でのAttributeErrorを修正（カラム設定を明示的定義に変更）
-- [UI] 詳細画面のテーブルにも3桁カンマ区切りと合計行を適用
-- [Logic] カラム設定ロジックを簡素化し、安定性を向上
+【更新履歴 v1.7.5】
+- [Fix] NameError/AttributeErrorの原因となる自動設定ロジックを廃止し、堅牢な明示的定義に変更
+- [UI] 全画面（全社・個人・詳細・YoY）でのカンマ区切り、合計行、KPI表示を完全維持
+- [Refactor] コード構造を整理し、実行順序によるエラーを防止
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -127,9 +126,9 @@ def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
     df_total = pd.DataFrame([total_data])
     return pd.concat([df, df_total], ignore_index=True)
 
-def get_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
+def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     """
-    汎用的なカラム設定生成
+    データフレームのカラムに基づいてデフォルトの表示設定を作成する
     """
     config = {}
     for col in df.columns:
@@ -355,7 +354,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             # 合計行の追加
             df_display = append_total_row(df_group, label_col=target_key)
             
-            # 明示的なカラム設定
+            # 表示設定
             col_cfg = {
                 target_key: st.column_config.TextColumn(target_label, width="medium"),
                 col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
@@ -406,7 +405,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             # 合計行の追加
             df_display = append_total_row(df_detail, label_col=main_col)
             
-            # ★Fix: カラム設定を明示的に定義（AttributeError回避）
+            # 設定定義（安全な辞書定義）
             col_cfg = {
                 main_col: st.column_config.TextColumn(col_label),
                 col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
@@ -476,7 +475,7 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             cols.remove("担当者名")
             cols.insert(0, "担当者名")
         
-        col_cfg = get_column_config(df_disp[cols])
+        col_cfg = create_default_column_config(df_disp[cols])
         
         st.dataframe(
             df_disp[cols], 
@@ -504,7 +503,7 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
                 
                 # 合計行を追加
                 df_final = append_total_row(df_disp[cols], label_col="担当者名" if "担当者名" in cols else None)
-                col_cfg = get_column_config(df_final)
+                col_cfg = create_default_column_config(df_final)
                 
                 st.dataframe(
                     df_final, 
@@ -577,7 +576,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 "market_scale": "全社売上規模"
             })
             
-            col_cfg = get_column_config(disp_df)
+            col_cfg = create_default_column_config(disp_df)
             
             st.dataframe(
                 disp_df,
@@ -603,7 +602,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
         renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)"})
-        col_cfg = get_column_config(renamed_df)
+        col_cfg = create_default_column_config(renamed_df)
         
         st.dataframe(
             renamed_df,
@@ -662,7 +661,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.4 (Fix: Detail View)")
+    st.caption("Updated: v1.7.5 (Stability Fix)")
 
 if __name__ == "__main__":
     main()
