@@ -1,11 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.1 (Individual KPI Expanded)
+SFA｜戦略ダッシュボード - OS v1.7.2 (UI Polish: Names over Emails)
 
-【更新履歴 v1.7.1】
-- [UI] 「エリア/個人」タブのKPI表示を全社タブと同様の形式（売上/粗利 × 4指標）に拡張
-- [UI] 予算達成や昨年対比のギャップを可視化
+【更新履歴 v1.7.2】
+- [UI] 「エリア/個人」タブのテーブル表示を改善
+- 無機質な「ログインメール」を非表示にし、「担当者名」を先頭列に配置
+- YoYランキングなどのリストも担当者名ベースで可視化
 """
 
 from __future__ import annotations
@@ -141,8 +142,6 @@ def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
         st.stop()
         
     project_id, location, sa = _get_bq_from_secrets()
-    
-    # Cache key creation
     sa_json = json.dumps(sa)
     
     creds = service_account.Credentials.from_service_account_info(sa)
@@ -224,7 +223,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.1｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.2｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -286,7 +285,7 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
-    全社KPI + ワーストランキング分析 (KPI拡張版)
+    全社KPI + ワーストランキング分析
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
@@ -303,10 +302,10 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             row = df_org.iloc[0]
             
             # --- 値の取得 ---
-            s_cur_fytd = float(row.get('sales_amount_fytd', 0)) # ①現状
-            s_py_total = float(row.get('sales_amount_py_total', 0)) # ②昨年実績
-            s_forecast = float(row.get('sales_forecast_total', 0)) # ③着地予測
-            s_gap = s_forecast - s_py_total # ④GAP
+            s_cur_fytd = float(row.get('sales_amount_fytd', 0))
+            s_py_total = float(row.get('sales_amount_py_total', 0))
+            s_forecast = float(row.get('sales_forecast_total', 0))
+            s_gap = s_forecast - s_py_total
             
             gp_cur_fytd = float(row.get('gross_profit_fytd', 0))
             gp_py_total = float(row.get('gross_profit_py_total', 0))
@@ -435,7 +434,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
     """
-    エリア/個人 KPI (全社と同じ4項目フォーマットに拡張)
+    エリア/個人 KPI (テーブル表示を改善)
     """
     st.subheader("👤 年度累計（FYTD）｜自分")
     if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
@@ -448,7 +447,7 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
 
         row = df_me.iloc[0]
         
-        # --- 値の取得 (個人版) ---
+        # --- 値の取得 ---
         s_cur_fytd = float(row.get('sales_amount_fytd', 0))
         s_py_total = float(row.get('sales_amount_py_total', 0))
         s_forecast = float(row.get('sales_forecast_total', 0))
@@ -475,7 +474,23 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         c8.metric("④ GAP (予測 - 昨年)", f"¥{gp_gap:,.0f}", delta_color="off")
         
         st.divider()
-        st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
+        
+        # --- テーブル表示 (改善版) ---
+        df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
+        
+        # 列の並び替えロジック
+        cols = list(df_disp.columns)
+        
+        # 1. ログインメール、閲覧者メールを除外する
+        if "ログインメール" in cols: cols.remove("ログインメール")
+        if "閲覧者メール" in cols: cols.remove("閲覧者メール")
+        
+        # 2. 担当者名を先頭に移動する
+        if "担当者名" in cols:
+            cols.remove("担当者名")
+            cols.insert(0, "担当者名")
+            
+        st.dataframe(df_disp[cols], use_container_width=True, hide_index=True)
 
 def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
     st.subheader("📊 当月YoY（得意先ランキング）")
@@ -486,7 +501,18 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
             df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
             if not df.empty:
-                st.dataframe(rename_columns_for_display(df, JP_COLS_YOY), use_container_width=True)
+                # --- テーブル表示 (改善版) ---
+                df_disp = rename_columns_for_display(df, JP_COLS_YOY)
+                
+                cols = list(df_disp.columns)
+                # 1. メール非表示
+                if "ログインメール" in cols: cols.remove("ログインメール")
+                # 2. 担当者名を先頭へ
+                if "担当者名" in cols:
+                    cols.remove("担当者名")
+                    cols.insert(0, "担当者名")
+                
+                st.dataframe(df_disp[cols], use_container_width=True, hide_index=True)
             else:
                 st.info("0件です。")
 
@@ -636,7 +662,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.1 (Individual KPI Expanded)")
+    st.caption("Updated: v1.7.2 (UI Polish)")
 
 if __name__ == "__main__":
     main()
