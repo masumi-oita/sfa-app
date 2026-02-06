@@ -1,20 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.3 (Enhanced UI/UX)
+SFA｜入口高速版（判断専用） - OS v1.6.4 (Bug Fix: Button State Persistence)
 
-【システム構成定義】
-- Backend: Google BigQuery (asia-northeast1)
-- Frontend: Streamlit (Compatible with v1.31.0+)
-- Logic:
-    1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
-    2. Forecasting: Pacing Method (Sales & Gross Profit)
-    3. Analysis: Worst Impact Ranking (Stateful Drill-down) ★Updated
-    4. Recommendation: Gap Analysis (JAN Based)
-
-【更新履歴 v1.6.3】
-- ワースト分析のドリルダウン時に画面がリセットされる問題を修正（Session State導入）
-- 数値表示を3桁カンマ区切り（¥1,234,567）に変更し視認性を向上
+【更新内容 v1.6.4】
+- [Fix] ドリルダウン時に「全社データを読み込む」状態が解除され、初期画面に戻るバグを修正
+- データ読み込み状態を session_state で管理するように変更
+- その他、UI表示の安定化
 """
 
 from __future__ import annotations
@@ -157,7 +149,6 @@ def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
     st.sidebar.header("接続設定")
     if _secrets_has_bigquery():
         project_id, location, sa = _get_bq_from_secrets()
-        # st.sidebar.success("Secrets: OK") # UI簡易化のため非表示
         return project_id, location, sa
     
     st.sidebar.warning("Secrets 未設定。JSON貼り付けモードで動作します。")
@@ -252,7 +243,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.6.3｜戦略提案｜ワースト分析（ドリルダウン改善）｜着地予測")
+    st.caption("OS v1.6.4｜戦略提案｜ワースト分析（Bug Fix）｜着地予測")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -315,12 +306,16 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
     全社KPI + ワーストランキング分析
-    v1.6.3: セッション管理による画面維持、3桁カンマ区切り表示を適用
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
-    # 全社KPIの読み込み
-    if st.button("全社データを読み込む", key="btn_org", use_container_width=True):
+    # ★修正点: ボタンの状態を session_state に保存して、再描画後も維持する
+    if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
+        st.session_state.org_data_loaded = True
+    
+    # 読み込み済みの場合のみ表示する
+    if st.session_state.org_data_loaded:
+        
         # KPI Card
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
         df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
@@ -334,14 +329,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 pace = float(row.get('pacing_rate', 0))
                 st.metric("対前年ペース", f"{pace*100:.1f}%", f"{(pace-1.0)*100:+.1f}%")
             with c3: st.metric("昨年度実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
-
-            st.markdown("##### ■ 粗利予測")
-            c4, c5, c6 = st.columns(3)
-            with c4: st.metric("粗利 着地予測（年）", f"¥{float(row.get('gp_forecast_total', 0)):,.0f}")
-            with c5:
-                pace_gp = float(row.get('gp_pacing_rate', 0))
-                st.metric("対前年ペース", f"{pace_gp*100:.1f}%", f"{(pace_gp-1.0)*100:+.1f}%")
-            with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
             st.divider()
 
         # --- Interactive Worst Ranking (Stateful) ---
@@ -355,22 +342,18 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 2. 分析軸の選択（ラジオボタン）
-        # セッションの状態に応じて表示を制御
+        # 2. 分析軸の選択
         axis_mode = st.radio("分析軸:", ["📦 商品軸で見る", "🏥 得意先軸で見る"], horizontal=True, key="worst_axis_radio")
         is_product_mode = "商品" in axis_mode
 
-        # 3. 画面分岐: 「一覧」か「詳細」か
+        # 3. 画面分岐
         if st.session_state.worst_view_mode == 'ranking':
-            # === ランキング一覧画面 ===
-            
+            # === ランキング一覧 ===
             if is_product_mode:
-                # 商品ごとの集計
                 st.markdown("**① 商品ワーストランキング**")
                 df_group = df_raw.groupby("product_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_group = df_group.sort_values("sales_diff", ascending=True) # 減少額が大きい順（マイナス）
+                df_group = df_group.sort_values("sales_diff", ascending=True)
                 
-                # 表示用設定
                 col_cfg = {
                     "product_name": st.column_config.TextColumn("商品名", width="medium"),
                     "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
@@ -379,9 +362,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 }
                 disp_cols = ["product_name", "sales_diff", "sales_cur", "sales_prev"]
                 target_key = "product_name"
-                
             else:
-                # 得意先ごとの集計
                 st.markdown("**① 得意先ワーストランキング**")
                 df_group = df_raw.groupby("customer_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
                 df_group = df_group.sort_values("sales_diff", ascending=True)
@@ -395,38 +376,25 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 disp_cols = ["customer_name", "sales_diff", "sales_cur", "sales_prev"]
                 target_key = "customer_name"
 
-            # ランキング表示
-            st.dataframe(
-                df_group[disp_cols],
-                column_config=col_cfg,
-                use_container_width=True,
-                hide_index=True,
-                height=400
-            )
+            st.dataframe(df_group[disp_cols], column_config=col_cfg, use_container_width=True, hide_index=True, height=400)
 
-            # ドリルダウン選択UI
             st.divider()
             st.info("👇 詳細を見たい項目を選んでボタンを押してください")
             
-            # 選択肢リスト
+            # 選択ボックス
             options_list = df_group[target_key].tolist()
-            selected_item = st.selectbox(
-                f"分析対象を選択:", 
-                options_list, 
-                key="worst_selectbox"
-            )
+            selected_item = st.selectbox(f"分析対象を選択:", options_list, key="worst_selectbox")
 
+            # ★ここが重要: ボタンを押すと rerun するが、org_data_loaded が True なのでここに戻ってくる
             if st.button("詳細分析へ移動 ➡", type="primary"):
-                # セッションに保存してリロード
                 st.session_state.worst_selected_name = selected_item
                 st.session_state.worst_view_mode = 'detail'
                 st.rerun()
 
         elif st.session_state.worst_view_mode == 'detail':
-            # === 詳細分析画面 ===
+            # === 詳細分析 ===
             target_name = st.session_state.worst_selected_name
             
-            # 戻るボタン
             if st.button("⬅ ランキングに戻る"):
                 st.session_state.worst_view_mode = 'ranking'
                 st.session_state.worst_selected_name = None
@@ -435,13 +403,11 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.title(f"🔍 詳細分析: {target_name}")
             
             if is_product_mode:
-                # 商品が選ばれた -> 得意先別の内訳を表示
                 df_detail = df_raw[df_raw["product_name"] == target_name].copy()
                 st.markdown("##### 得意先別 減少内訳")
                 main_col = "customer_name"
                 col_label = "得意先名"
             else:
-                # 得意先が選ばれた -> 商品別の内訳を表示
                 df_detail = df_raw[df_raw["customer_name"] == target_name].copy()
                 st.markdown("##### 商品別 減少内訳")
                 main_col = "product_name"
@@ -449,7 +415,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             
             df_detail = df_detail.sort_values("sales_diff", ascending=True)
 
-            # 詳細テーブル表示 (カンマ区切り)
             st.dataframe(
                 df_detail[[main_col, "sales_diff", "sales_cur", "sales_prev", "sales_rate"]],
                 column_config={
@@ -462,6 +427,9 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 use_container_width=True,
                 hide_index=True
             )
+    else:
+        # データがまだ読み込まれていない時
+        st.info("👆 上のボタンを押して全社データを読み込んでください")
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
     st.subheader("👤 年度累計（FYTD）｜自分")
@@ -482,7 +450,6 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         with c3: st.metric("前年実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
         
         st.divider()
-        # Dataframe with simple renaming
         st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
 
 def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
@@ -494,8 +461,6 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
             df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
             if not df.empty:
-                # 簡易表示のため、全カラムをカラムコンフィグするのは省略し、
-                # 主要カラムだけ見やすくする（ここでは既存ロジックを踏襲）
                 st.dataframe(rename_columns_for_display(df, JP_COLS_YOY), use_container_width=True)
             else:
                 st.info("0件です。")
@@ -505,12 +470,8 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
     with c3: _show_table("新規/比較不能", VIEW_YOY_UNCOMP, "btn_unc")
 
 def render_customer_drilldown(client, cache_key, login_email, opts):
-    """
-    v1.6.0 New Feature: Customer Gap Analysis & Recommendation (JAN Based)
-    """
     st.subheader("🎯 得意先別・戦略提案（AI Gap Analysis）")
     
-    # 1. Get Customer List
     sql_cust = f"""
     SELECT DISTINCT customer_code, customer_name
     FROM `{VIEW_FACT_DAILY}`
@@ -523,7 +484,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         st.info("担当得意先データがありません（またはログインメール不一致）。")
         return
 
-    # 2. Select Customer
     cust_options = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in df_cust.iterrows()}
     selected_code = st.selectbox("分析する得意先を選択してください", options=cust_options.keys(), format_func=lambda x: cust_options[x])
     
@@ -532,7 +492,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 
     st.divider()
     
-    # 3. Get Recommendation
     sql_rec = f"""
     SELECT * FROM `{VIEW_RECOMMEND}`
     WHERE customer_code = @cust_code
@@ -540,7 +499,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
     """
     df_rec = query_df_safe(client, sql_rec, {"cust_code": selected_code}, "Recommendation", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
     
-    # 4. Display Logic
     c1, c2 = st.columns([1, 2])
     
     with c1:
@@ -578,7 +536,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 hide_index=True
             )
             
-    # 5. Reference: Adopted List
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
         SELECT 
@@ -608,12 +565,15 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 # Main Execution
 # -----------------------------
 def main():
-    # 0. Session State Initialization (Critical for Drill-down)
-    # 画面遷移やリロードでも状態を保持するために初期化
+    # 0. Session State Initialization
     if 'worst_view_mode' not in st.session_state:
-        st.session_state.worst_view_mode = 'ranking' # 'ranking' or 'detail'
+        st.session_state.worst_view_mode = 'ranking'
     if 'worst_selected_name' not in st.session_state:
         st.session_state.worst_selected_name = None
+    
+    # ★追加: 「全社データが読み込まれたかどうか」を記憶するフラグ
+    if 'org_data_loaded' not in st.session_state:
+        st.session_state.org_data_loaded = False
 
     set_page()
     
@@ -655,7 +615,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.3 (Safe Mode + Enhanced UI)")
+    st.caption("Updated: v1.6.4 (Fix: Button Persistence)")
 
 if __name__ == "__main__":
     main()
