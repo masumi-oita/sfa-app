@@ -9,8 +9,8 @@ SFA｜入口高速版（判断専用） - OS v1.6.0
 - Logic:
     1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
     2. Forecasting: Pacing Method (Sales & Gross Profit)
-    3. Analysis: Worst Impact Ranking (Direct Raw Access)
-    4. Recommendation: Gap Analysis (Manufacturer Based) ★New!
+    3. Analysis: Worst Impact Ranking (Direct Raw Access / JAN Strict)
+    4. Recommendation: Gap Analysis (JAN Based) ★New!
 
 【参照VIEW一覧】
 - v_dim_staff_role_dedup: 権限管理
@@ -18,6 +18,7 @@ SFA｜入口高速版（判断専用） - OS v1.6.0
 - v_admin_product_yoy_worst_ranking: 全社減少要因分析
 - v_staff_fytd_summary_scoped: 個人KPI
 - v_sales_customer_yoy_*: 得意先別ランキング
+- v_sales_fact_login_jan_daily: 日次ファクト（ドリルダウン用）
 - v_sales_recommendation_engine: 戦略提案エンジン ★New!
 """
 
@@ -59,9 +60,8 @@ VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_cu
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 
-# ★ Recommendation View
+# ★ Recommendation & Fact Views
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
-# Fact table for Drilldown List
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
 
 
@@ -449,11 +449,11 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
 
 def render_customer_drilldown(client, cache_key, login_email, opts):
     """
-    v1.6.0 New Feature: Customer Gap Analysis & Recommendation
+    v1.6.0 New Feature: Customer Gap Analysis & Recommendation (JAN Based)
     """
     st.subheader("🎯 得意先別・戦略提案（AI Gap Analysis）")
     
-    # 1. Get Customer List from Fact
+    # 1. Get Customer List from Fact (Login scoped)
     sql_cust = f"""
     SELECT DISTINCT customer_code, customer_name
     FROM `{VIEW_FACT_DAILY}`
@@ -475,7 +475,8 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 
     st.divider()
     
-    # 3. Get Recommendation
+    # 3. Get Recommendation (Query VIEW_RECOMMEND by Customer)
+    # Note: Logic relies on JAN, but we display refined info
     sql_rec = f"""
     SELECT * FROM `{VIEW_RECOMMEND}`
     WHERE customer_code = @cust_code
@@ -503,6 +504,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         if df_rec.empty:
             st.success("🎉 この領域の主要商品はすべて採用済みです。")
         else:
+            # Display: Hide JAN, Show Product Name & Scale
             disp_df = df_rec[[
                 "priority_rank", "recommend_product", "manufacturer", "market_scale"
             ]].rename(columns={
@@ -521,7 +523,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 hide_index=True
             )
             
-    # 5. Reference: Adopted List
+    # 5. Reference: Adopted List (Raw Fact)
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
         SELECT 
@@ -575,16 +577,16 @@ def main():
             st.divider()
             render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3:
-            # Admin sees all (or specific)
             render_customer_drilldown(client, cache_key, login_email, opts)
 
     else:
+        # Sales Role: New Tab Structure
         t1, t2, t3 = st.tabs(["👤 今年の成績", "📊 得意先分析", "🎯 提案を作る"])
         with t1: render_fytd_me_section(client, cache_key, login_email, opts)
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.0 Strategy & Recommendation")
+    st.caption("Updated: v1.6.0 Strategy & Recommendation (Strict JAN)")
 
 if __name__ == "__main__":
     main()
