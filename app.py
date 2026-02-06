@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.3 (UI Polish: Commas & Totals)
+SFA｜戦略ダッシュボード - OS v1.7.4 (Fix: AttributeError in Detail View)
 
-【更新履歴 v1.7.3】
-- [UI] 全ての数値テーブルに3桁カンマ区切り（¥1,234,567）を適用
-- [UI] YoYランキングや詳細分析テーブルの最下行に「合計（Total）」行を自動追加
-- [Logic] パーセント値の合計行は誤解を招くため空欄にする処理を実装
+【更新履歴 v1.7.4】
+- [Fix] 詳細分析画面でのAttributeErrorを修正（カラム設定を明示的定義に変更）
+- [UI] 詳細画面のテーブルにも3桁カンマ区切りと合計行を適用
+- [Logic] カラム設定ロジックを簡素化し、安定性を向上
 """
 
 from __future__ import annotations
@@ -108,55 +108,39 @@ def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
     if df.empty:
         return df
         
-    # 数値カラムを特定
     num_cols = df.select_dtypes(include=['number']).columns
     
-    # 合計を計算
     total_data = {}
     for col in df.columns:
         if col in num_cols:
-            # パーセント系の列（率、比、ペース）は合計しても意味がないのでNoneにする
+            # パーセント系の列は合計しない
             if any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
                 total_data[col] = None
             else:
                 total_data[col] = df[col].sum()
         else:
-            total_data[col] = "" # 文字列カラムは空文字
+            total_data[col] = "" 
 
-    # 合計行のラベル設定
-    # 指定がなければ、一番左の列に「合計」と入れる
     target_label_col = label_col if label_col and label_col in df.columns else df.columns[0]
     total_data[target_label_col] = "=== 合計 ==="
     
-    # 行を追加
     df_total = pd.DataFrame([total_data])
     return pd.concat([df, df_total], ignore_index=True)
 
 def get_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     """
-    カラム名に基づいて、Streamlitの表示フォーマット（カンマ区切り等）を自動生成する関数
+    汎用的なカラム設定生成
     """
     config = {}
     for col in df.columns:
-        # 金額・数値系 -> 3桁カンマ区切り (¥マーク付き)
-        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP", "amount", "profit", "diff"]):
-            config[col] = st.column_config.NumberColumn(
-                col, format="¥%d"
-            )
-        # 率・ペース系 -> パーセント表示
+        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP", "amount", "profit", "diff", "cur", "prev"]):
+            config[col] = st.column_config.NumberColumn(col, format="¥%d")
         elif any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
-            config[col] = st.column_config.NumberColumn(
-                col, format="%.1f%%"
-            )
-        # その他数値
+            config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
         elif is_numeric_dtype(df[col]):
-            config[col] = st.column_config.NumberColumn(
-                col, format="%d"
-            )
-        # テキスト系
+            config[col] = st.column_config.NumberColumn(col, format="%d")
         else:
             config[col] = st.column_config.TextColumn(col)
-            
     return config
 
 
@@ -277,68 +261,6 @@ def query_df_safe(
 
 
 # -----------------------------
-# Component: User Interface
-# -----------------------------
-def set_page():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption("OS v1.7.3｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
-
-def sidebar_controls() -> Dict[str, Any]:
-    st.sidebar.header("System Settings")
-    use_bqstorage = st.sidebar.toggle("Use Storage API (Fast)", value=True)
-    timeout_sec = st.sidebar.slider("Query Timeout (sec)", 10, 300, 60, 10)
-    show_sql = st.sidebar.toggle("Show SQL (Debug)", value=False)
-    if st.sidebar.button("Clear Cache"):
-        st.cache_data.clear()
-        st.sidebar.success("Cache Cleared.")
-    return {"use_bqstorage": use_bqstorage, "timeout_sec": timeout_sec, "show_sql": show_sql}
-
-def get_login_email_ui() -> str:
-    st.sidebar.header("Login Simulation")
-    default_email = st.secrets.get("default_login_email", "") if "default_login_email" in st.secrets else ""
-    login_email = st.sidebar.text_input("Login Email", value=default_email).strip()
-    if not login_email:
-        st.info("Please enter login email.")
-        st.stop()
-    return login_email
-
-def resolve_role(client, cache_key, login_email, opts) -> RoleInfo:
-    sql = f"""
-    SELECT login_email, role_tier, role_admin_view, area_name
-    FROM `{VIEW_ROLE}` WHERE login_email = @login_email LIMIT 1
-    """
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Role Check",
-                       opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-    if df.empty:
-        return RoleInfo(login_email=login_email)
-    
-    r = df.iloc[0]
-    return RoleInfo(
-        login_email=login_email,
-        role_key=normalize_role_key(str(r.get("role_tier"))),
-        role_admin_view=bool(r.get("role_admin_view")),
-        area_name=str(r.get("area_name", "未設定"))
-    )
-
-def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, opts, allow_fallback=False):
-    sql = sql_template.replace("__WHERE__", f"WHERE {scope_col} = @login_email")
-    if opts["show_sql"]: st.code(sql, language="sql")
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Scoped Query",
-                       opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-    if not df.empty: return df
-
-    if allow_fallback:
-        sql_all = sql_template.replace("__WHERE__", f'WHERE {scope_col} = "all" OR {scope_col} IS NULL')
-        if opts["show_sql"]: st.code(sql_all, language="sql")
-        df_all = query_df_safe(client, sql_all, None, "Fallback Query",
-                               opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-        return df_all
-        
-    return pd.DataFrame()
-
-
-# -----------------------------
 # Component: Render Sections
 # -----------------------------
 
@@ -433,13 +355,13 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             # 合計行の追加
             df_display = append_total_row(df_group, label_col=target_key)
             
-            # 表示設定の自動生成
-            col_cfg = get_column_config(df_display)
-            # 特定列のラベル上書き
-            col_cfg[target_key].label = target_label
-            col_cfg[col_target].label = label_diff
-            col_cfg[col_cur].label = label_cur
-            col_cfg[col_prev].label = label_prev
+            # 明示的なカラム設定
+            col_cfg = {
+                target_key: st.column_config.TextColumn(target_label, width="medium"),
+                col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
+                col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
+                col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
+            }
             
             st.dataframe(
                 df_display[[target_key, col_target, col_cur, col_prev]], 
@@ -481,15 +403,16 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             
             df_detail = df_detail.sort_values(col_target, ascending=True)
             
-            # 合計行追加
+            # 合計行の追加
             df_display = append_total_row(df_detail, label_col=main_col)
             
-            # 設定生成
-            col_cfg = get_column_config(df_display)
-            col_cfg[main_col].label = col_label
-            col_cfg[col_target].label = label_diff
-            col_cfg[col_cur].label = label_cur
-            col_cfg[col_prev].label = label_prev
+            # ★Fix: カラム設定を明示的に定義（AttributeError回避）
+            col_cfg = {
+                main_col: st.column_config.TextColumn(col_label),
+                col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
+                col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
+                col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
+            }
 
             st.dataframe(
                 df_display[[main_col, col_target, col_cur, col_prev]],
@@ -502,7 +425,7 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
     """
-    エリア/個人 KPI (テーブル表示を改善)
+    エリア/個人 KPI
     """
     st.subheader("👤 年度累計（FYTD）｜自分")
     if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
@@ -526,7 +449,7 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         gp_forecast = float(row.get('gp_forecast_total', 0))
         gp_gap = gp_forecast - gp_py_total
 
-        # --- KPI表示 (2x4 Grid) ---
+        # --- KPI表示 ---
         st.markdown("##### ■ 売上 (Sales)")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("① 現状 (FYTD)", f"¥{s_cur_fytd:,.0f}")
@@ -543,10 +466,9 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         
         st.divider()
         
-        # --- テーブル表示 (改善版) ---
+        # --- テーブル表示 ---
         df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
         
-        # 列の並び替え
         cols = list(df_disp.columns)
         if "ログインメール" in cols: cols.remove("ログインメール")
         if "閲覧者メール" in cols: cols.remove("閲覧者メール")
@@ -554,7 +476,6 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             cols.remove("担当者名")
             cols.insert(0, "担当者名")
         
-        # カンマ区切り適用
         col_cfg = get_column_config(df_disp[cols])
         
         st.dataframe(
@@ -573,7 +494,6 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
             df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
             if not df.empty:
-                # --- テーブル表示 (改善版) ---
                 df_disp = rename_columns_for_display(df, JP_COLS_YOY)
                 
                 cols = list(df_disp.columns)
@@ -584,8 +504,6 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
                 
                 # 合計行を追加
                 df_final = append_total_row(df_disp[cols], label_col="担当者名" if "担当者名" in cols else None)
-                
-                # カンマ区切り適用
                 col_cfg = get_column_config(df_final)
                 
                 st.dataframe(
@@ -659,7 +577,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 "market_scale": "全社売上規模"
             })
             
-            # フォーマット適用
             col_cfg = get_column_config(disp_df)
             
             st.dataframe(
@@ -745,7 +662,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.3 (Totals & Commas)")
+    st.caption("Updated: v1.7.4 (Fix: Detail View)")
 
 if __name__ == "__main__":
     main()
