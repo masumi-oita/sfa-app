@@ -1,15 +1,15 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.2
+SFA｜入口高速版（判断専用） - OS v1.6.2 (Safe Mode)
 
 【システム構成定義】
 - Backend: Google BigQuery (asia-northeast1)
-- Frontend: Streamlit
+- Frontend: Streamlit (Compatible with v1.31.0)
 - Logic:
     1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
     2. Forecasting: Pacing Method (Sales & Gross Profit)
-    3. Analysis: Worst Impact Ranking (Drill-down UI: Product <-> Customer) ★Updated!
+    3. Analysis: Worst Impact Ranking (Drill-down via Selectbox) ★Modified for compatibility
     4. Recommendation: Gap Analysis (JAN Based)
 
 【参照VIEW一覧】
@@ -364,7 +364,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
         
         if not df_org.empty:
             row = df_org.iloc[0]
-            
             st.markdown("##### ■ 売上予測")
             c1, c2, c3 = st.columns(3)
             with c1: st.metric("売上 着地予測（年）", f"¥{float(row.get('sales_forecast_total', 0)):,.0f}")
@@ -380,14 +379,11 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 pace_gp = float(row.get('gp_pacing_rate', 0))
                 st.metric("対前年ペース", f"{pace_gp*100:.1f}%", f"{(pace_gp-1.0)*100:+.1f}%")
             with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
-            
             st.divider()
 
-        # --- Interactive Worst Ranking (Drill-down) ---
+        # --- Interactive Worst Ranking (Compatible Mode) ---
         st.subheader("📉 売上減少要因（ワースト分析）")
         
-        # 1. データを取得（Granular Data: Product x Customer）
-        # Limitを増やして全体像を確保
         sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 3000"
         df_raw = query_df_safe(client, sql_rank, None, "Worst Raw", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
@@ -395,34 +391,31 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 2. 分析軸の選択（商品軸 vs 得意先軸）
-        analysis_mode = st.radio("分析軸を選択:", ["📦 商品軸で見る (どの商品が下がった？)", "🏥 得意先軸で見る (どの得意先が下がった？)"], horizontal=True)
-
+        # 分析軸の選択
+        analysis_mode = st.radio("分析軸:", ["📦 商品軸で見る", "🏥 得意先軸で見る"], horizontal=True)
+        
         c_left, c_right = st.columns([1, 1])
 
         if "商品" in analysis_mode:
-            # --- Mode A: Product Focus ---
+            # Mode A: Product Focus
             with c_left:
-                st.markdown("**① 商品ワーストランキング**")
-                # 商品ごとに集約
+                st.markdown("**① 商品ランキング**")
                 df_prod = df_raw.groupby("product_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_prod = df_prod.sort_values("sales_diff", ascending=True) # 減少額が大きい順
+                df_prod = df_prod.sort_values("sales_diff", ascending=True)
                 
-                # Selection UI
-                event = st.dataframe(
+                # ★修正: selectboxで選択させる
+                prod_list = df_prod["product_name"].tolist()
+                selected_prod = st.selectbox("詳細を見る商品を選択:", prod_list, key="sel_prod")
+                
+                st.dataframe(
                     df_prod.rename(columns={"product_name": "商品名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                    on_select="rerun", selection_mode="single-row",
-                    use_container_width=True, hide_index=True, height=400,
+                    use_container_width=True, hide_index=True, height=300,
                     column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
                 )
             
             with c_right:
-                st.markdown("**② その商品の内訳 (得意先別)**")
-                if len(event.selection.rows) > 0:
-                    selected_idx = event.selection.rows[0]
-                    selected_prod = df_prod.iloc[selected_idx]["product_name"]
-                    
-                    # Filter raw data
+                st.markdown("**② 内訳 (得意先別)**")
+                if selected_prod:
                     df_detail = df_raw[df_raw["product_name"] == selected_prod].copy()
                     df_detail = df_detail.sort_values("sales_diff", ascending=True)
                     
@@ -432,30 +425,27 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                         use_container_width=True, hide_index=True,
                         column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
                     )
-                else:
-                    st.caption("👈 左の表から商品を選択すると、詳細が表示されます。")
 
         else:
-            # --- Mode B: Customer Focus ---
+            # Mode B: Customer Focus
             with c_left:
-                st.markdown("**① 得意先ワーストランキング**")
-                # 得意先ごとに集約
+                st.markdown("**① 得意先ランキング**")
                 df_cust = df_raw.groupby("customer_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
                 df_cust = df_cust.sort_values("sales_diff", ascending=True)
                 
-                event = st.dataframe(
+                # ★修正: selectboxで選択させる
+                cust_list = df_cust["customer_name"].tolist()
+                selected_cust = st.selectbox("詳細を見る得意先を選択:", cust_list, key="sel_cust")
+                
+                st.dataframe(
                     df_cust.rename(columns={"customer_name": "得意先名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                    on_select="rerun", selection_mode="single-row",
-                    use_container_width=True, hide_index=True, height=400,
+                    use_container_width=True, hide_index=True, height=300,
                     column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
                 )
 
             with c_right:
-                st.markdown("**② その得意先の内訳 (商品別)**")
-                if len(event.selection.rows) > 0:
-                    selected_idx = event.selection.rows[0]
-                    selected_cust = df_cust.iloc[selected_idx]["customer_name"]
-                    
+                st.markdown("**② 内訳 (商品別)**")
+                if selected_cust:
                     df_detail = df_raw[df_raw["customer_name"] == selected_cust].copy()
                     df_detail = df_detail.sort_values("sales_diff", ascending=True)
                     
@@ -465,9 +455,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                         use_container_width=True, hide_index=True,
                         column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
                     )
-                else:
-                    st.caption("👈 左の表から得意先を選択すると、詳細が表示されます。")
-
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
     st.subheader("👤 年度累計（FYTD）｜自分")
@@ -645,7 +632,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.2 Drill-down Analysis & JAN Backfill")
+    st.caption("Updated: v1.6.2 (Safe Mode)")
 
 if __name__ == "__main__":
     main()
