@@ -1,25 +1,20 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜入口高速版（判断専用） - OS v1.6.2 (Safe Mode)
+SFA｜入口高速版（判断専用） - OS v1.6.3 (Enhanced UI/UX)
 
 【システム構成定義】
 - Backend: Google BigQuery (asia-northeast1)
-- Frontend: Streamlit (Compatible with v1.31.0)
+- Frontend: Streamlit (Compatible with v1.31.0+)
 - Logic:
     1. Role Separation: HQ_ADMIN (全社) vs SALES (個人)
     2. Forecasting: Pacing Method (Sales & Gross Profit)
-    3. Analysis: Worst Impact Ranking (Drill-down via Selectbox) ★Modified for compatibility
+    3. Analysis: Worst Impact Ranking (Stateful Drill-down) ★Updated
     4. Recommendation: Gap Analysis (JAN Based)
 
-【参照VIEW一覧】
-- v_dim_staff_role_dedup: 権限管理
-- v_admin_org_fytd_summary_scoped: 全社KPI・着地予測
-- v_admin_product_yoy_worst_ranking: 全社減少要因分析（得意先・商品別・JAN補完済）
-- v_staff_fytd_summary_scoped: 個人KPI
-- v_sales_customer_yoy_*: 得意先別ランキング
-- v_sales_fact_login_jan_daily: 日次ファクト
-- v_sales_recommendation_engine: 戦略提案エンジン
+【更新履歴 v1.6.3】
+- ワースト分析のドリルダウン時に画面がリセットされる問題を修正（Session State導入）
+- 数値表示を3桁カンマ区切り（¥1,234,567）に変更し視認性を向上
 """
 
 from __future__ import annotations
@@ -49,18 +44,12 @@ DATASET_DEFAULT = "sales_data"
 
 # BigQuery Views (FQN)
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
-
-# Admin / Org Views
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 VIEW_WORST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_worst_ranking"
-
-# Staff / Personal Views
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
-
-# Recommendation & Fact Views
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
 
@@ -68,7 +57,6 @@ VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_d
 # -----------------------------
 # Display Mappings (Japanese)
 # -----------------------------
-# KPI Card Columns
 JP_COLS_FYTD = {
     "viewer_email": "閲覧者メール",
     "login_email": "ログインメール",
@@ -84,7 +72,6 @@ JP_COLS_FYTD = {
     "gross_profit_py_fytd": "粗利（前年FYTD）",
     "sales_diff_fytd": "前年差（売上）",
     "gp_diff_fytd": "前年差（粗利）",
-    # Forecasts
     "sales_forecast_total": "売上着地予測（年）",
     "pacing_rate": "売上対前年ペース",
     "sales_amount_py_total": "前年売上実績（年）",
@@ -93,19 +80,6 @@ JP_COLS_FYTD = {
     "gross_profit_py_total": "前年粗利実績（年）",
 }
 
-# Ranking Columns (Worst Analysis)
-JP_COLS_RANK = {
-    "jan": "JANコード",
-    "customer_name": "得意先名",
-    "product_name": "商品名",
-    "maker_name": "メーカー",
-    "sales_cur": "売上(今年)",
-    "sales_prev": "売上(前年)",
-    "sales_diff": "売上差額(Impact)",
-    "sales_rate": "前年比",
-}
-
-# Customer Ranking Columns (YoY)
 JP_COLS_YOY = {
     "login_email": "ログインメール",
     "display_name": "担当者名",
@@ -141,12 +115,11 @@ def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.
 @dataclass(frozen=True)
 class RoleInfo:
     login_email: str
-    role_key: str = "SALES"  # HQ_ADMIN / AREA_MANAGER / SALES
+    role_key: str = "SALES"
     role_admin_view: bool = False
     role_admin_edit: bool = False
     role_sales_view: bool = True
     area_name: str = "未設定"
-
 
 def normalize_role_key(role_key: str) -> str:
     rk = (role_key or "").strip().upper()
@@ -164,14 +137,12 @@ def _secrets_has_bigquery() -> bool:
     bq = st.secrets.get("bigquery", {})
     return bool(bq.get("project_id")) and bool(bq.get("service_account"))
 
-
 def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
     bq = st.secrets["bigquery"]
     project_id = str(bq.get("project_id"))
     location = str(bq.get("location") or DEFAULT_LOCATION)
     sa = dict(bq.get("service_account"))
     return project_id, location, sa
-
 
 def _parse_service_account_json(text: str) -> Dict[str, Any]:
     obj = json.loads(text)
@@ -182,34 +153,27 @@ def _parse_service_account_json(text: str) -> Dict[str, Any]:
             raise ValueError(f"Service Account JSON missing key: {k}")
     return obj
 
-
 def ensure_credentials_ui() -> Tuple[str, str, Dict[str, Any]]:
     st.sidebar.header("接続設定")
-
     if _secrets_has_bigquery():
         project_id, location, sa = _get_bq_from_secrets()
-        st.sidebar.success("Secrets: OK")
+        # st.sidebar.success("Secrets: OK") # UI簡易化のため非表示
         return project_id, location, sa
-
+    
     st.sidebar.warning("Secrets 未設定。JSON貼り付けモードで動作します。")
-
     project_id = st.sidebar.text_input("project_id (Temporary)", value=PROJECT_DEFAULT)
     location = st.sidebar.text_input("location (Temporary)", value=DEFAULT_LOCATION)
     sa_text = st.sidebar.text_area("Service Account JSON", height=100)
-
     if not sa_text.strip():
         st.info("SA JSONを入力してください。")
         st.stop()
-
     try:
         sa = _parse_service_account_json(sa_text.strip())
     except Exception as e:
         st.error(f"JSON Parse Error: {e}")
         st.stop()
-
     sa["project_id"] = project_id.strip() or sa.get("project_id")
     return str(project_id), str(location), sa
-
 
 @st.cache_resource(show_spinner=False)
 def get_bq_client(project_id: str, location: str, sa: Dict[str, Any]) -> bigquery.Client:
@@ -237,11 +201,9 @@ def _build_query_parameters(params: Optional[Dict[str, Any]]) -> List[bigquery.S
             qparams.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
     return qparams
 
-
 def _show_bq_error_context(title: str, sql: str, exc: Exception):
     st.error(f"Query Failed: {title}")
     st.write(f"Exception: {exc}")
-
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
 def cached_query_df(
@@ -250,17 +212,14 @@ def cached_query_df(
 ) -> pd.DataFrame:
     sa = json.loads(sa_json)
     client = get_bq_client(project_id, location, sa)
-    
     params = json.loads(params_json) if params_json else {}
     job_config = bigquery.QueryJobConfig()
     qparams = _build_query_parameters(params)
     if qparams:
         job_config.query_parameters = qparams
-
     job = client.query(sql, job_config=job_config)
     job.result(timeout=timeout_sec)
     return job.to_dataframe(create_bqstorage_client=use_bqstorage)
-
 
 def query_df_safe(
     client: bigquery.Client, sql: str, params: Optional[Dict[str, Any]] = None,
@@ -282,7 +241,6 @@ def query_df_safe(
             job = client.query(sql, job_config=job_config)
             job.result(timeout=timeout_sec)
             return job.to_dataframe(create_bqstorage_client=use_bqstorage)
-
     except (BadRequest, GoogleAPICallError, Exception) as e:
         _show_bq_error_context(label, sql, e)
         return pd.DataFrame()
@@ -294,7 +252,7 @@ def query_df_safe(
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.6.2｜戦略提案｜ワースト分析（ドリルダウン）｜着地予測")
+    st.caption("OS v1.6.3｜戦略提案｜ワースト分析（ドリルダウン改善）｜着地予測")
 
 def sidebar_controls() -> Dict[str, Any]:
     st.sidebar.header("System Settings")
@@ -355,8 +313,13 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 # -----------------------------
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
+    """
+    全社KPI + ワーストランキング分析
+    v1.6.3: セッション管理による画面維持、3桁カンマ区切り表示を適用
+    """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
+    # 全社KPIの読み込み
     if st.button("全社データを読み込む", key="btn_org", use_container_width=True):
         # KPI Card
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
@@ -381,9 +344,10 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             with c6: st.metric("昨年度実績（年）", f"¥{float(row.get('gross_profit_py_total', 0)):,.0f}")
             st.divider()
 
-        # --- Interactive Worst Ranking (Compatible Mode) ---
+        # --- Interactive Worst Ranking (Stateful) ---
         st.subheader("📉 売上減少要因（ワースト分析）")
         
+        # 1. データ取得
         sql_rank = f"SELECT * FROM `{VIEW_WORST_RANK}` LIMIT 3000"
         df_raw = query_df_safe(client, sql_rank, None, "Worst Raw", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
@@ -391,70 +355,113 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 分析軸の選択
-        analysis_mode = st.radio("分析軸:", ["📦 商品軸で見る", "🏥 得意先軸で見る"], horizontal=True)
-        
-        c_left, c_right = st.columns([1, 1])
+        # 2. 分析軸の選択（ラジオボタン）
+        # セッションの状態に応じて表示を制御
+        axis_mode = st.radio("分析軸:", ["📦 商品軸で見る", "🏥 得意先軸で見る"], horizontal=True, key="worst_axis_radio")
+        is_product_mode = "商品" in axis_mode
 
-        if "商品" in analysis_mode:
-            # Mode A: Product Focus
-            with c_left:
-                st.markdown("**① 商品ランキング**")
-                df_prod = df_raw.groupby("product_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_prod = df_prod.sort_values("sales_diff", ascending=True)
-                
-                # ★修正: selectboxで選択させる
-                prod_list = df_prod["product_name"].tolist()
-                selected_prod = st.selectbox("詳細を見る商品を選択:", prod_list, key="sel_prod")
-                
-                st.dataframe(
-                    df_prod.rename(columns={"product_name": "商品名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                    use_container_width=True, hide_index=True, height=300,
-                    column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
-                )
+        # 3. 画面分岐: 「一覧」か「詳細」か
+        if st.session_state.worst_view_mode == 'ranking':
+            # === ランキング一覧画面 ===
             
-            with c_right:
-                st.markdown("**② 内訳 (得意先別)**")
-                if selected_prod:
-                    df_detail = df_raw[df_raw["product_name"] == selected_prod].copy()
-                    df_detail = df_detail.sort_values("sales_diff", ascending=True)
-                    
-                    st.info(f"商品: **{selected_prod}**")
-                    st.dataframe(
-                        df_detail[["customer_name", "sales_diff", "sales_cur", "sales_prev"]].rename(columns={"customer_name": "得意先名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                        use_container_width=True, hide_index=True,
-                        column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
-                    )
-
-        else:
-            # Mode B: Customer Focus
-            with c_left:
-                st.markdown("**① 得意先ランキング**")
-                df_cust = df_raw.groupby("customer_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
-                df_cust = df_cust.sort_values("sales_diff", ascending=True)
+            if is_product_mode:
+                # 商品ごとの集計
+                st.markdown("**① 商品ワーストランキング**")
+                df_group = df_raw.groupby("product_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
+                df_group = df_group.sort_values("sales_diff", ascending=True) # 減少額が大きい順（マイナス）
                 
-                # ★修正: selectboxで選択させる
-                cust_list = df_cust["customer_name"].tolist()
-                selected_cust = st.selectbox("詳細を見る得意先を選択:", cust_list, key="sel_cust")
+                # 表示用設定
+                col_cfg = {
+                    "product_name": st.column_config.TextColumn("商品名", width="medium"),
+                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
+                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
+                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d")
+                }
+                disp_cols = ["product_name", "sales_diff", "sales_cur", "sales_prev"]
+                target_key = "product_name"
                 
-                st.dataframe(
-                    df_cust.rename(columns={"customer_name": "得意先名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                    use_container_width=True, hide_index=True, height=300,
-                    column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
-                )
+            else:
+                # 得意先ごとの集計
+                st.markdown("**① 得意先ワーストランキング**")
+                df_group = df_raw.groupby("customer_name")[["sales_diff", "sales_cur", "sales_prev"]].sum().reset_index()
+                df_group = df_group.sort_values("sales_diff", ascending=True)
 
-            with c_right:
-                st.markdown("**② 内訳 (商品別)**")
-                if selected_cust:
-                    df_detail = df_raw[df_raw["customer_name"] == selected_cust].copy()
-                    df_detail = df_detail.sort_values("sales_diff", ascending=True)
-                    
-                    st.info(f"得意先: **{selected_cust}**")
-                    st.dataframe(
-                        df_detail[["product_name", "sales_diff", "sales_cur", "sales_prev"]].rename(columns={"product_name": "商品名", "sales_diff": "減少額", "sales_cur": "今年", "sales_prev": "前年"}),
-                        use_container_width=True, hide_index=True,
-                        column_config={"減少額": st.column_config.NumberColumn(format="¥%d"), "今年": st.column_config.NumberColumn(format="¥%d")}
-                    )
+                col_cfg = {
+                    "customer_name": st.column_config.TextColumn("得意先名", width="medium"),
+                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
+                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
+                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d")
+                }
+                disp_cols = ["customer_name", "sales_diff", "sales_cur", "sales_prev"]
+                target_key = "customer_name"
+
+            # ランキング表示
+            st.dataframe(
+                df_group[disp_cols],
+                column_config=col_cfg,
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+
+            # ドリルダウン選択UI
+            st.divider()
+            st.info("👇 詳細を見たい項目を選んでボタンを押してください")
+            
+            # 選択肢リスト
+            options_list = df_group[target_key].tolist()
+            selected_item = st.selectbox(
+                f"分析対象を選択:", 
+                options_list, 
+                key="worst_selectbox"
+            )
+
+            if st.button("詳細分析へ移動 ➡", type="primary"):
+                # セッションに保存してリロード
+                st.session_state.worst_selected_name = selected_item
+                st.session_state.worst_view_mode = 'detail'
+                st.rerun()
+
+        elif st.session_state.worst_view_mode == 'detail':
+            # === 詳細分析画面 ===
+            target_name = st.session_state.worst_selected_name
+            
+            # 戻るボタン
+            if st.button("⬅ ランキングに戻る"):
+                st.session_state.worst_view_mode = 'ranking'
+                st.session_state.worst_selected_name = None
+                st.rerun()
+
+            st.title(f"🔍 詳細分析: {target_name}")
+            
+            if is_product_mode:
+                # 商品が選ばれた -> 得意先別の内訳を表示
+                df_detail = df_raw[df_raw["product_name"] == target_name].copy()
+                st.markdown("##### 得意先別 減少内訳")
+                main_col = "customer_name"
+                col_label = "得意先名"
+            else:
+                # 得意先が選ばれた -> 商品別の内訳を表示
+                df_detail = df_raw[df_raw["customer_name"] == target_name].copy()
+                st.markdown("##### 商品別 減少内訳")
+                main_col = "product_name"
+                col_label = "商品名"
+            
+            df_detail = df_detail.sort_values("sales_diff", ascending=True)
+
+            # 詳細テーブル表示 (カンマ区切り)
+            st.dataframe(
+                df_detail[[main_col, "sales_diff", "sales_cur", "sales_prev", "sales_rate"]],
+                column_config={
+                    main_col: st.column_config.TextColumn(col_label),
+                    "sales_diff": st.column_config.NumberColumn("減少額", format="¥%d"),
+                    "sales_cur": st.column_config.NumberColumn("今年", format="¥%d"),
+                    "sales_prev": st.column_config.NumberColumn("前年", format="¥%d"),
+                    "sales_rate": st.column_config.NumberColumn("前年比", format="%.2f")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
 
 def render_fytd_me_section(client, cache_key, login_email, opts):
     st.subheader("👤 年度累計（FYTD）｜自分")
@@ -475,6 +482,7 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         with c3: st.metric("前年実績（年）", f"¥{float(row.get('sales_amount_py_total', 0)):,.0f}")
         
         st.divider()
+        # Dataframe with simple renaming
         st.dataframe(rename_columns_for_display(df_me, JP_COLS_FYTD), use_container_width=True)
 
 def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
@@ -486,6 +494,8 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
             df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
             if not df.empty:
+                # 簡易表示のため、全カラムをカラムコンフィグするのは省略し、
+                # 主要カラムだけ見やすくする（ここでは既存ロジックを踏襲）
                 st.dataframe(rename_columns_for_display(df, JP_COLS_YOY), use_container_width=True)
             else:
                 st.info("0件です。")
@@ -500,7 +510,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
     """
     st.subheader("🎯 得意先別・戦略提案（AI Gap Analysis）")
     
-    # 1. Get Customer List from Fact (Login scoped)
+    # 1. Get Customer List
     sql_cust = f"""
     SELECT DISTINCT customer_code, customer_name
     FROM `{VIEW_FACT_DAILY}`
@@ -522,7 +532,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 
     st.divider()
     
-    # 3. Get Recommendation (Query VIEW_RECOMMEND by Customer)
+    # 3. Get Recommendation
     sql_rec = f"""
     SELECT * FROM `{VIEW_RECOMMEND}`
     WHERE customer_code = @cust_code
@@ -550,7 +560,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         if df_rec.empty:
             st.success("🎉 この領域の主要商品はすべて採用済みです。")
         else:
-            # Display: Hide JAN, Show Product Name & Scale
             disp_df = df_rec[[
                 "priority_rank", "recommend_product", "manufacturer", "market_scale"
             ]].rename(columns={
@@ -569,7 +578,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
                 hide_index=True
             )
             
-    # 5. Reference: Adopted List (Raw Fact)
+    # 5. Reference: Adopted List
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
         SELECT 
@@ -585,13 +594,27 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         LIMIT 100
         """
         df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-        st.dataframe(df_adopted, use_container_width=True)
+        
+        st.dataframe(
+            df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)"}),
+            use_container_width=True,
+            column_config={
+                "売上(FYTD)": st.column_config.NumberColumn(format="¥%d")
+            }
+        )
 
 
 # -----------------------------
 # Main Execution
 # -----------------------------
 def main():
+    # 0. Session State Initialization (Critical for Drill-down)
+    # 画面遷移やリロードでも状態を保持するために初期化
+    if 'worst_view_mode' not in st.session_state:
+        st.session_state.worst_view_mode = 'ranking' # 'ranking' or 'detail'
+    if 'worst_selected_name' not in st.session_state:
+        st.session_state.worst_selected_name = None
+
     set_page()
     
     # 1. Connection
@@ -614,7 +637,7 @@ def main():
     
     st.divider()
     
-    # 4. Routing with New Tabs
+    # 4. Routing with Tabs
     if is_admin:
         t1, t2, t3 = st.tabs(["🏢 全社状況", "👤 エリア/個人", "🎯 戦略提案(Beta)"])
         with t1: render_fytd_org_section(client, cache_key, login_email, opts)
@@ -626,13 +649,13 @@ def main():
             render_customer_drilldown(client, cache_key, login_email, opts)
 
     else:
-        # Sales Role: New Tab Structure
+        # Sales Role
         t1, t2, t3 = st.tabs(["👤 今年の成績", "📊 得意先分析", "🎯 提案を作る"])
         with t1: render_fytd_me_section(client, cache_key, login_email, opts)
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.6.2 (Safe Mode)")
+    st.caption("Updated: v1.6.3 (Safe Mode + Enhanced UI)")
 
 if __name__ == "__main__":
     main()
