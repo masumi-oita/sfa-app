@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.8.0 (Best Ranking & Click Interaction)
+SFA｜戦略ダッシュボード - OS v1.8.1 (Layout Fixed)
 
-【更新履歴 v1.8.0】
-- [Feature] 全社分析に「トップ（Best）ランキング」を追加（ワーストと切替可能）
-- [UI] データフレームの行をクリック（選択）するだけで詳細分析へ遷移する機能を実装
-- [Config] QRコードURLは固定のまま
+【更新履歴 v1.8.1】
+- [UI] ワースト分析画面のレイアウト崩れ（文字重複）を防ぐため、UI配置を整理
+- [Config] QRコードURLを固定設定
+- [Data] BigQuery側で「商品名不明」データが指数表記になる問題をSQL側で対処済み（連携確認）
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
+# ★QRコードの飛び先
 APP_URL = "https://sfa-premium-app-2.streamlit.app/"
 
 PROJECT_DEFAULT = "salesdb-479915"
@@ -39,11 +40,8 @@ DATASET_DEFAULT = "sales_data"
 # BigQuery Views (FQN)
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-
-# Ranking Views
 VIEW_WORST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_worst_ranking"
-VIEW_BEST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_best_ranking" # ★New
-
+VIEW_BEST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_best_ranking"
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
@@ -103,7 +101,7 @@ JP_COLS_YOY = {
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.8.0｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
+    st.caption("OS v1.8.1｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -270,7 +268,7 @@ def get_login_email_ui() -> str:
 
 
 # -----------------------------
-# 7. Render Functions (Core Logic)
+# 7. Render Functions
 # -----------------------------
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
@@ -303,15 +301,17 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             c6.metric("② 昨年度実績", f"¥{gp_py:,.0f}")
             c7.metric("③ 着地予測", f"¥{gp_fc:,.0f}", delta_color="normal")
             c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta=None, delta_color="off")
+            
+            # ★レイアウト調整: スペースを空ける
             st.divider()
+            st.write("") 
 
-        # --- Interactive Ranking (Best & Worst) ---
+        # --- Interactive Ranking ---
         st.subheader("📊 増減要因分析 (ランキング)")
         
         # 1. 軸の選択
         c_mode, c_axis, c_val = st.columns(3)
         with c_mode:
-            # ★Top/Worst 切り替え
             rank_type = st.radio("順位 (Type):", ["📉 ワースト (Worst)", "📈 トップ (Best)"])
             is_worst = "ワースト" in rank_type
         with c_axis:
@@ -345,17 +345,19 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             target_key = "product_name" if is_product_mode else "customer_name"
             target_label = "商品名" if is_product_mode else "得意先名"
             
+            # ★レイアウト調整: スペースを空ける
+            st.write("")
             st.markdown(f"**{rank_type} ランキング ({label_diff}順)**")
             st.caption("👇 行をクリックすると詳細分析へ移動します")
             
             df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
-            # ソート: Bestなら降順、Worstなら昇順
+            # ソート
             df_group = df_group.sort_values(col_target, ascending=not is_worst)
             
             # 合計行
             df_display = append_total_row(df_group, label_col=target_key)
             
-            # ★Click Event Implementation
+            # Click Event
             selection = st.dataframe(
                 df_display[[target_key, col_target, col_cur, col_prev]], 
                 column_config={
@@ -367,17 +369,13 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
                 use_container_width=True, 
                 hide_index=True, 
                 height=400,
-                on_select="rerun", # ★クリックでリラン
+                on_select="rerun",
                 selection_mode="single-row"
             )
             
-            # クリックイベントのハンドリング
             if len(selection.selection.rows) > 0:
                 selected_idx = selection.selection.rows[0]
-                # 合計行(最後の行)をクリックした場合は無視するなどの制御も可能だが、
-                # 今回はシンプルに名前を取得して遷移
                 selected_name = df_display.iloc[selected_idx][target_key]
-                
                 if selected_name != "=== 合計 ===":
                     st.session_state.worst_selected_name = selected_name
                     st.session_state.worst_view_mode = 'detail'
@@ -490,6 +488,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
     
     sql_cust = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_FACT_DAILY}` WHERE login_email = @login_email ORDER BY customer_code"
     df_cust = query_df_safe(client, sql_cust, {"login_email": login_email}, "Cust List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    
     if df_cust.empty:
         st.info("担当得意先データがありません（またはログインメール不一致）。")
         return
@@ -516,23 +515,31 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
     with c2:
         st.markdown("#### 💡 AI提案リスト（未採用のチャンス商品）")
         st.caption(f"全社の **{strong_cat}** 売上TOP10のうち、**未採用**の商品")
+        
         if df_rec.empty:
             st.success("🎉 この領域の主要商品はすべて採用済みです。")
         else:
             disp_df = df_rec[["priority_rank", "recommend_product", "manufacturer", "market_scale"]].rename(columns={"priority_rank": "優先順位", "recommend_product": "推奨商品名", "manufacturer": "メーカー", "market_scale": "全社売上規模"})
-            st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=create_default_column_config(disp_df))
+            col_cfg = create_default_column_config(disp_df)
+            st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=col_cfg)
             
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
-        SELECT m.product_name, SUM(t.sales_amount) as sales_fytd, SUM(t.gross_profit) as gp_fytd
-        FROM `{VIEW_FACT_DAILY}` t LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m 
-        ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING)
+        SELECT 
+            m.product_name, 
+            SUM(t.sales_amount) as sales_fytd,
+            SUM(t.gross_profit) as gp_fytd
+        FROM `{VIEW_FACT_DAILY}` t
+        LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m 
+            ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING)
         WHERE t.customer_code = @cust_code AND t.fiscal_year = 2025
         GROUP BY 1 ORDER BY 2 DESC LIMIT 100
         """
         df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+        
         renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)", "gp_fytd": "粗利(FYTD)"})
-        st.dataframe(renamed_df, use_container_width=True, column_config=create_default_column_config(renamed_df))
+        col_cfg = create_default_column_config(renamed_df)
+        st.dataframe(renamed_df, use_container_width=True, column_config=col_cfg)
 
 
 # -----------------------------
@@ -544,6 +551,7 @@ def main():
     if 'org_data_loaded' not in st.session_state: st.session_state.org_data_loaded = False
 
     set_page()
+    
     client, project_id, location, sa_json = setup_bigquery_client()
     cache_key = (project_id, location, sa_json)
     
@@ -570,7 +578,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.8.0 (Best Ranking & Click Select)")
+    st.caption("Updated: v1.8.1 (Layout Fixed)")
 
 if __name__ == "__main__":
     main()
