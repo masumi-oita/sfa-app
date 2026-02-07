@@ -1,18 +1,16 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.7 (QR Code Added)
+SFA｜戦略ダッシュボード - OS v1.7.8 (Fix: No-Install QR Code)
 
-【更新履歴 v1.7.7】
-- [UI] サイドバーの最上部に、このアプリへアクセスするためのQRコードを追加
-  （※要 qrcode, pillow ライブラリインストール）
+【更新履歴 v1.7.8】
+- [Fix] ModuleNotFoundError回避のため、QRコード生成をライブラリ依存からAPI経由に変更
+- [UI] BigQueryのエラー回避のためSQLロジックのコメントアウトを整理（SQLは別途BigQuery側で更新が必要）
 """
 
 from __future__ import annotations
 
 import json
-import qrcode  # ★追加: QRコード生成用
-from io import BytesIO # ★追加: 画像データ処理用
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -32,8 +30,8 @@ APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
-# ★TODO: ここを実際にデプロイしたアプリのURLに書き換えてください★
-APP_URL = "https://share.streamlit.io/your-org/your-repo/main/app.py"
+# ★実際のアプリURLに書き換えてください（QRコードの飛び先になります）
+APP_URL = "https://share.streamlit.io/" 
 
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
@@ -102,29 +100,11 @@ def set_page():
     """ページ設定（必ず最初に呼ぶ）"""
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.7｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.8｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
-@st.cache_data(show_spinner=False)
-def generate_qr_code(url: str) -> BytesIO:
-    """★追加: URLからQRコード画像を生成しバイトストリームで返す"""
-    try:
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=2,
-        )
-        qr.add_data(url)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="#333333", back_color="white")
-        
-        img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format='PNG')
-        img_byte_arr.seek(0)
-        return img_byte_arr
-    except Exception as e:
-        st.error(f"QR Code Generation Failed: {e}")
-        return BytesIO()
+def get_qr_code_url(url: str) -> str:
+    """★変更: ライブラリ不要のQRコード生成APIを利用"""
+    return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
 
 def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     if df is None or df.empty:
@@ -288,10 +268,9 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 # 6. Sidebar
 # -----------------------------
 def sidebar_controls() -> Dict[str, Any]:
-    # ★追加: QRコード表示
-    qr_image = generate_qr_code(APP_URL)
-    if qr_image:
-        st.sidebar.image(qr_image, caption="📱スマホでアクセス", use_container_width=True)
+    # ★変更: APIを使ったQRコード表示（ライブラリ不要）
+    qr_url = get_qr_code_url(APP_URL)
+    st.sidebar.image(qr_url, caption="📱スマホでアクセス", width=150)
     st.sidebar.divider()
 
     st.sidebar.header("System Settings")
@@ -608,7 +587,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.7 (QR Code Added)")
+    st.caption("Updated: v1.7.8 (Fix: No-Install QR Code)")
 
 if __name__ == "__main__":
     main()
