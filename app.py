@@ -1,17 +1,18 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.5 (Stability Final: Explicit Configs)
+SFA｜戦略ダッシュボード - OS v1.7.7 (QR Code Added)
 
-【更新履歴 v1.7.5】
-- [Fix] AttributeErrorの原因となる「設定の動的変更」を廃止し、明示的な定義に変更
-- [Fix] NameErrorを防ぐため、関数の定義順序を最適化（set_pageを上部に移動）
-- [UI] 全てのテーブルで「3桁カンマ区切り」と「合計行」を維持
+【更新履歴 v1.7.7】
+- [UI] サイドバーの最上部に、このアプリへアクセスするためのQRコードを追加
+  （※要 qrcode, pillow ライブラリインストール）
 """
 
 from __future__ import annotations
 
 import json
+import qrcode  # ★追加: QRコード生成用
+from io import BytesIO # ★追加: 画像データ処理用
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +31,9 @@ from google.api_core.exceptions import BadRequest, GoogleAPICallError
 APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
+
+# ★TODO: ここを実際にデプロイしたアプリのURLに書き換えてください★
+APP_URL = "https://share.streamlit.io/your-org/your-repo/main/app.py"
 
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
@@ -98,7 +102,29 @@ def set_page():
     """ページ設定（必ず最初に呼ぶ）"""
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.5｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.7｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+
+@st.cache_data(show_spinner=False)
+def generate_qr_code(url: str) -> BytesIO:
+    """★追加: URLからQRコード画像を生成しバイトストリームで返す"""
+    try:
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=2,
+        )
+        qr.add_data(url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="#333333", back_color="white")
+        
+        img_byte_arr = BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        return img_byte_arr
+    except Exception as e:
+        st.error(f"QR Code Generation Failed: {e}")
+        return BytesIO()
 
 def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
     if df is None or df.empty:
@@ -130,6 +156,20 @@ def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
     total_data[target_label] = "=== 合計 ==="
     
     return pd.concat([df, pd.DataFrame([total_data])], ignore_index=True)
+
+def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
+    """デフォルトのカラム設定を作成"""
+    config = {}
+    for col in df.columns:
+        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP", "amount", "profit", "diff", "cur", "prev"]):
+            config[col] = st.column_config.NumberColumn(col, format="¥%d")
+        elif any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
+            config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+        elif is_numeric_dtype(df[col]):
+            config[col] = st.column_config.NumberColumn(col, format="%d")
+        else:
+            config[col] = st.column_config.TextColumn(col)
+    return config
 
 
 # -----------------------------
@@ -248,6 +288,12 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 # 6. Sidebar
 # -----------------------------
 def sidebar_controls() -> Dict[str, Any]:
+    # ★追加: QRコード表示
+    qr_image = generate_qr_code(APP_URL)
+    if qr_image:
+        st.sidebar.image(qr_image, caption="📱スマホでアクセス", use_container_width=True)
+    st.sidebar.divider()
+
     st.sidebar.header("System Settings")
     use_bqstorage = st.sidebar.toggle("Use Storage API (Fast)", value=True)
     timeout_sec = st.sidebar.slider("Query Timeout (sec)", 10, 300, 60, 10)
@@ -268,7 +314,7 @@ def get_login_email_ui() -> str:
 
 
 # -----------------------------
-# 7. Render Functions (Fixed Configs)
+# 7. Render Functions
 # -----------------------------
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
@@ -353,7 +399,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.divider()
             
             options_list = df_group[target_key].tolist()
-            # 合計行は選択肢から除外
             if "=== 合計 ===" in options_list: options_list.remove("=== 合計 ===")
             
             selected_item = st.selectbox(f"詳細分析する対象を選択:", options_list, key="worst_selectbox")
@@ -431,7 +476,6 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
         c8.metric("④ GAP (予測 - 昨年)", f"¥{gp_gap:,.0f}", delta_color="off")
         st.divider()
         
-        # テーブル表示 (Explicit Config)
         df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
         cols = list(df_disp.columns)
         if "ログインメール" in cols: cols.remove("ログインメール")
@@ -440,17 +484,8 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             cols.remove("担当者名")
             cols.insert(0, "担当者名")
         
-        # Config構築
-        cfg = {}
-        for c in cols:
-            if "売上" in c or "粗利" in c or "差" in c:
-                cfg[c] = st.column_config.NumberColumn(c, format="¥%d")
-            elif "率" in c or "ペース" in c:
-                cfg[c] = st.column_config.NumberColumn(c, format="%.1f%%")
-            else:
-                cfg[c] = st.column_config.TextColumn(c)
-
-        st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=cfg)
+        col_cfg = create_default_column_config(df_disp[cols])
+        st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=col_cfg)
 
 def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
     st.subheader("📊 当月YoY（得意先ランキング）")
@@ -469,17 +504,8 @@ def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
                     cols.insert(0, "担当者名")
                 
                 df_final = append_total_row(df_disp[cols], label_col="担当者名")
-                
-                cfg = {}
-                for c in cols:
-                    if "売上" in c or "粗利" in c or "差" in c:
-                        cfg[c] = st.column_config.NumberColumn(c, format="¥%d")
-                    elif "率" in c:
-                        cfg[c] = st.column_config.NumberColumn(c, format="%.1f%%")
-                    else:
-                        cfg[c] = st.column_config.TextColumn(c)
-
-                st.dataframe(df_final, use_container_width=True, hide_index=True, column_config=cfg)
+                col_cfg = create_default_column_config(df_final)
+                st.dataframe(df_final, use_container_width=True, hide_index=True, column_config=col_cfg)
             else:
                 st.info("0件です。")
 
@@ -524,19 +550,26 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
             st.success("🎉 この領域の主要商品はすべて採用済みです。")
         else:
             disp_df = df_rec[["priority_rank", "recommend_product", "manufacturer", "market_scale"]].rename(columns={"priority_rank": "優先順位", "recommend_product": "推奨商品名", "manufacturer": "メーカー", "market_scale": "全社売上規模"})
-            st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config={"全社売上規模": st.column_config.NumberColumn(format="¥%d")})
+            col_cfg = create_default_column_config(disp_df)
+            st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=col_cfg)
             
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
-        SELECT m.product_name, SUM(t.sales_amount) as sales_fytd
-        FROM `{VIEW_FACT_DAILY}` t LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m 
-        ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING)
+        SELECT 
+            m.product_name, 
+            SUM(t.sales_amount) as sales_fytd,
+            SUM(t.gross_profit) as gp_fytd
+        FROM `{VIEW_FACT_DAILY}` t
+        LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m 
+            ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING)
         WHERE t.customer_code = @cust_code AND t.fiscal_year = 2025
         GROUP BY 1 ORDER BY 2 DESC LIMIT 100
         """
         df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-        renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)"})
-        st.dataframe(renamed_df, use_container_width=True, column_config={"売上(FYTD)": st.column_config.NumberColumn(format="¥%d")})
+        
+        renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)", "gp_fytd": "粗利(FYTD)"})
+        col_cfg = create_default_column_config(renamed_df)
+        st.dataframe(renamed_df, use_container_width=True, column_config=col_cfg)
 
 
 # -----------------------------
@@ -575,7 +608,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.5 (Stability Final)")
+    st.caption("Updated: v1.7.7 (QR Code Added)")
 
 if __name__ == "__main__":
     main()
