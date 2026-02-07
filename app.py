@@ -1,11 +1,10 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.7.8 (Fix: No-Install QR Code)
+SFA｜戦略ダッシュボード - OS v1.7.9 (URL Hardcoded)
 
-【更新履歴 v1.7.8】
-- [Fix] ModuleNotFoundError回避のため、QRコード生成をライブラリ依存からAPI経由に変更
-- [UI] BigQueryのエラー回避のためSQLロジックのコメントアウトを整理（SQLは別途BigQuery側で更新が必要）
+【更新履歴 v1.7.9】
+- [Config] QRコードの遷移先URLを「https://sfa-premium-app-2.streamlit.app/」に固定
 """
 
 from __future__ import annotations
@@ -30,8 +29,8 @@ APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
-# ★実際のアプリURLに書き換えてください（QRコードの飛び先になります）
-APP_URL = "https://share.streamlit.io/" 
+# ★変更: SFAのURLを直接指定しました
+APP_URL = "https://sfa-premium-app-2.streamlit.app/"
 
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
@@ -100,10 +99,10 @@ def set_page():
     """ページ設定（必ず最初に呼ぶ）"""
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.7.8｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
+    st.caption("OS v1.7.9｜戦略提案｜ワースト分析｜着地予測ダッシュボード")
 
 def get_qr_code_url(url: str) -> str:
-    """★変更: ライブラリ不要のQRコード生成APIを利用"""
+    """ライブラリ不要のQRコード生成APIを利用"""
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
 
 def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
@@ -268,7 +267,7 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
 # 6. Sidebar
 # -----------------------------
 def sidebar_controls() -> Dict[str, Any]:
-    # ★変更: APIを使ったQRコード表示（ライブラリ不要）
+    # QRコード表示 (API利用)
     qr_url = get_qr_code_url(APP_URL)
     st.sidebar.image(qr_url, caption="📱スマホでアクセス", width=150)
     st.sidebar.divider()
@@ -587,7 +586,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.7.8 (Fix: No-Install QR Code)")
+    st.caption("Updated: v1.7.9 (URL Hardcoded)")
 
 if __name__ == "__main__":
     main()
