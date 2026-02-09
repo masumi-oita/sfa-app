@@ -1,12 +1,11 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.9.0 (Stable)
+SFA｜戦略ダッシュボード - OS v1.9.1 (Stable/BugFix)
 
-【更新履歴 v1.9.0】
-- [Fix] KPI数値がNullの場合にTypeErrorになる問題を修正 (float変換ロジック強化)
-- [Feat] ランキング表でヘッダークリックによるソート（並べ替え）機能を追加
-- [Data] BigQuery View修正に対応（JANコード復元・年度カラム対応版）
+【更新履歴 v1.9.1】
+- [Fix] Pandasのpd.NA型による「boolean value of NA is ambiguous」エラーを修正 (fillna(0)適用)
+- [Feat] ランキング表のソート機能、JANコード対応、年度カラム対応を統合
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from pandas.api.types import is_numeric_dtype
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from google.api_core.exceptions import BadRequest, GoogleAPICallError
 
 
 # -----------------------------
@@ -101,7 +99,7 @@ JP_COLS_YOY = {
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.9.0 (Stable)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
+    st.caption("OS v1.9.1 (Stable)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -126,6 +124,7 @@ def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
             total_data[col] = ""
     target_label = label_col if label_col and label_col in df.columns else df.columns[0]
     total_data[target_label] = "=== 合計 ==="
+    # pd.concat verify_integrity=False is default
     return pd.concat([df, pd.DataFrame([total_data])], ignore_index=True)
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -274,7 +273,7 @@ def get_login_email_ui() -> str:
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
     【修正済み】
-    1. NullデータのTypeError回避
+    1. df.fillna(0) で pd.NA エラーを回避
     2. st.dataframeによるヘッダーソート対応
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
@@ -287,14 +286,16 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
         df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
         
         if not df_org.empty:
+            # ★Fix: pandasのNA/NaNを0に置換して、TypeErrorを防ぐ
+            df_org = df_org.fillna(0)
             row = df_org.iloc[0]
-            # 【修正】Null安全なfloat変換
-            s_cur = float(row.get('sales_amount_fytd') or 0)
-            s_py = float(row.get('sales_amount_py_total') or 0)
-            s_fc = float(row.get('sales_forecast_total') or 0)
-            gp_cur = float(row.get('gross_profit_fytd') or 0)
-            gp_py = float(row.get('gross_profit_py_total') or 0)
-            gp_fc = float(row.get('gp_forecast_total') or 0)
+            
+            s_cur = float(row.get('sales_amount_fytd', 0))
+            s_py = float(row.get('sales_amount_py_total', 0))
+            s_fc = float(row.get('sales_forecast_total', 0))
+            gp_cur = float(row.get('gross_profit_fytd', 0))
+            gp_py = float(row.get('gross_profit_py_total', 0))
+            gp_fc = float(row.get('gp_forecast_total', 0))
 
             st.markdown("##### ■ 売上 (Sales)")
             c1, c2, c3, c4 = st.columns(4)
@@ -353,13 +354,13 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.caption("👇 表のヘッダーをクリックすると並べ替えができます")
             
             df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
-            # 初期ソート（ワーストは昇順、トップは降順）
+            # 初期ソート
             df_group = df_group.sort_values(col_target, ascending=not is_worst)
             
-            # 合計行を追加
+            # 合計行
             df_display = append_total_row(df_group, label_col=target_key)
             
-            # 【機能追加】並べ替え可能なデータフレーム
+            # ソート可能なDataFrame
             selection = st.dataframe(
                 df_display[[target_key, col_target, col_cur, col_prev]], 
                 column_config={
@@ -426,13 +427,16 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             st.warning("データがありません。")
             return
 
+        # ★Fix: pandasのNA/NaNを0に置換
+        df_me = df_me.fillna(0)
         row = df_me.iloc[0]
-        s_cur = float(row.get('sales_amount_fytd') or 0)
-        s_fc = float(row.get('sales_forecast_total') or 0)
-        s_py = float(row.get('sales_amount_py_total') or 0)
-        gp_cur = float(row.get('gross_profit_fytd') or 0)
-        gp_fc = float(row.get('gp_forecast_total') or 0)
-        gp_py = float(row.get('gross_profit_py_total') or 0)
+
+        s_cur = float(row.get('sales_amount_fytd', 0))
+        s_fc = float(row.get('sales_forecast_total', 0))
+        s_py = float(row.get('sales_amount_py_total', 0))
+        gp_cur = float(row.get('gross_profit_fytd', 0))
+        gp_fc = float(row.get('gp_forecast_total', 0))
+        gp_py = float(row.get('gross_profit_py_total', 0))
 
         st.markdown("##### ■ 売上 (Sales)")
         c1, c2, c3, c4 = st.columns(4)
@@ -582,7 +586,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.9.0 (Stable)")
+    st.caption("Updated: v1.9.1 (Stable/BugFix)")
 
 if __name__ == "__main__":
     main()
