@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.9.3 (Drill-Down Update)
+SFA｜戦略ダッシュボード - OS v1.9.7 (High Performance / Dynamic SQL)
 
-【更新履歴 v1.9.3】
-- [New] 商品ランキングからの3段階ドリルダウン分析機能を実装
-  (ランキング -> 得意先別増減 -> 得意先別商品構成)
-- [Update] 全社状況タブのUIを整理し、分析機能を強化
+【更新履歴 v1.9.7】
+- [Performance] 計算処理をPythonからBigQuery(SQL)へ完全移管。大量データでも高速動作。
+- [Architecture] ランキング用個別Viewを廃止し、統合View(`v_sales_fact_unified`)への動的クエリに一本化。
+- [Feature] 「商品/得意先」×「売上/粗利」の多次元分析とドリルダウンを実装。
 """
 
 from __future__ import annotations
@@ -24,117 +24,55 @@ from google.oauth2 import service_account
 
 
 # -----------------------------
-# 1. Configuration & Constants
+# 1. Configuration
 # -----------------------------
 APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
 CACHE_TTL_SEC = 300
 
-# ★QRコードの飛び先
 APP_URL = "https://sfa-premium-app-2.streamlit.app/"
-
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
-# BigQuery Views (FQN)
-VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
+# ★分析の土台となる統合View
+VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
+
+# KPIカード用などの既存View（これらは維持）
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-VIEW_WORST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_worst_ranking"
-VIEW_BEST_RANK = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_product_yoy_best_ranking"
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
-# ★Drill-down用 (Raw Fact View)
-VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
+VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_dim_staff_role_dedup"
+
+# 除外コード定義（SQLに埋め込む用）
+NOISE_JAN_SQL = "('0', '22221', '99998', '33334')"
 
 
 # -----------------------------
-# 2. Display Mappings
-# -----------------------------
-JP_COLS_FYTD = {
-    "viewer_email": "閲覧者メール",
-    "login_email": "ログインメール",
-    "display_name": "担当者名",
-    "role_tier": "ロール",
-    "area_name": "エリア",
-    "current_month": "基準日",
-    "fy_start": "年度開始",
-    "sales_amount_fytd": "売上（FYTD）",
-    "gross_profit_fytd": "粗利（FYTD）",
-    "gross_profit_rate_fytd": "粗利率（FYTD）",
-    "sales_amount_py_fytd": "売上（前年FYTD）",
-    "gross_profit_py_fytd": "粗利（前年FYTD）",
-    "sales_diff_fytd": "前年差（売上）",
-    "gp_diff_fytd": "前年差（粗利）",
-    "sales_forecast_total": "売上着地予測（年）",
-    "pacing_rate": "売上対前年ペース",
-    "sales_amount_py_total": "前年売上実績（年）",
-    "gp_forecast_total": "粗利着地予測（年）",
-    "gp_pacing_rate": "粗利対前年ペース",
-    "gross_profit_py_total": "前年粗利実績（年）",
-}
-
-JP_COLS_YOY = {
-    "login_email": "ログインメール",
-    "display_name": "担当者名",
-    "month": "対象月（月初）",
-    "customer_code": "得意先コード",
-    "customer_name": "得意先名",
-    "sales_amount": "売上（当月）",
-    "gross_profit": "粗利（当月）",
-    "gross_profit_rate": "粗利率（当月）",
-    "sales_amount_py": "売上（前年同月）",
-    "gross_profit_py": "粗利（前年同月）",
-    "gross_profit_rate_py": "粗利率（前年同月）",
-    "sales_diff_yoy": "前年差（売上）",
-    "gp_diff_yoy": "前年差（粗利）",
-    "sales_yoy_rate": "前年同月比（売上）",
-    "gp_yoy_rate": "前年同月比（粗利）",
-}
-
-
-# -----------------------------
-# 3. Helper Functions
+# 2. Helpers (Display)
 # -----------------------------
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.9.3 (Drill-Down Update)｜戦略提案｜3段階ドリルダウン分析｜着地予測")
+    st.caption("OS v1.9.7 (High Performance)｜BigQuery集計・動的SQL版")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
 
 def rename_columns_for_display(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
+    if df is None or df.empty: return df
     cols = {c: mapping.get(c, c) for c in df.columns}
     return df.rename(columns=cols)
-
-def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
-    if df.empty: return df
-    num_cols = df.select_dtypes(include=['number']).columns
-    total_data = {}
-    for col in df.columns:
-        if col in num_cols:
-            if any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
-                total_data[col] = None
-            else:
-                total_data[col] = df[col].sum()
-        else:
-            total_data[col] = ""
-    target_label = label_col if label_col and label_col in df.columns else df.columns[0]
-    total_data[target_label] = "=== 合計 ==="
-    return pd.concat([df, pd.DataFrame([total_data])], ignore_index=True)
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     config = {}
     for col in df.columns:
-        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP", "amount", "profit", "diff", "cur", "prev"]):
+        if any(k in col for k in ["売上", "粗利", "金額", "差", "実績", "予測", "GAP"]):
             config[col] = st.column_config.NumberColumn(col, format="¥%d")
-        elif any(k in col for k in ["率", "比", "ペース", "rate", "pace"]):
+        elif any(k in col for k in ["率", "比", "ペース"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
         elif is_numeric_dtype(df[col]):
             config[col] = st.column_config.NumberColumn(col, format="%d")
@@ -144,118 +82,154 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
 
 def get_safe_float(row: pd.Series, key: str) -> float:
     val = row.get(key)
-    if pd.isna(val):
-        return 0.0
+    if pd.isna(val): return 0.0
     return float(val)
 
+JP_COLS_FYTD = {
+    "login_email": "ログインメール", "display_name": "担当者名",
+    "sales_amount_fytd": "売上（FYTD）", "gross_profit_fytd": "粗利（FYTD）",
+    "sales_amount_py_total": "前年売上実績（年）", "sales_forecast_total": "売上着地予測（年）",
+    "gross_profit_py_total": "前年粗利実績（年）", "gp_forecast_total": "粗利着地予測（年）"
+}
+JP_COLS_YOY = {
+    "customer_code": "得意先コード", "customer_name": "得意先名",
+    "sales_amount": "売上（当月）", "gross_profit": "粗利（当月）",
+    "sales_amount_py": "売上（前年同月）", "sales_diff_yoy": "前年差（売上）"
+}
+
 
 # -----------------------------
-# 4. Role & Auth
+# 3. BigQuery Connection
 # -----------------------------
+def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
+    if "bigquery" not in st.secrets:
+        st.error("❌ Secrets設定が見つかりません。")
+        st.stop()
+    bq = st.secrets["bigquery"]
+    project_id = str(bq.get("project_id"))
+    location = str(bq.get("location") or DEFAULT_LOCATION)
+    sa = dict(bq.get("service_account"))
+    creds = service_account.Credentials.from_service_account_info(sa)
+    client = bigquery.Client(project=project_id, credentials=creds, location=location)
+    return client, project_id, location, json.dumps(sa)
+
+def query_df_safe(client: bigquery.Client, sql: str, params: Optional[Dict[str, Any]] = None, label: str = "", use_bqstorage: bool = True, timeout_sec: int = 60) -> pd.DataFrame:
+    try:
+        job_config = bigquery.QueryJobConfig()
+        qparams = []
+        if params:
+            for k, v in params.items():
+                if isinstance(v, int): qparams.append(bigquery.ScalarQueryParameter(k, "INT64", v))
+                elif isinstance(v, float): qparams.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
+                else: qparams.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
+        if qparams: job_config.query_parameters = qparams
+        job = client.query(sql, job_config=job_config)
+        job.result(timeout=timeout_sec)
+        return job.to_dataframe(create_bqstorage_client=use_bqstorage)
+    except Exception as e:
+        st.error(f"Query Failed: {label}\n{e}")
+        return pd.DataFrame()
+
 @dataclass(frozen=True)
 class RoleInfo:
     login_email: str
     role_key: str = "SALES"
     role_admin_view: bool = False
-    role_admin_edit: bool = False
-    role_sales_view: bool = True
     area_name: str = "未設定"
 
-def normalize_role_key(role_key: str) -> str:
-    rk = (role_key or "").strip().upper()
-    if rk in ("HQ_ADMIN", "AREA_MANAGER", "SALES"):
-        return rk
-    return "SALES"
-
-def _secrets_has_bigquery() -> bool:
-    if "bigquery" not in st.secrets: return False
-    bq = st.secrets.get("bigquery", {})
-    return bool(bq.get("project_id")) and bool(bq.get("service_account"))
-
-def _get_bq_from_secrets() -> Tuple[str, str, Dict[str, Any]]:
-    bq = st.secrets["bigquery"]
-    return str(bq.get("project_id")), str(bq.get("location") or DEFAULT_LOCATION), dict(bq.get("service_account"))
-
-def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
-    if not _secrets_has_bigquery():
-        st.error("❌ Secrets設定が見つかりません。")
-        st.stop()
-    project_id, location, sa = _get_bq_from_secrets()
-    sa_json = json.dumps(sa)
-    creds = service_account.Credentials.from_service_account_info(sa)
-    client = bigquery.Client(project=project_id, credentials=creds, location=location)
-    return client, project_id, location, sa_json
-
-
-# -----------------------------
-# 5. Query Execution
-# -----------------------------
-def _build_query_parameters(params: Optional[Dict[str, Any]]) -> List[bigquery.ScalarQueryParameter]:
-    qparams = []
-    if not params: return qparams
-    for k, v in params.items():
-        if isinstance(v, bool): qparams.append(bigquery.ScalarQueryParameter(k, "BOOL", v))
-        elif isinstance(v, int): qparams.append(bigquery.ScalarQueryParameter(k, "INT64", v))
-        elif isinstance(v, float): qparams.append(bigquery.ScalarQueryParameter(k, "FLOAT64", v))
-        elif v is None: qparams.append(bigquery.ScalarQueryParameter(k, "STRING", ""))
-        else: qparams.append(bigquery.ScalarQueryParameter(k, "STRING", str(v)))
-    return qparams
-
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SEC)
-def cached_query_df(project_id: str, location: str, sa_json: str, sql: str, params_json: str, use_bqstorage: bool, timeout_sec: int) -> pd.DataFrame:
-    sa = json.loads(sa_json)
-    creds = service_account.Credentials.from_service_account_info(sa)
-    client = bigquery.Client(project=project_id, credentials=creds, location=location)
-    params = json.loads(params_json) if params_json else {}
-    job_config = bigquery.QueryJobConfig()
-    qparams = _build_query_parameters(params)
-    if qparams: job_config.query_parameters = qparams
-    job = client.query(sql, job_config=job_config)
-    job.result(timeout=timeout_sec)
-    return job.to_dataframe(create_bqstorage_client=use_bqstorage)
-
-def query_df_safe(client: bigquery.Client, sql: str, params: Optional[Dict[str, Any]] = None, label: str = "", use_bqstorage: bool = True, timeout_sec: int = 60, cache_key: Optional[Tuple[str, str, str]] = None) -> pd.DataFrame:
-    params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
-    try:
-        if cache_key:
-            project_id, location, sa_json = cache_key
-            return cached_query_df(project_id, location, sa_json, sql, params_json, use_bqstorage, timeout_sec)
-        else:
-            job_config = bigquery.QueryJobConfig()
-            qparams = _build_query_parameters(params or {})
-            if qparams: job_config.query_parameters = qparams
-            job = client.query(sql, job_config=job_config)
-            job.result(timeout=timeout_sec)
-            return job.to_dataframe(create_bqstorage_client=use_bqstorage)
-    except Exception as e:
-        st.error(f"Query Failed: {label}\n{e}")
-        return pd.DataFrame()
-
-def resolve_role(client, cache_key, login_email, opts) -> RoleInfo:
+def resolve_role(client, login_email) -> RoleInfo:
     sql = f"SELECT login_email, role_tier, role_admin_view, area_name FROM `{VIEW_ROLE}` WHERE login_email = @login_email LIMIT 1"
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Role Check", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    df = query_df_safe(client, sql, {"login_email": login_email}, "Role Check")
     if df.empty: return RoleInfo(login_email=login_email)
     r = df.iloc[0]
-    return RoleInfo(login_email=login_email, role_key=normalize_role_key(str(r.get("role_tier"))), role_admin_view=bool(r.get("role_admin_view")), area_name=str(r.get("area_name", "未設定")))
+    rk = str(r.get("role_tier", "")).strip().upper()
+    rk = rk if rk in ("HQ_ADMIN", "AREA_MANAGER", "SALES") else "SALES"
+    return RoleInfo(login_email=login_email, role_key=rk, role_admin_view=bool(r.get("role_admin_view")), area_name=str(r.get("area_name", "未設定")))
 
-def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, opts, allow_fallback=False):
+def run_scoped_query(client, sql_template, scope_col, login_email, allow_fallback=False):
     sql = sql_template.replace("__WHERE__", f"WHERE {scope_col} = @login_email")
-    if opts["show_sql"]: st.code(sql, language="sql")
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Scoped Query", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    df = query_df_safe(client, sql, {"login_email": login_email}, "Scoped Query")
     if not df.empty: return df
     if allow_fallback:
         sql_all = sql_template.replace("__WHERE__", f'WHERE {scope_col} = "all" OR {scope_col} IS NULL')
-        if opts["show_sql"]: st.code(sql_all, language="sql")
-        return query_df_safe(client, sql_all, None, "Fallback Query", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+        return query_df_safe(client, sql_all, None, "Fallback Query")
     return pd.DataFrame()
 
-# --- Drill-Down Queries ---
-def get_product_drilldown(client, cache_key, product_name: str, is_worst: bool, opts) -> pd.DataFrame:
-    """商品 -> 得意先別増減内訳"""
-    sort_order = "ASC" if is_worst else "DESC"
+
+# -----------------------------
+# 4. ★BigQuery Calculation Logic★
+# -----------------------------
+def fetch_ranking_from_bq(client, ranking_type: str, axis_mode: str, is_sales_mode: bool) -> pd.DataFrame:
+    """
+    BigQuery側で集計・ソート・フィルタリングを行い、結果(TOP1000)だけを取得します。
+    """
+    is_worst = (ranking_type == "worst")
+    is_product = (axis_mode == "product")
+    
+    # 集計軸
+    group_col = "product_name" if is_product else "customer_name"
+    
+    # 評価指標 (売上 or 粗利)
+    target_val = "sales_amount" if is_sales_mode else "gross_profit"
+    
+    # ソート順
+    order_dir = "ASC" if is_worst else "DESC"
+
+    # SQL構築
+    sql = f"""
+    WITH base_stats AS (
+        SELECT MAX(fiscal_year) AS current_fy FROM `{VIEW_UNIFIED}`
+    )
+    SELECT
+        {group_col} AS name,
+        
+        -- 集計 (SUM)
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) THEN sales_amount ELSE 0 END) AS sales_cur,
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) THEN gross_profit ELSE 0 END) AS gp_cur,
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) - 1 THEN sales_amount ELSE 0 END) AS sales_prev,
+        
+        -- 差額計算 (Difference)
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) THEN {target_val} ELSE 0 END) - 
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) - 1 THEN {target_val} ELSE 0 END) AS diff_val,
+
+        -- 売上差額 (表示用)
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) THEN sales_amount ELSE 0 END) - 
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) - 1 THEN sales_amount ELSE 0 END) AS sales_diff,
+
+        -- 粗利差額 (表示用)
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) THEN gross_profit ELSE 0 END) - 
+        SUM(CASE WHEN fiscal_year = (SELECT current_fy FROM base_stats) - 1 THEN gross_profit ELSE 0 END) AS gp_diff
+
+    FROM `{VIEW_UNIFIED}`
+    
+    WHERE
+        -- ノイズ除去 (BigQuery側でフィルタリング)
+        jan_code NOT IN {NOISE_JAN_SQL}
+        AND jan_code NOT LIKE '999%'
+        AND LENGTH(jan_code) > 5
+
+    GROUP BY {group_col}
+    
+    HAVING (sales_cur > 0 OR sales_prev > 0)
+    
+    -- ソート (BigQuery側で実行)
+    ORDER BY diff_val {order_dir}
+    LIMIT 1000
+    """
+    
+    return query_df_safe(client, sql, None, "Ranking Query")
+
+def fetch_drilldown_from_bq(client, key_col: str, key_val: str, target_col: str, is_worst: bool, is_sales_mode: bool) -> pd.DataFrame:
+    """
+    ドリルダウン詳細もBigQueryで集計します。
+    """
+    order_dir = "ASC" if is_worst else "DESC"
+    sort_col_alias = "売上差額" if is_sales_mode else "粗利差額"
+    target_label = "得意先名" if target_col == "customer_name" else "商品名"
+
     sql = f"""
         SELECT 
-            customer_name AS `得意先名`,
+            {target_col} AS `{target_label}`,
             SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) as `今年売上`,
             SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as `前年売上`,
             SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - 
@@ -264,279 +238,175 @@ def get_product_drilldown(client, cache_key, product_name: str, is_worst: bool, 
             SUM(CASE WHEN fiscal_year = 2025 THEN gross_profit ELSE 0 END) - 
             SUM(CASE WHEN fiscal_year = 2024 THEN gross_profit ELSE 0 END) as `粗利差額`
         FROM `{VIEW_UNIFIED}`
-        WHERE product_name = @product_name
+        WHERE {key_col} = @key_val
         GROUP BY 1
-        ORDER BY `売上差額` {sort_order}
+        ORDER BY `{sort_col_alias}` {order_dir}
         LIMIT 500
     """
-    return query_df_safe(client, sql, {"product_name": product_name}, "Drill: Product->Cust", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-
-def get_customer_portfolio(client, cache_key, customer_name: str, opts) -> pd.DataFrame:
-    """得意先 -> 商品構成"""
-    sql = f"""
-        SELECT 
-            product_name AS `商品名`,
-            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) as `今年売上`,
-            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - 
-            SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as `売上差額`,
-            SUM(CASE WHEN fiscal_year = 2025 THEN gross_profit ELSE 0 END) as `今年粗利`
-        FROM `{VIEW_UNIFIED}`
-        WHERE customer_name = @customer_name
-        GROUP BY 1
-        ORDER BY `今年売上` DESC
-        LIMIT 500
-    """
-    return query_df_safe(client, sql, {"customer_name": customer_name}, "Drill: Cust->Portfolio", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    return query_df_safe(client, sql, {"key_val": key_val}, "Drilldown Query")
 
 
 # -----------------------------
-# 6. Sidebar
+# 5. UI Layout
 # -----------------------------
 def sidebar_controls() -> Dict[str, Any]:
-    qr_url = get_qr_code_url(APP_URL)
-    st.sidebar.image(qr_url, caption="📱スマホでアクセス", width=150)
+    st.sidebar.image(get_qr_code_url(APP_URL), caption="📱スマホでアクセス", width=150)
     st.sidebar.divider()
-    st.sidebar.header("System Settings")
-    use_bqstorage = st.sidebar.toggle("Use Storage API (Fast)", value=True)
-    timeout_sec = st.sidebar.slider("Query Timeout (sec)", 10, 300, 60, 10)
-    show_sql = st.sidebar.toggle("Show SQL (Debug)", value=False)
     if st.sidebar.button("Clear Cache"):
         st.cache_data.clear()
         st.sidebar.success("Cache Cleared.")
-    return {"use_bqstorage": use_bqstorage, "timeout_sec": timeout_sec, "show_sql": show_sql}
+    return {}
 
 def get_login_email_ui() -> str:
     st.sidebar.header("Login Simulation")
-    default_email = st.secrets.get("default_login_email", "") if "default_login_email" in st.secrets else ""
-    login_email = st.sidebar.text_input("Login Email", value=default_email).strip()
-    if not login_email: st.stop()
-    return login_email
+    default = st.secrets.get("default_login_email", "") if "default_login_email" in st.secrets else ""
+    return st.sidebar.text_input("Login Email", value=default).strip()
 
-
-# -----------------------------
-# 7. Render Functions
-# -----------------------------
-
-def render_interactive_ranking_flow(client, cache_key, ranking_type: str, opts):
-    """3段階ドリルダウン機能付きランキング表示 (Worst/Best共通)"""
+def render_interactive_ranking_matrix(client, ranking_type: str, axis_mode: str, is_sales_mode: bool):
     is_worst = (ranking_type == "worst")
-    view_name = VIEW_WORST_RANK if is_worst else VIEW_BEST_RANK
+    is_product = (axis_mode == "product")
     
-    # Session State keys for this specific tab
-    key_prefix = f"drill_{ranking_type}"
+    # Labels
+    label_col = "商品名" if is_product else "得意先名"
+    mode_label = "売上" if is_sales_mode else "粗利"
     
-    # 1. ランキングデータの取得 (SQL Viewでノイズ除去・ソート済み)
-    sql_rank = f"SELECT * FROM `{view_name}` LIMIT 1000"
-    df_rank = query_df_safe(client, sql_rank, None, f"Ranking {ranking_type}", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    # 1. BigQueryで計算した結果を取得
+    df_rank = fetch_ranking_from_bq(client, ranking_type, axis_mode, is_sales_mode)
 
     if df_rank.empty:
         st.info("データがありません。")
         return
 
-    # 表示用カラム調整
+    # 表示用にカラム名を整形
     df_disp = df_rank.rename(columns={
-        "product_name": "商品名",
-        "sales_cur": "今年売上",
-        "sales_prev": "前年売上",
-        "sales_diff": "売上差額",
-        "gp_cur": "今年粗利",
-        "gp_diff": "粗利差額"
+        "name": label_col,
+        "sales_cur": "今年売上", "sales_prev": "前年売上", "sales_diff": "売上差額",
+        "gp_cur": "今年粗利", "gp_diff": "粗利差額"
     })
     
-    # カラム順序
-    cols = ["商品名", "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
+    # 表示順序
+    if is_sales_mode:
+        cols = [label_col, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
+    else:
+        cols = [label_col, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
     
-    st.markdown("##### ① 商品を選択してください (クリックで詳細分析)")
-    st.caption("※送料・値引等の管理コードは自動的に除外されています。")
+    st.markdown(f"##### ① {label_col}を選択 ({mode_label}ベース)")
+    st.caption(f"※{mode_label}の増減額が大きい順 (計算: BigQuery)")
 
-    # Selection API
+    # Ranking Table
+    key_suffix = f"{ranking_type}_{axis_mode}_{mode_label}"
     event = st.dataframe(
         df_disp[cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "商品名": st.column_config.TextColumn("商品名", width="medium"),
-            "売上差額": st.column_config.NumberColumn("売上差額", format="¥%d"),
-            "今年売上": st.column_config.NumberColumn("今年売上", format="¥%d"),
-            "前年売上": st.column_config.NumberColumn("前年売上", format="¥%d"),
-            "粗利差額": st.column_config.NumberColumn("粗利差額", format="¥%d"),
-            "今年粗利": st.column_config.NumberColumn("今年粗利", format="¥%d"),
-        },
-        height=400,
-        on_select="rerun",
-        selection_mode="single-row",
-        key=f"{key_prefix}_table_1"
+        use_container_width=True, hide_index=True,
+        column_config=create_default_column_config(df_disp),
+        height=400, on_select="rerun", selection_mode="single-row",
+        key=f"t1_{key_suffix}"
     )
 
-    # Level 2: Product Selected -> Show Customer Breakdown
+    # Drill Down
     if len(event.selection["rows"]) > 0:
         idx = event.selection["rows"][0]
-        selected_product = df_disp.iloc[idx]["商品名"]
+        selected_val = df_disp.iloc[idx][label_col]
         
         st.divider()
-        st.subheader(f"🔎 詳細分析: {selected_product}")
-        st.info(f"この商品は、どの得意先で数字が変動したのか？ ({'減少' if is_worst else '増加'}要因)")
-
-        df_cust = get_product_drilldown(client, cache_key, selected_product, is_worst, opts)
+        drill_type_label = "得意先" if is_product else "商品"
+        st.subheader(f"🔎 内訳分析: {selected_val}")
         
-        if df_cust.empty:
-            st.warning("詳細データが見つかりませんでした。")
+        # Determine drill-down keys
+        key_col = "product_name" if is_product else "customer_name"
+        target_col = "customer_name" if is_product else "product_name"
+        
+        # BigQueryで詳細集計
+        df_drill = fetch_drilldown_from_bq(client, key_col, selected_val, target_col, is_worst, is_sales_mode)
+        
+        if df_drill.empty:
+            st.warning("詳細データなし")
         else:
-            event_cust = st.dataframe(
-                df_cust,
-                use_container_width=True,
-                hide_index=True,
-                column_config=create_default_column_config(df_cust),
-                on_select="rerun",
-                selection_mode="single-row",
-                key=f"{key_prefix}_table_2"
+            drill_label = "得意先名" if is_product else "商品名"
+            if is_sales_mode:
+                d_cols = [drill_label, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
+            else:
+                d_cols = [drill_label, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
+
+            st.dataframe(
+                df_drill[d_cols],
+                use_container_width=True, hide_index=True,
+                column_config=create_default_column_config(df_drill),
+                key=f"t2_{key_suffix}"
             )
 
-            # Level 3: Customer Selected -> Show Portfolio
-            if len(event_cust.selection["rows"]) > 0:
-                c_idx = event_cust.selection["rows"][0]
-                selected_customer = df_cust.iloc[c_idx]["得意先名"]
-                
-                st.divider()
-                st.subheader(f"🏥 得意先分析: {selected_customer}")
-                st.success(f"{selected_customer} の現在の購入商品一覧")
-                
-                df_portfolio = get_customer_portfolio(client, cache_key, selected_customer, opts)
-                st.dataframe(
-                    df_portfolio,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config=create_default_column_config(df_portfolio),
-                    key=f"{key_prefix}_table_3"
-                )
-
-def render_fytd_org_section(client, cache_key, login_email, opts):
+def render_fytd_org_section(client, login_email):
     st.subheader("🏢 年度累計（FYTD）｜全社")
-    
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
         st.session_state.org_data_loaded = True
     
     if st.session_state.org_data_loaded:
-        # KPI Cards
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
-        df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
-        
+        df_org = run_scoped_query(client, sql_kpi, "viewer_email", login_email, allow_fallback=True)
         if not df_org.empty:
             row = df_org.iloc[0]
-            s_cur = get_safe_float(row, 'sales_amount_fytd')
-            s_py = get_safe_float(row, 'sales_amount_py_total')
-            s_fc = get_safe_float(row, 'sales_forecast_total')
-            gp_cur = get_safe_float(row, 'gross_profit_fytd')
-            gp_py = get_safe_float(row, 'gross_profit_py_total')
-            gp_fc = get_safe_float(row, 'gp_forecast_total')
-
+            s_cur, s_py, s_fc = get_safe_float(row,'sales_amount_fytd'), get_safe_float(row,'sales_amount_py_total'), get_safe_float(row,'sales_forecast_total')
+            gp_cur, gp_py, gp_fc = get_safe_float(row,'gross_profit_fytd'), get_safe_float(row,'gross_profit_py_total'), get_safe_float(row,'gp_forecast_total')
             st.markdown("##### ■ 売上 (Sales)")
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("① 現状 (FYTD)", f"¥{s_cur:,.0f}")
-            c2.metric("② 昨年度実績", f"¥{s_py:,.0f}")
-            c3.metric("③ 着地予測", f"¥{s_fc:,.0f}", delta_color="normal")
-            c4.metric("④ GAP", f"¥{s_fc - s_py:,.0f}", delta=None, delta_color="off")
-
+            c1.metric("① 現状", f"¥{s_cur:,.0f}")
+            c2.metric("② 昨年", f"¥{s_py:,.0f}")
+            c3.metric("③ 予測", f"¥{s_fc:,.0f}")
+            c4.metric("④ GAP", f"¥{s_fc - s_py:,.0f}", delta_color="off")
             st.markdown("##### ■ 粗利 (Gross Profit)")
             c5, c6, c7, c8 = st.columns(4)
-            c5.metric("① 現状 (FYTD)", f"¥{gp_cur:,.0f}")
-            c6.metric("② 昨年度実績", f"¥{gp_py:,.0f}")
-            c7.metric("③ 着地予測", f"¥{gp_fc:,.0f}", delta_color="normal")
-            c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta=None, delta_color="off")
-            
+            c5.metric("① 現状", f"¥{gp_cur:,.0f}")
+            c6.metric("② 昨年", f"¥{gp_py:,.0f}")
+            c7.metric("③ 予測", f"¥{gp_fc:,.0f}")
+            c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta_color="off")
             st.divider()
 
-        # Interactive Ranking Tabs
-        st.subheader("📊 増減要因分析 (ドリルダウン)")
-        tab_worst, tab_best = st.tabs(["📉 ワースト (売上減)", "📈 ベスト (売上増)"])
-        
-        with tab_worst:
-            render_interactive_ranking_flow(client, cache_key, "worst", opts)
-        
-        with tab_best:
-            render_interactive_ranking_flow(client, cache_key, "best", opts)
+        st.subheader("📊 増減要因分析 (多次元)")
+        c_axis, c_val = st.columns(2)
+        with c_axis:
+            axis_sel = st.radio("集計軸:", ["📦 商品軸", "🏥 得意先軸"], horizontal=True)
+            axis_mode = "product" if "商品" in axis_sel else "customer"
+        with c_val:
+            val_sel = st.radio("評価指標:", ["💰 売上金額", "💹 粗利金額"], horizontal=True)
+            is_sales_mode = "売上" in val_sel
 
+        tab_worst, tab_best = st.tabs(["📉 ワースト (減)", "📈 ベスト (増)"])
+        with tab_worst: render_interactive_ranking_matrix(client, "worst", axis_mode, is_sales_mode)
+        with tab_best: render_interactive_ranking_matrix(client, "best", axis_mode, is_sales_mode)
     else:
         st.info("👆 上のボタンを押して全社データを読み込んでください")
 
-def render_fytd_me_section(client, cache_key, login_email, opts):
+def render_fytd_me_section(client, login_email):
     st.subheader("👤 年度累計（FYTD）｜自分")
     if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
         sql = f"SELECT * FROM `{VIEW_FYTD_ME}` __WHERE__ LIMIT 100"
-        df_me = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts)
-        if df_me.empty:
-            st.warning("データがありません。")
-            return
-
-        row = df_me.iloc[0]
-        s_cur = get_safe_float(row, 'sales_amount_fytd')
-        s_fc = get_safe_float(row, 'sales_forecast_total')
-        s_py = get_safe_float(row, 'sales_amount_py_total')
-        gp_cur = get_safe_float(row, 'gross_profit_fytd')
-        gp_fc = get_safe_float(row, 'gp_forecast_total')
-        gp_py = get_safe_float(row, 'gross_profit_py_total')
-
-        st.markdown("##### ■ 売上 (Sales)")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("① 現状", f"¥{s_cur:,.0f}")
-        c2.metric("② 昨年", f"¥{s_py:,.0f}")
-        c3.metric("③ 予測", f"¥{s_fc:,.0f}")
-        c4.metric("④ GAP", f"¥{s_fc - s_py:,.0f}", delta_color="off")
-
-        st.markdown("##### ■ 粗利 (Gross Profit)")
-        c5, c6, c7, c8 = st.columns(4)
-        c5.metric("① 現状", f"¥{gp_cur:,.0f}")
-        c6.metric("② 昨年", f"¥{gp_py:,.0f}")
-        c7.metric("③ 予測", f"¥{gp_fc:,.0f}")
-        c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta_color="off")
-        st.divider()
-        
+        df_me = run_scoped_query(client, sql, "login_email", login_email)
+        if df_me.empty: return
         df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
         cols = list(df_disp.columns)
-        if "ログインメール" in cols: cols.remove("ログインメール")
-        if "閲覧者メール" in cols: cols.remove("閲覧者メール")
-        if "担当者名" in cols:
-            cols.remove("担当者名")
-            cols.insert(0, "担当者名")
-        
+        if "担当者名" in cols: cols.remove("担当者名"); cols.insert(0, "担当者名")
         col_cfg = create_default_column_config(df_disp[cols])
         st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=col_cfg)
 
-def render_yoy_section(client, cache_key, login_email, allow_fallback, opts):
+def render_yoy_section(client, login_email, allow_fallback):
     st.subheader("📊 当月YoY（得意先ランキング）")
     c1, c2, c3 = st.columns(3)
-    
     def _show_table(title, view_name, key):
         if st.button(title, key=key, use_container_width=True):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
-            df = run_scoped_query(client, cache_key, sql, "login_email", login_email, opts, allow_fallback)
+            df = run_scoped_query(client, sql, "login_email", login_email, allow_fallback)
             if not df.empty:
                 df_disp = rename_columns_for_display(df, JP_COLS_YOY)
-                cols = list(df_disp.columns)
-                if "ログインメール" in cols: cols.remove("ログインメール")
-                if "担当者名" in cols:
-                    cols.remove("担当者名")
-                    cols.insert(0, "担当者名")
-                
-                df_final = append_total_row(df_disp[cols], label_col="担当者名")
-                col_cfg = create_default_column_config(df_final)
-                st.dataframe(df_final, use_container_width=True, hide_index=True, column_config=col_cfg)
-            else:
-                st.info("0件です。")
-
+                st.dataframe(df_disp, use_container_width=True, hide_index=True)
     with c1: _show_table("YoY Top (伸び)", VIEW_YOY_TOP, "btn_top")
     with c2: _show_table("YoY Bottom (落ち)", VIEW_YOY_BOTTOM, "btn_btm")
     with c3: _show_table("新規/比較不能", VIEW_YOY_UNCOMP, "btn_unc")
 
-def render_customer_drilldown(client, cache_key, login_email, opts):
-    st.subheader("🎯 得意先別・戦略提案（AI Gap Analysis）")
-    
+def render_customer_drilldown(client, login_email):
+    st.subheader("🎯 得意先別・戦略提案")
     sql_cust = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_FACT_DAILY}` WHERE login_email = @login_email ORDER BY customer_code"
-    df_cust = query_df_safe(client, sql_cust, {"login_email": login_email}, "Cust List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-    
-    if df_cust.empty:
-        st.info("担当得意先データがありません（またはログインメール不一致）。")
-        return
+    df_cust = query_df_safe(client, sql_cust, {"login_email": login_email}, "Cust List")
+    if df_cust.empty: return
 
     cust_options = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in df_cust.iterrows()}
     selected_code = st.selectbox("分析する得意先を選択してください", options=cust_options.keys(), format_func=lambda x: cust_options[x])
@@ -544,30 +414,19 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 
     st.divider()
     sql_rec = f"SELECT * FROM `{VIEW_RECOMMEND}` WHERE customer_code = @cust_code ORDER BY priority_rank ASC"
-    df_rec = query_df_safe(client, sql_rec, {"cust_code": selected_code}, "Recommendation", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+    df_rec = query_df_safe(client, sql_rec, {"cust_code": selected_code}, "Recommendation")
     
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.markdown("#### 🏥 得意先プロファイル")
-        if not df_rec.empty:
-            strong_cat = df_rec.iloc[0].get("strong_category", "-")
-            st.info(f"この得意先の主力領域(メーカー): **{strong_cat}**")
-            st.caption("※購入実績シェアNo.1のメーカー")
-        else:
-            st.warning("プロファイルデータ不足（または主要品完納済み）")
-            strong_cat = "(不明)"
-
+        st.markdown("#### 🏥 プロファイル")
+        strong = df_rec.iloc[0].get("strong_category", "-") if not df_rec.empty else "-"
+        st.info(f"主力領域: **{strong}**")
     with c2:
-        st.markdown("#### 💡 AI提案リスト（未採用のチャンス商品）")
-        st.caption(f"全社の **{strong_cat}** 売上TOP10のうち、**未採用**の商品")
-        
-        if df_rec.empty:
-            st.success("🎉 この領域の主要商品はすべて採用済みです。")
-        else:
-            disp_df = df_rec[["priority_rank", "recommend_product", "manufacturer", "market_scale"]].rename(columns={"priority_rank": "優先順位", "recommend_product": "推奨商品名", "manufacturer": "メーカー", "market_scale": "全社売上規模"})
-            col_cfg = create_default_column_config(disp_df)
-            st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=col_cfg)
-            
+        st.markdown("#### 💡 AI提案リスト")
+        if not df_rec.empty:
+            disp_df = df_rec[["priority_rank", "recommend_product", "manufacturer", "market_scale"]].rename(columns={"priority_rank": "順位", "recommend_product": "商品", "manufacturer": "メーカー", "market_scale": "規模"})
+            st.dataframe(disp_df, use_container_width=True, hide_index=True)
+
     with st.expander("参考: 現在の採用品リストを見る"):
         sql_adopted = f"""
         SELECT 
@@ -580,48 +439,42 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
         WHERE t.customer_code = @cust_code AND t.fiscal_year = 2025
         GROUP BY 1 ORDER BY 2 DESC LIMIT 100
         """
-        df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-        
+        df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List")
         renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)", "gp_fytd": "粗利(FYTD)"})
         col_cfg = create_default_column_config(renamed_df)
         st.dataframe(renamed_df, use_container_width=True, column_config=col_cfg)
 
 
 # -----------------------------
-# 8. Main
+# 6. Main
 # -----------------------------
 def main():
     if 'org_data_loaded' not in st.session_state: st.session_state.org_data_loaded = False
-
     set_page()
-    
     client, project_id, location, sa_json = setup_bigquery_client()
-    cache_key = (project_id, location, sa_json)
-    
-    opts = sidebar_controls()
+    _ = sidebar_controls()
     login_email = get_login_email_ui()
     st.divider()
-
-    role = resolve_role(client, cache_key, login_email, opts)
+    role = resolve_role(client, login_email)
     st.write(f"**Login:** {role.login_email} / **Role:** {role.role_key} ({role.area_name})")
     is_admin = role.role_key in ("HQ_ADMIN", "AREA_MANAGER")
     st.divider()
     
     if is_admin:
         t1, t2, t3 = st.tabs(["🏢 全社状況", "👤 エリア/個人", "🎯 戦略提案(Beta)"])
-        with t1: render_fytd_org_section(client, cache_key, login_email, opts)
+        with t1: render_fytd_org_section(client, login_email)
         with t2:
-            render_fytd_me_section(client, cache_key, login_email, opts)
+            render_fytd_me_section(client, login_email)
             st.divider()
-            render_yoy_section(client, cache_key, login_email, is_admin, opts)
-        with t3: render_customer_drilldown(client, cache_key, login_email, opts)
+            render_yoy_section(client, login_email, is_admin)
+        with t3: render_customer_drilldown(client, login_email)
     else:
         t1, t2, t3 = st.tabs(["👤 今年の成績", "📊 得意先分析", "🎯 提案を作る"])
-        with t1: render_fytd_me_section(client, cache_key, login_email, opts)
-        with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
-        with t3: render_customer_drilldown(client, cache_key, login_email, opts)
+        with t1: render_fytd_me_section(client, login_email)
+        with t2: render_yoy_section(client, login_email, is_admin)
+        with t3: render_customer_drilldown(client, login_email)
 
-    st.caption("Updated: v1.9.3 (Drill-Down Update)")
+    st.caption("Updated: v1.9.7 (High Performance)")
 
 if __name__ == "__main__":
     main()
