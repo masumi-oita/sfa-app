@@ -1,11 +1,11 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.9.1 (Stable/BugFix)
+SFA｜戦略ダッシュボード - OS v1.9.2 (Stable/HotFix)
 
-【更新履歴 v1.9.1】
-- [Fix] Pandasのpd.NA型による「boolean value of NA is ambiguous」エラーを修正 (fillna(0)適用)
-- [Feat] ランキング表のソート機能、JANコード対応、年度カラム対応を統合
+【更新履歴 v1.9.2】
+- [Critical Fix] BigQueryのDate/String列に対するfillna(0)で発生するTypeErrorを修正
+- [Fix] 値取得時にpd.isna()判定を行う安全なロジックに変更
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ JP_COLS_YOY = {
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.9.1 (Stable)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
+    st.caption("OS v1.9.2 (Stable/HotFix)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -124,7 +124,6 @@ def append_total_row(df: pd.DataFrame, label_col: str = None) -> pd.DataFrame:
             total_data[col] = ""
     target_label = label_col if label_col and label_col in df.columns else df.columns[0]
     total_data[target_label] = "=== 合計 ==="
-    # pd.concat verify_integrity=False is default
     return pd.concat([df, pd.DataFrame([total_data])], ignore_index=True)
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -139,6 +138,13 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
         else:
             config[col] = st.column_config.TextColumn(col)
     return config
+
+# ★Helper: 安全にfloatを取得する関数
+def get_safe_float(row: pd.Series, key: str) -> float:
+    val = row.get(key)
+    if pd.isna(val):
+        return 0.0
+    return float(val)
 
 
 # -----------------------------
@@ -273,8 +279,8 @@ def get_login_email_ui() -> str:
 def render_fytd_org_section(client, cache_key, login_email, opts):
     """
     【修正済み】
-    1. df.fillna(0) で pd.NA エラーを回避
-    2. st.dataframeによるヘッダーソート対応
+    BigQueryのDate列に対するfillna(0)エラーを回避するため、
+    値取得時にpd.isnaチェックを行う方式に変更。
     """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
@@ -286,16 +292,15 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
         df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
         
         if not df_org.empty:
-            # ★Fix: pandasのNA/NaNを0に置換して、TypeErrorを防ぐ
-            df_org = df_org.fillna(0)
+            # ★Fix: fillna(0)を削除し、安全な取得関数を使用
             row = df_org.iloc[0]
             
-            s_cur = float(row.get('sales_amount_fytd', 0))
-            s_py = float(row.get('sales_amount_py_total', 0))
-            s_fc = float(row.get('sales_forecast_total', 0))
-            gp_cur = float(row.get('gross_profit_fytd', 0))
-            gp_py = float(row.get('gross_profit_py_total', 0))
-            gp_fc = float(row.get('gp_forecast_total', 0))
+            s_cur = get_safe_float(row, 'sales_amount_fytd')
+            s_py = get_safe_float(row, 'sales_amount_py_total')
+            s_fc = get_safe_float(row, 'sales_forecast_total')
+            gp_cur = get_safe_float(row, 'gross_profit_fytd')
+            gp_py = get_safe_float(row, 'gross_profit_py_total')
+            gp_fc = get_safe_float(row, 'gp_forecast_total')
 
             st.markdown("##### ■ 売上 (Sales)")
             c1, c2, c3, c4 = st.columns(4)
@@ -427,16 +432,15 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             st.warning("データがありません。")
             return
 
-        # ★Fix: pandasのNA/NaNを0に置換
-        df_me = df_me.fillna(0)
+        # ★Fix: ここも安全な取得関数に変更
         row = df_me.iloc[0]
 
-        s_cur = float(row.get('sales_amount_fytd', 0))
-        s_fc = float(row.get('sales_forecast_total', 0))
-        s_py = float(row.get('sales_amount_py_total', 0))
-        gp_cur = float(row.get('gross_profit_fytd', 0))
-        gp_fc = float(row.get('gp_forecast_total', 0))
-        gp_py = float(row.get('gross_profit_py_total', 0))
+        s_cur = get_safe_float(row, 'sales_amount_fytd')
+        s_fc = get_safe_float(row, 'sales_forecast_total')
+        s_py = get_safe_float(row, 'sales_amount_py_total')
+        gp_cur = get_safe_float(row, 'gross_profit_fytd')
+        gp_fc = get_safe_float(row, 'gp_forecast_total')
+        gp_py = get_safe_float(row, 'gross_profit_py_total')
 
         st.markdown("##### ■ 売上 (Sales)")
         c1, c2, c3, c4 = st.columns(4)
@@ -586,7 +590,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.9.1 (Stable/BugFix)")
+    st.caption("Updated: v1.9.2 (Stable/HotFix)")
 
 if __name__ == "__main__":
     main()
