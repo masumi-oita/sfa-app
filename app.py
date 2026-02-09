@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.8.1 (Layout Fixed)
+SFA｜戦略ダッシュボード - OS v1.9.0 (Stable)
 
-【更新履歴 v1.8.1】
-- [UI] ワースト分析画面のレイアウト崩れ（文字重複）を防ぐため、UI配置を整理
-- [Config] QRコードURLを固定設定
-- [Data] BigQuery側で「商品名不明」データが指数表記になる問題をSQL側で対処済み（連携確認）
+【更新履歴 v1.9.0】
+- [Fix] KPI数値がNullの場合にTypeErrorになる問題を修正 (float変換ロジック強化)
+- [Feat] ランキング表でヘッダークリックによるソート（並べ替え）機能を追加
+- [Data] BigQuery View修正に対応（JANコード復元・年度カラム対応版）
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ JP_COLS_YOY = {
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.8.1｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
+    st.caption("OS v1.9.0 (Stable)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -272,6 +272,11 @@ def get_login_email_ui() -> str:
 # -----------------------------
 
 def render_fytd_org_section(client, cache_key, login_email, opts):
+    """
+    【修正済み】
+    1. NullデータのTypeError回避
+    2. st.dataframeによるヘッダーソート対応
+    """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
@@ -283,10 +288,13 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
         
         if not df_org.empty:
             row = df_org.iloc[0]
-            s_cur, s_py = float(row.get('sales_amount_fytd', 0)), float(row.get('sales_amount_py_total', 0))
-            s_fc = float(row.get('sales_forecast_total', 0))
-            gp_cur, gp_py = float(row.get('gross_profit_fytd', 0)), float(row.get('gross_profit_py_total', 0))
-            gp_fc = float(row.get('gp_forecast_total', 0))
+            # 【修正】Null安全なfloat変換
+            s_cur = float(row.get('sales_amount_fytd') or 0)
+            s_py = float(row.get('sales_amount_py_total') or 0)
+            s_fc = float(row.get('sales_forecast_total') or 0)
+            gp_cur = float(row.get('gross_profit_fytd') or 0)
+            gp_py = float(row.get('gross_profit_py_total') or 0)
+            gp_fc = float(row.get('gp_forecast_total') or 0)
 
             st.markdown("##### ■ 売上 (Sales)")
             c1, c2, c3, c4 = st.columns(4)
@@ -302,14 +310,12 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             c7.metric("③ 着地予測", f"¥{gp_fc:,.0f}", delta_color="normal")
             c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta=None, delta_color="off")
             
-            # ★レイアウト調整: スペースを空ける
             st.divider()
             st.write("") 
 
         # --- Interactive Ranking ---
         st.subheader("📊 増減要因分析 (ランキング)")
         
-        # 1. 軸の選択
         c_mode, c_axis, c_val = st.columns(3)
         with c_mode:
             rank_type = st.radio("順位 (Type):", ["📉 ワースト (Worst)", "📈 トップ (Best)"])
@@ -321,10 +327,8 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             value_mode = st.radio("評価指標 (Value):", ["💰 売上金額", "💹 粗利金額"])
             is_sales_mode = "売上" in value_mode
 
-        # 2. Viewの切り替え
         target_view = VIEW_WORST_RANK if is_worst else VIEW_BEST_RANK
         
-        # 3. データ取得
         sql_rank = f"SELECT * FROM `{target_view}` LIMIT 3000"
         df_raw = query_df_safe(client, sql_rank, None, "Ranking Raw", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
         
@@ -332,7 +336,6 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             st.info("データがありません。")
             return
 
-        # 4. カラム設定
         if is_sales_mode:
             col_target, col_cur, col_prev = "sales_diff", "sales_cur", "sales_prev"
             label_diff, label_cur, label_prev = "売上増減額", "今年売上", "前年売上"
@@ -340,24 +343,23 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             col_target, col_cur, col_prev = "gp_diff", "gp_cur", "gp_prev"
             label_diff, label_cur, label_prev = "粗利増減額", "今年粗利", "前年粗利"
 
-        # 5. 画面描画
+        # View Mode Control
         if st.session_state.worst_view_mode == 'ranking':
             target_key = "product_name" if is_product_mode else "customer_name"
             target_label = "商品名" if is_product_mode else "得意先名"
             
-            # ★レイアウト調整: スペースを空ける
             st.write("")
             st.markdown(f"**{rank_type} ランキング ({label_diff}順)**")
-            st.caption("👇 行をクリックすると詳細分析へ移動します")
+            st.caption("👇 表のヘッダーをクリックすると並べ替えができます")
             
             df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
-            # ソート
+            # 初期ソート（ワーストは昇順、トップは降順）
             df_group = df_group.sort_values(col_target, ascending=not is_worst)
             
-            # 合計行
+            # 合計行を追加
             df_display = append_total_row(df_group, label_col=target_key)
             
-            # Click Event
+            # 【機能追加】並べ替え可能なデータフレーム
             selection = st.dataframe(
                 df_display[[target_key, col_target, col_cur, col_prev]], 
                 column_config={
@@ -375,11 +377,12 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             
             if len(selection.selection.rows) > 0:
                 selected_idx = selection.selection.rows[0]
-                selected_name = df_display.iloc[selected_idx][target_key]
-                if selected_name != "=== 合計 ===":
-                    st.session_state.worst_selected_name = selected_name
-                    st.session_state.worst_view_mode = 'detail'
-                    st.rerun()
+                if selected_idx < len(df_display):
+                    selected_name = df_display.iloc[selected_idx][target_key]
+                    if selected_name != "=== 合計 ===":
+                        st.session_state.worst_selected_name = selected_name
+                        st.session_state.worst_view_mode = 'detail'
+                        st.rerun()
 
         elif st.session_state.worst_view_mode == 'detail':
             target_name = st.session_state.worst_selected_name
@@ -424,12 +427,12 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             return
 
         row = df_me.iloc[0]
-        s_cur = float(row.get('sales_amount_fytd', 0))
-        s_fc = float(row.get('sales_forecast_total', 0))
-        s_py = float(row.get('sales_amount_py_total', 0))
-        gp_cur = float(row.get('gross_profit_fytd', 0))
-        gp_fc = float(row.get('gp_forecast_total', 0))
-        gp_py = float(row.get('gross_profit_py_total', 0))
+        s_cur = float(row.get('sales_amount_fytd') or 0)
+        s_fc = float(row.get('sales_forecast_total') or 0)
+        s_py = float(row.get('sales_amount_py_total') or 0)
+        gp_cur = float(row.get('gross_profit_fytd') or 0)
+        gp_fc = float(row.get('gp_forecast_total') or 0)
+        gp_py = float(row.get('gross_profit_py_total') or 0)
 
         st.markdown("##### ■ 売上 (Sales)")
         c1, c2, c3, c4 = st.columns(4)
@@ -524,6 +527,7 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
             st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=col_cfg)
             
     with st.expander("参考: 現在の採用品リストを見る"):
+        # Note: 修正されたViewを参照
         sql_adopted = f"""
         SELECT 
             m.product_name, 
@@ -578,7 +582,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.8.1 (Layout Fixed)")
+    st.caption("Updated: v1.9.0 (Stable)")
 
 if __name__ == "__main__":
     main()
