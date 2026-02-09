@@ -1,11 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.9.2 (Stable/HotFix)
+SFA｜戦略ダッシュボード - OS v1.9.3 (Drill-Down Update)
 
-【更新履歴 v1.9.2】
-- [Critical Fix] BigQueryのDate/String列に対するfillna(0)で発生するTypeErrorを修正
-- [Fix] 値取得時にpd.isna()判定を行う安全なロジックに変更
+【更新履歴 v1.9.3】
+- [New] 商品ランキングからの3段階ドリルダウン分析機能を実装
+  (ランキング -> 得意先別増減 -> 得意先別商品構成)
+- [Update] 全社状況タブのUIを整理し、分析機能を強化
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bot
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
+# ★Drill-down用 (Raw Fact View)
+VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
 
 
 # -----------------------------
@@ -99,7 +102,7 @@ JP_COLS_YOY = {
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.9.2 (Stable/HotFix)｜戦略提案｜ワースト・トップ分析｜着地予測ダッシュボード")
+    st.caption("OS v1.9.3 (Drill-Down Update)｜戦略提案｜3段階ドリルダウン分析｜着地予測")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -139,7 +142,6 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
             config[col] = st.column_config.TextColumn(col)
     return config
 
-# ★Helper: 安全にfloatを取得する関数
 def get_safe_float(row: pd.Series, key: str) -> float:
     val = row.get(key)
     if pd.isna(val):
@@ -247,6 +249,45 @@ def run_scoped_query(client, cache_key, sql_template, scope_col, login_email, op
         return query_df_safe(client, sql_all, None, "Fallback Query", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
     return pd.DataFrame()
 
+# --- Drill-Down Queries ---
+def get_product_drilldown(client, cache_key, product_name: str, is_worst: bool, opts) -> pd.DataFrame:
+    """商品 -> 得意先別増減内訳"""
+    sort_order = "ASC" if is_worst else "DESC"
+    sql = f"""
+        SELECT 
+            customer_name AS `得意先名`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) as `今年売上`,
+            SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as `前年売上`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - 
+            SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as `売上差額`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN gross_profit ELSE 0 END) as `今年粗利`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN gross_profit ELSE 0 END) - 
+            SUM(CASE WHEN fiscal_year = 2024 THEN gross_profit ELSE 0 END) as `粗利差額`
+        FROM `{VIEW_UNIFIED}`
+        WHERE product_name = @product_name
+        GROUP BY 1
+        ORDER BY `売上差額` {sort_order}
+        LIMIT 500
+    """
+    return query_df_safe(client, sql, {"product_name": product_name}, "Drill: Product->Cust", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+
+def get_customer_portfolio(client, cache_key, customer_name: str, opts) -> pd.DataFrame:
+    """得意先 -> 商品構成"""
+    sql = f"""
+        SELECT 
+            product_name AS `商品名`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) as `今年売上`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - 
+            SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as `売上差額`,
+            SUM(CASE WHEN fiscal_year = 2025 THEN gross_profit ELSE 0 END) as `今年粗利`
+        FROM `{VIEW_UNIFIED}`
+        WHERE customer_name = @customer_name
+        GROUP BY 1
+        ORDER BY `今年売上` DESC
+        LIMIT 500
+    """
+    return query_df_safe(client, sql, {"customer_name": customer_name}, "Drill: Cust->Portfolio", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+
 
 # -----------------------------
 # 6. Sidebar
@@ -276,25 +317,112 @@ def get_login_email_ui() -> str:
 # 7. Render Functions
 # -----------------------------
 
+def render_interactive_ranking_flow(client, cache_key, ranking_type: str, opts):
+    """3段階ドリルダウン機能付きランキング表示 (Worst/Best共通)"""
+    is_worst = (ranking_type == "worst")
+    view_name = VIEW_WORST_RANK if is_worst else VIEW_BEST_RANK
+    
+    # Session State keys for this specific tab
+    key_prefix = f"drill_{ranking_type}"
+    
+    # 1. ランキングデータの取得 (SQL Viewでノイズ除去・ソート済み)
+    sql_rank = f"SELECT * FROM `{view_name}` LIMIT 1000"
+    df_rank = query_df_safe(client, sql_rank, None, f"Ranking {ranking_type}", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
+
+    if df_rank.empty:
+        st.info("データがありません。")
+        return
+
+    # 表示用カラム調整
+    df_disp = df_rank.rename(columns={
+        "product_name": "商品名",
+        "sales_cur": "今年売上",
+        "sales_prev": "前年売上",
+        "sales_diff": "売上差額",
+        "gp_cur": "今年粗利",
+        "gp_diff": "粗利差額"
+    })
+    
+    # カラム順序
+    cols = ["商品名", "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
+    
+    st.markdown("##### ① 商品を選択してください (クリックで詳細分析)")
+    st.caption("※送料・値引等の管理コードは自動的に除外されています。")
+
+    # Selection API
+    event = st.dataframe(
+        df_disp[cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "商品名": st.column_config.TextColumn("商品名", width="medium"),
+            "売上差額": st.column_config.NumberColumn("売上差額", format="¥%d"),
+            "今年売上": st.column_config.NumberColumn("今年売上", format="¥%d"),
+            "前年売上": st.column_config.NumberColumn("前年売上", format="¥%d"),
+            "粗利差額": st.column_config.NumberColumn("粗利差額", format="¥%d"),
+            "今年粗利": st.column_config.NumberColumn("今年粗利", format="¥%d"),
+        },
+        height=400,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"{key_prefix}_table_1"
+    )
+
+    # Level 2: Product Selected -> Show Customer Breakdown
+    if len(event.selection["rows"]) > 0:
+        idx = event.selection["rows"][0]
+        selected_product = df_disp.iloc[idx]["商品名"]
+        
+        st.divider()
+        st.subheader(f"🔎 詳細分析: {selected_product}")
+        st.info(f"この商品は、どの得意先で数字が変動したのか？ ({'減少' if is_worst else '増加'}要因)")
+
+        df_cust = get_product_drilldown(client, cache_key, selected_product, is_worst, opts)
+        
+        if df_cust.empty:
+            st.warning("詳細データが見つかりませんでした。")
+        else:
+            event_cust = st.dataframe(
+                df_cust,
+                use_container_width=True,
+                hide_index=True,
+                column_config=create_default_column_config(df_cust),
+                on_select="rerun",
+                selection_mode="single-row",
+                key=f"{key_prefix}_table_2"
+            )
+
+            # Level 3: Customer Selected -> Show Portfolio
+            if len(event_cust.selection["rows"]) > 0:
+                c_idx = event_cust.selection["rows"][0]
+                selected_customer = df_cust.iloc[c_idx]["得意先名"]
+                
+                st.divider()
+                st.subheader(f"🏥 得意先分析: {selected_customer}")
+                st.success(f"{selected_customer} の現在の購入商品一覧")
+                
+                df_portfolio = get_customer_portfolio(client, cache_key, selected_customer, opts)
+                st.dataframe(
+                    df_portfolio,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=create_default_column_config(df_portfolio),
+                    key=f"{key_prefix}_table_3"
+                )
+
 def render_fytd_org_section(client, cache_key, login_email, opts):
-    """
-    【修正済み】
-    BigQueryのDate列に対するfillna(0)エラーを回避するため、
-    値取得時にpd.isnaチェックを行う方式に変更。
-    """
     st.subheader("🏢 年度累計（FYTD）｜全社")
     
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
         st.session_state.org_data_loaded = True
     
     if st.session_state.org_data_loaded:
+        # KPI Cards
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
         df_org = run_scoped_query(client, cache_key, sql_kpi, "viewer_email", login_email, opts, allow_fallback=True)
         
         if not df_org.empty:
-            # ★Fix: fillna(0)を削除し、安全な取得関数を使用
             row = df_org.iloc[0]
-            
             s_cur = get_safe_float(row, 'sales_amount_fytd')
             s_py = get_safe_float(row, 'sales_amount_py_total')
             s_fc = get_safe_float(row, 'sales_forecast_total')
@@ -317,109 +445,17 @@ def render_fytd_org_section(client, cache_key, login_email, opts):
             c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta=None, delta_color="off")
             
             st.divider()
-            st.write("") 
 
-        # --- Interactive Ranking ---
-        st.subheader("📊 増減要因分析 (ランキング)")
+        # Interactive Ranking Tabs
+        st.subheader("📊 増減要因分析 (ドリルダウン)")
+        tab_worst, tab_best = st.tabs(["📉 ワースト (売上減)", "📈 ベスト (売上増)"])
         
-        c_mode, c_axis, c_val = st.columns(3)
-        with c_mode:
-            rank_type = st.radio("順位 (Type):", ["📉 ワースト (Worst)", "📈 トップ (Best)"])
-            is_worst = "ワースト" in rank_type
-        with c_axis:
-            axis_mode = st.radio("集計軸 (Axis):", ["📦 商品軸", "🏥 得意先軸"])
-            is_product_mode = "商品" in axis_mode
-        with c_val:
-            value_mode = st.radio("評価指標 (Value):", ["💰 売上金額", "💹 粗利金額"])
-            is_sales_mode = "売上" in value_mode
-
-        target_view = VIEW_WORST_RANK if is_worst else VIEW_BEST_RANK
+        with tab_worst:
+            render_interactive_ranking_flow(client, cache_key, "worst", opts)
         
-        sql_rank = f"SELECT * FROM `{target_view}` LIMIT 3000"
-        df_raw = query_df_safe(client, sql_rank, None, "Ranking Raw", opts["use_bqstorage"], opts["timeout_sec"], cache_key)
-        
-        if df_raw.empty:
-            st.info("データがありません。")
-            return
+        with tab_best:
+            render_interactive_ranking_flow(client, cache_key, "best", opts)
 
-        if is_sales_mode:
-            col_target, col_cur, col_prev = "sales_diff", "sales_cur", "sales_prev"
-            label_diff, label_cur, label_prev = "売上増減額", "今年売上", "前年売上"
-        else:
-            col_target, col_cur, col_prev = "gp_diff", "gp_cur", "gp_prev"
-            label_diff, label_cur, label_prev = "粗利増減額", "今年粗利", "前年粗利"
-
-        # View Mode Control
-        if st.session_state.worst_view_mode == 'ranking':
-            target_key = "product_name" if is_product_mode else "customer_name"
-            target_label = "商品名" if is_product_mode else "得意先名"
-            
-            st.write("")
-            st.markdown(f"**{rank_type} ランキング ({label_diff}順)**")
-            st.caption("👇 表のヘッダーをクリックすると並べ替えができます")
-            
-            df_group = df_raw.groupby(target_key)[[col_target, col_cur, col_prev]].sum().reset_index()
-            # 初期ソート
-            df_group = df_group.sort_values(col_target, ascending=not is_worst)
-            
-            # 合計行
-            df_display = append_total_row(df_group, label_col=target_key)
-            
-            # ソート可能なDataFrame
-            selection = st.dataframe(
-                df_display[[target_key, col_target, col_cur, col_prev]], 
-                column_config={
-                    target_key: st.column_config.TextColumn(target_label, width="medium"),
-                    col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
-                    col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
-                    col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
-                },
-                use_container_width=True, 
-                hide_index=True, 
-                height=400,
-                on_select="rerun",
-                selection_mode="single-row"
-            )
-            
-            if len(selection.selection.rows) > 0:
-                selected_idx = selection.selection.rows[0]
-                if selected_idx < len(df_display):
-                    selected_name = df_display.iloc[selected_idx][target_key]
-                    if selected_name != "=== 合計 ===":
-                        st.session_state.worst_selected_name = selected_name
-                        st.session_state.worst_view_mode = 'detail'
-                        st.rerun()
-
-        elif st.session_state.worst_view_mode == 'detail':
-            target_name = st.session_state.worst_selected_name
-            if st.button("⬅ ランキングに戻る"):
-                st.session_state.worst_view_mode = 'ranking'
-                st.session_state.worst_selected_name = None
-                st.rerun()
-
-            st.title(f"🔍 詳細分析: {target_name}")
-            st.caption(f"指標: {label_diff}")
-            
-            if is_product_mode:
-                df_detail = df_raw[df_raw["product_name"] == target_name].copy()
-                main_col, col_label = "customer_name", "得意先名"
-            else:
-                df_detail = df_raw[df_raw["customer_name"] == target_name].copy()
-                main_col, col_label = "product_name", "商品名"
-            
-            df_detail = df_detail.sort_values(col_target, ascending=not is_worst)
-            df_display = append_total_row(df_detail, label_col=main_col)
-
-            st.dataframe(
-                df_display[[main_col, col_target, col_cur, col_prev]],
-                column_config={
-                    main_col: st.column_config.TextColumn(col_label),
-                    col_target: st.column_config.NumberColumn(label_diff, format="¥%d"),
-                    col_cur: st.column_config.NumberColumn(label_cur, format="¥%d"),
-                    col_prev: st.column_config.NumberColumn(label_prev, format="¥%d")
-                },
-                use_container_width=True, hide_index=True
-            )
     else:
         st.info("👆 上のボタンを押して全社データを読み込んでください")
 
@@ -432,9 +468,7 @@ def render_fytd_me_section(client, cache_key, login_email, opts):
             st.warning("データがありません。")
             return
 
-        # ★Fix: ここも安全な取得関数に変更
         row = df_me.iloc[0]
-
         s_cur = get_safe_float(row, 'sales_amount_fytd')
         s_fc = get_safe_float(row, 'sales_forecast_total')
         s_py = get_safe_float(row, 'sales_amount_py_total')
@@ -535,7 +569,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
             st.dataframe(disp_df, use_container_width=True, hide_index=True, column_config=col_cfg)
             
     with st.expander("参考: 現在の採用品リストを見る"):
-        # Note: 修正されたViewを参照
         sql_adopted = f"""
         SELECT 
             m.product_name, 
@@ -558,8 +591,6 @@ def render_customer_drilldown(client, cache_key, login_email, opts):
 # 8. Main
 # -----------------------------
 def main():
-    if 'worst_view_mode' not in st.session_state: st.session_state.worst_view_mode = 'ranking'
-    if 'worst_selected_name' not in st.session_state: st.session_state.worst_selected_name = None
     if 'org_data_loaded' not in st.session_state: st.session_state.org_data_loaded = False
 
     set_page()
@@ -590,7 +621,7 @@ def main():
         with t2: render_yoy_section(client, cache_key, login_email, is_admin, opts)
         with t3: render_customer_drilldown(client, cache_key, login_email, opts)
 
-    st.caption("Updated: v1.9.2 (Stable/HotFix)")
+    st.caption("Updated: v1.9.3 (Drill-Down Update)")
 
 if __name__ == "__main__":
     main()
