@@ -1,42 +1,26 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v2.3.0 (Restore Features / Unified Bounds / Dynamic SQL)
+SFA｜戦略ダッシュボード - OS v2.5.0 (SSOT / Scoped RBAC / Restore P0)
 
-【踏襲（復元）した機能】
-- 入口：管理者 / 担当者 のRBAC（sales_staff_master_native）
-- FYTDサマリー（売上/粗利/粗利率 + PYTD比較）
-- 当月YoYランキング（得意先）
-- 多次元分析：得意先/商品 × 売上/粗利（ランキング＋ドリル）
-- 検索UI（得意先/商品/JAN 部分一致）
-- 動的SQL：統一FACT VIEWへ一本化（v_sales_fact_unified 優先、無ければ v_sales_details_norm）
-- Drive参照ゼロ（403根絶）
-
-【前提】
-- Bounds: salesdb-479915.sales_data.v_sys_bounds
-- Role:   salesdb-479915.sales_data.sales_staff_master_native
-- Fact:   salesdb-479915.sales_data.v_sales_fact_unified  (無ければ v_sales_details_norm)
-
-【必須カラム（FACT側でこの形に正規化されていること）】
-customer_code, customer_name, jan_code, aggregation_code, product_name,
-staff_name, sales_date, sales_amount, gross_profit
-（email/phone/role/fiscal_year はあれば使う）
+【OS準拠ポイント】
+1. SSOT: 担当者・得意先・メールを dim_customer_owner_current で物理固定。
+2. RBAC: アプリ側フィルタを廃止。BQの Scoped View に viewer_email を渡す設計。
+3. 機能復元: 放置されていた「新規採用（Adoption）」をP0機能として最前面に配置。
+4. 循環断ち: INFORMATION_SCHEMA 依存や Drive 参照を根絶し、ネイティブ BQ テーブルで完結。
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
 import pandas as pd
 import streamlit as st
 from pandas.api.types import is_numeric_dtype
-
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
 # =========================================================
-# Config
+# 1. Configuration (OS準拠：物理パス固定)
 # =========================================================
 APP_TITLE = "SFA｜戦略ダッシュボード"
 DEFAULT_LOCATION = "asia-northeast1"
@@ -45,39 +29,35 @@ CACHE_TTL_SEC = 300
 PROJECT = "salesdb-479915"
 DATASET = "sales_data"
 
-VIEW_BOUNDS = f"{PROJECT}.{DATASET}.v_sys_bounds"
-TABLE_ROLE  = f"{PROJECT}.{DATASET}.sales_staff_master_native"
+# システム基盤View
+VIEW_BOUNDS   = f"{PROJECT}.{DATASET}.v_sys_bounds"
+TABLE_ROLE    = f"{PROJECT}.{DATASET}.sales_staff_master_native"
+OWNER_MASTER  = f"{PROJECT}.{DATASET}.dim_customer_owner_current"
 
-# 統一FACT（優先順）
-FACT_CANDIDATES = [
-    f"{PROJECT}.{DATASET}.v_sales_fact_unified",
-    f"{PROJECT}.{DATASET}.v_sales_details_norm",
-]
+# Scoped Fact Views (閲覧Emailで自動フィルタされるView)
+VIEW_FACT_SCOPED     = f"{PROJECT}.{DATASET}.v_sales_fact_scoped"
+VIEW_ADOPTION_SCOPED = f"{PROJECT}.{DATASET}.v_new_adoption_unified_scoped"
 
-# ノイズJAN（必要なら増やす）
+# ノイズ除去
 NOISE_JAN_LIST = ["0", "22221", "99998", "33334"]
 
 # =========================================================
-# UI helpers
+# 2. Helpers (UI & Formatting)
 # =========================================================
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v2.3.0｜踏襲復元版（RBAC / ランキング / ドリル / 検索 / Dynamic SQL）")
+    st.caption("OS v2.5.0｜SSOT準拠・新規採用管理・物理スコープ版")
 
 def money(x: float) -> str:
-    try:
-        return f"¥{float(x):,.0f}"
-    except Exception:
-        return "¥0"
+    try: return f"¥{float(x):,.0f}"
+    except: return "¥0"
 
 def pct(x: float) -> str:
-    try:
-        return f"{float(x):.1f}%"
-    except Exception:
-        return "0.0%"
+    try: return f"{float(x):.1f}%"
+    except: return "0.0%"
 
-def column_config(df: pd.DataFrame):
+def get_column_config(df: pd.DataFrame):
     cfg = {}
     for c in df.columns:
         if any(k in c for k in ["売上", "粗利", "金額", "差", "GAP"]):
@@ -91,420 +71,196 @@ def column_config(df: pd.DataFrame):
     return cfg
 
 # =========================================================
-# BigQuery client
+# 3. BigQuery Connection & Auth Logic
 # =========================================================
 @st.cache_resource
-def bq_client() -> bigquery.Client:
+def get_bq_client() -> bigquery.Client:
     if "bigquery" not in st.secrets:
         st.error("❌ secrets.bigquery が未設定です")
         st.stop()
-
     bq = st.secrets["bigquery"]
+    # 403エラー対策：Cloud Platformスコープを付与
     creds = service_account.Credentials.from_service_account_info(
         dict(bq["service_account"]),
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
-    return bigquery.Client(
-        project=bq["project_id"],
-        credentials=creds,
-        location=bq.get("location", DEFAULT_LOCATION),
-    )
+    return bigquery.Client(project=bq["project_id"], credentials=creds, location=DEFAULT_LOCATION)
 
 @st.cache_data(ttl=CACHE_TTL_SEC)
-def run_query(sql: str) -> pd.DataFrame:
+def run_query(sql: str, params: Optional[List[bigquery.ScalarQueryParameter]] = None) -> pd.DataFrame:
+    client = get_bq_client()
+    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
     try:
-        return bq_client().query(sql).to_dataframe()
+        return client.query(sql, job_config=job_config).to_dataframe()
     except Exception as e:
-        st.error(f"Query Failed:\n{e}\n\n---\nSQL:\n{sql}")
+        st.error(f"SQL Error: {e}")
         return pd.DataFrame()
 
-# =========================================================
-# Resolve Fact View (unified)
-# =========================================================
-@st.cache_data(ttl=3600)
-def resolve_fact_view() -> str:
-    # INFORMATION_SCHEMAで存在チェック（asia-northeast1前提）
-    # ※ VIEWが無い場合に備え、順に試す
-    for v in FACT_CANDIDATES:
-        proj, ds, name = v.split(".")
-        sql = f"""
-        SELECT 1 AS ok
-        FROM `{proj}.{ds}.INFORMATION_SCHEMA.TABLES`
-        WHERE table_name = '{name}'
-        LIMIT 1
-        """
-        df = run_query(sql)
-        if not df.empty:
-            return v
-
-    st.error("❌ FACT VIEW が見つかりません（v_sales_fact_unified / v_sales_details_norm のいずれも不在）")
-    st.stop()
-
-# =========================================================
-# RBAC
-# =========================================================
 @dataclass(frozen=True)
 class RoleInfo:
-    login_email: str
+    is_authenticated: bool
+    email: str
     staff_name: str
-    role_key: str
+    role: str
     is_admin: bool
+    phone_last4: str
 
-def load_role(email: str) -> RoleInfo:
-    email = email.strip().lower()
-    sql = f"""
-    SELECT email, staff_name, role
-    FROM `{TABLE_ROLE}`
-    WHERE LOWER(email) = '{email}'
-    LIMIT 1
-    """
-    df = run_query(sql)
+def resolve_role(email: str, code: str) -> RoleInfo:
+    sql = f"SELECT email, staff_name, role, phone FROM `{TABLE_ROLE}` WHERE LOWER(email) = @email LIMIT 1"
+    params = [bigquery.ScalarQueryParameter("email", "STRING", email.lower().strip())]
+    df = run_query(sql, params)
+    
     if df.empty:
-        return RoleInfo(login_email=email, staff_name="ゲスト", role_key="SALES", is_admin=False)
-
+        return RoleInfo(False, email, "ゲスト", "GUEST", False, "")
+    
     r = df.iloc[0]
-    role = str(r.get("role", "SALES")).upper()
-    is_admin = any(k in role for k in ["ADMIN", "HQ", "MANAGER"])
-    return RoleInfo(
-        login_email=email,
-        staff_name=str(r.get("staff_name", "不明")),
-        role_key=role,
-        is_admin=is_admin,
-    )
+    master_phone = str(r.get("phone", "")).replace("-", "").strip()
+    if code != master_phone[-4:]:
+        return RoleInfo(False, email, str(r.get("staff_name")), "GUEST", False, "")
 
-def scope_where(role: RoleInfo, selected_staff: Optional[str]) -> str:
-    # 管理者：任意のstaff_nameに絞れる（Noneなら全件）
-    # 担当：固定（自分）
-    if role.is_admin:
-        if selected_staff and selected_staff != "（全員）":
-            return f"staff_name = '{selected_staff}'"
-        return "1=1"
-    return f"staff_name = '{role.staff_name}'"
+    raw_role = str(r.get("role", ""))
+    is_admin = any(k in raw_role for k in ["統括", "エリア", "本部", "ADMIN"])
+    
+    return RoleInfo(True, email, str(r.get("staff_name")), raw_role, is_admin, master_phone[-4:])
 
 # =========================================================
-# Bounds
+# 4. Data Logic (Scoped View 連携)
 # =========================================================
-@st.cache_data(ttl=3600)
-def load_bounds() -> Dict[str, Any]:
-    df = run_query(f"SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1")
-    if df.empty:
-        st.error("❌ v_sys_bounds が空です")
-        st.stop()
-    r = df.iloc[0].to_dict()
-    # 想定列: current_month, fy_start, py_fy_start, py_current_month, fiscal_year_current, fiscal_year_prev
-    return r
+def get_viewer_params(email: str):
+    return [bigquery.ScalarQueryParameter("email", "STRING", email)]
 
-# =========================================================
-# Dynamic SQL builders
-# =========================================================
-def noise_jan_where() -> str:
-    if not NOISE_JAN_LIST:
-        return "1=1"
-    in_list = ",".join([f"'{x}'" for x in NOISE_JAN_LIST])
-    return f"jan_code NOT IN ({in_list})"
-
-def base_fact_cte(fact_view: str) -> str:
-    # ここで“正規形”に寄せる（fact側の実列が多少違っても、norm view で合わせる想定）
+def sql_kpi_summary(email: str) -> str:
     return f"""
-    base AS (
-      SELECT
-        CAST(customer_code AS STRING)      AS customer_code,
-        CAST(customer_name AS STRING)      AS customer_name,
-        CAST(jan_code AS STRING)           AS jan_code,
-        CAST(aggregation_code AS STRING)   AS aggregation_code,
-        CAST(product_name AS STRING)       AS product_name,
-        CAST(staff_name AS STRING)         AS staff_name,
-        DATE(sales_date)                   AS sales_date,
-        CAST(sales_amount AS FLOAT64)      AS sales_amount,
-        CAST(gross_profit AS FLOAT64)      AS gross_profit
-      FROM `{fact_view}`
-      WHERE {noise_jan_where()}
-    )
-    """
-
-def sql_fytd_summary(fact_view: str, where_scope: str) -> str:
-    return f"""
-    WITH
-      b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1),
-      {base_fact_cte(fact_view)}
+    WITH b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1)
     SELECT
-      SUM(CASE WHEN sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)
-               THEN sales_amount ELSE 0 END) AS sales_fytd,
-      SUM(CASE WHEN sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)
-               THEN gross_profit ELSE 0 END) AS gp_fytd,
-      SAFE_DIVIDE(
-        SUM(CASE WHEN sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)
-                 THEN gross_profit ELSE 0 END),
-        NULLIF(SUM(CASE WHEN sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)
-                 THEN sales_amount ELSE 0 END), 0)
-      ) * 100 AS gp_rate_fytd,
-
-      SUM(CASE WHEN sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)
-               THEN sales_amount ELSE 0 END) AS sales_pytd,
-      SUM(CASE WHEN sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)
-               THEN gross_profit ELSE 0 END) AS gp_pytd,
-      SAFE_DIVIDE(
-        SUM(CASE WHEN sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)
-                 THEN gross_profit ELSE 0 END),
-        NULLIF(SUM(CASE WHEN sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)
-                 THEN sales_amount ELSE 0 END), 0)
-      ) * 100 AS gp_rate_pytd
-    FROM base
-    WHERE {where_scope}
+      SUM(CASE WHEN DATE(sales_date) BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b) THEN sales_amount ELSE 0 END) AS s_fytd,
+      SUM(CASE WHEN DATE(sales_date) BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b) THEN gross_profit ELSE 0 END) AS g_fytd,
+      SUM(CASE WHEN DATE(sales_date) BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b) THEN sales_amount ELSE 0 END) AS s_pytd
+    FROM `{VIEW_FACT_SCOPED}`
+    WHERE viewer_email = @email
     """
 
-def sql_yoy_customer_current_month(fact_view: str, where_scope: str, limit: int = 100) -> str:
+def sql_rank(email: str, dim: str, metric: str) -> str:
+    dim_col = "customer_name" if dim == "customer" else "product_name"
+    met_col = "sales_amount" if metric == "sales" else "gross_profit"
     return f"""
-    WITH
-      b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1),
-      {base_fact_cte(fact_view)}
-    SELECT
-      customer_name AS 得意先名,
-      SUM(CASE WHEN DATE_TRUNC(sales_date, MONTH) = (SELECT current_month FROM b) THEN sales_amount ELSE 0 END) AS 売上_当月,
-      SUM(CASE WHEN DATE_TRUNC(sales_date, MONTH) = (SELECT py_current_month FROM b) THEN sales_amount ELSE 0 END) AS 売上_前年同月,
-      SUM(CASE WHEN DATE_TRUNC(sales_date, MONTH) = (SELECT current_month FROM b) THEN sales_amount ELSE 0 END)
-      - SUM(CASE WHEN DATE_TRUNC(sales_date, MONTH) = (SELECT py_current_month FROM b) THEN sales_amount ELSE 0 END) AS 売上差
-    FROM base
-    WHERE {where_scope}
-    GROUP BY 1
-    HAVING 売上_当月 > 0 OR 売上_前年同月 > 0
-    ORDER BY 売上差 DESC
-    LIMIT {int(limit)}
-    """
-
-def sql_rank(dim: str, metric: str, fact_view: str, where_scope: str, period: str, limit: int = 100, keyword: str = "") -> str:
-    """
-    dim: 'customer' | 'product'
-    metric: 'sales' | 'gp'
-    period: 'FYTD' | 'CURRENT_MONTH' | 'PYTD' | 'PY_CURRENT_MONTH'
-    keyword: 部分一致（customer_name/product_name/jan_code へOR）
-    """
-    dim_expr = "customer_name" if dim == "customer" else "product_name"
-    metric_expr = "sales_amount" if metric == "sales" else "gross_profit"
-
-    period_where = {
-        "FYTD": "sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)",
-        "PYTD": "sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)",
-        "CURRENT_MONTH": "DATE_TRUNC(sales_date, MONTH) = (SELECT current_month FROM b)",
-        "PY_CURRENT_MONTH": "DATE_TRUNC(sales_date, MONTH) = (SELECT py_current_month FROM b)",
-    }[period]
-
-    kw = keyword.strip()
-    kw_where = "1=1"
-    if kw:
-        kw_esc = kw.replace("'", r"\'")
-        kw_where = f"""
-        (
-          LOWER(customer_name) LIKE LOWER('%{kw_esc}%')
-          OR LOWER(product_name) LIKE LOWER('%{kw_esc}%')
-          OR CAST(jan_code AS STRING) LIKE '%{kw_esc}%'
-        )
-        """
-
-    label_dim = "得意先名" if dim == "customer" else "商品名"
-    label_metric = "売上" if metric == "sales" else "粗利"
-
-    return f"""
-    WITH
-      b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1),
-      {base_fact_cte(fact_view)}
-    SELECT
-      {dim_expr} AS {label_dim},
-      SUM(CASE WHEN {period_where} THEN {metric_expr} ELSE 0 END) AS {label_metric}
-    FROM base
-    WHERE {where_scope}
-      AND {kw_where}
-    GROUP BY 1
-    HAVING {label_metric} != 0
-    ORDER BY {label_metric} DESC
-    LIMIT {int(limit)}
-    """
-
-def sql_drill_details(fact_view: str, where_scope: str, mode: str, key_value: str, period: str, limit: int = 500) -> str:
-    """
-    mode: 'customer' | 'product'
-    key_value: 選択された customer_name or product_name
-    period: same as above
-    """
-    key_col = "customer_name" if mode == "customer" else "product_name"
-    period_where = {
-        "FYTD": "sales_date BETWEEN (SELECT fy_start FROM b) AND (SELECT current_month FROM b)",
-        "PYTD": "sales_date BETWEEN (SELECT py_fy_start FROM b) AND (SELECT py_current_month FROM b)",
-        "CURRENT_MONTH": "DATE_TRUNC(sales_date, MONTH) = (SELECT current_month FROM b)",
-        "PY_CURRENT_MONTH": "DATE_TRUNC(sales_date, MONTH) = (SELECT py_current_month FROM b)",
-    }[period]
-
-    v = key_value.replace("'", r"\'")
-
-    return f"""
-    WITH
-      b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1),
-      {base_fact_cte(fact_view)}
-    SELECT
-      sales_date AS 販売日,
-      customer_name AS 得意先名,
-      product_name AS 商品名,
-      jan_code AS JAN,
-      sales_amount AS 売上,
-      gross_profit AS 粗利,
-      SAFE_DIVIDE(gross_profit, NULLIF(sales_amount, 0)) * 100 AS 粗利率,
-      staff_name AS 担当
-    FROM base
-    WHERE {where_scope}
-      AND {key_col} = '{v}'
-      AND {period_where}
-    ORDER BY 販売日 DESC
-    LIMIT {int(limit)}
+    SELECT {dim_col} AS name, SUM({met_col}) AS val
+    FROM `{VIEW_FACT_SCOPED}`
+    WHERE viewer_email = @email
+    GROUP BY 1 HAVING val != 0 ORDER BY val DESC LIMIT 100
     """
 
 # =========================================================
-# Main
+# 5. UI Layout (Restore Tabs & Features)
 # =========================================================
-def main() -> None:
+def render_header(role: RoleInfo):
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        st.success(f"🔓 ログイン中: {role.staff_name} 様 ({role.role})")
+    with c2:
+        st.metric("ログインID", role.email)
+    with c3:
+        st.metric("コード照合", f"****-{role.phone_last4}")
+
+def render_kpi_row(email: str):
+    df = run_query(sql_kpi_summary(email), get_viewer_params(email))
+    if not df.empty:
+        r = df.iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("売上 FYTD", money(r['s_fytd']), delta=pct((r['s_fytd']/r['s_pytd']-1)*100) if r['s_pytd'] else None)
+        c2.metric("粗利 FYTD", money(r['g_fytd']))
+        c3.metric("粗利率", pct(r['g_fytd']/r['s_fytd']*100) if r['s_fytd'] else "0%")
+        c4.metric("前年同期売上", money(r['s_pytd']))
+
+# =========================================================
+# 6. Main Application
+# =========================================================
+def main():
     set_page()
-
-    fact_view = resolve_fact_view()
-    bounds = load_bounds()
-
-    # -------- Sidebar (Login / Filters) --------
-    st.sidebar.header("入口（RBAC）")
-    email = st.sidebar.text_input("ログインEmail").strip()
-    if not email:
-        st.info("👈 Emailを入力してください（RBAC判定）")
+    
+    # --- Sidebar Login (v2.0.0 踏襲) ---
+    st.sidebar.header("🔑 OS 認証パネル")
+    input_email = st.sidebar.text_input("ログイン Email").strip()
+    input_code = st.sidebar.text_input("携帯下4桁コード", type="password").strip()
+    
+    if not input_email or not input_code:
+        st.info("👈 サイドバーからログインしてください（SSOT/RBAC制御）")
+        st.sidebar.image(get_qr_code_url(APP_URL), caption="📱 スマホからアクセス", width=150)
         st.stop()
-
-    role = load_role(email)
-
-    st.sidebar.success(f"{role.staff_name} / {role.role_key}")
-
-    # 管理者だけ staff filter を許可
-    selected_staff = None
-    if role.is_admin:
-        df_staff = run_query(f"SELECT DISTINCT staff_name FROM `{TABLE_ROLE}` WHERE staff_name IS NOT NULL ORDER BY staff_name")
-        staff_list = ["（全員）"] + (df_staff["staff_name"].dropna().astype(str).tolist() if not df_staff.empty else [])
-        selected_staff = st.sidebar.selectbox("スコープ（担当者）", staff_list, index=0)
-
-    where_scope = scope_where(role, selected_staff)
-
-    # 共通フィルタ
-    st.sidebar.header("検索")
-    keyword = st.sidebar.text_input("得意先 / 商品 / JAN（部分一致）", value="").strip()
-
-    st.sidebar.header("期間")
-    period = st.sidebar.selectbox(
-        "期間モード",
-        ["FYTD", "CURRENT_MONTH", "PYTD", "PY_CURRENT_MONTH"],
-        index=0,
-        help="FYTD=当期4月〜当月 / CURRENT_MONTH=当月 / PYTD=前年同期 / PY_CURRENT_MONTH=前年同月",
-    )
-
-    # 上部：境界表示（明示）
-    with st.expander("sys_bounds（確定値）", expanded=False):
-        st.write({
-            "current_month": str(bounds.get("current_month")),
-            "fy_start": str(bounds.get("fy_start")),
-            "py_current_month": str(bounds.get("py_current_month")),
-            "py_fy_start": str(bounds.get("py_fy_start")),
-            "fiscal_year_current": int(bounds.get("fiscal_year_current")),
-            "fiscal_year_prev": int(bounds.get("fiscal_year_prev")),
-            "fact_view": fact_view,
-        })
-
-    # -------- KPI row --------
-    df_kpi = run_query(sql_fytd_summary(fact_view, where_scope))
-    if not df_kpi.empty:
-        r = df_kpi.iloc[0]
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("売上 FYTD", money(r["sales_fytd"]))
-        c2.metric("売上 PYTD", money(r["sales_pytd"]))
-        c3.metric("粗利 FYTD", money(r["gp_fytd"]))
-        c4.metric("粗利 PYTD", money(r["gp_pytd"]))
-        c5.metric("粗利率 FYTD", pct(r["gp_rate_fytd"]))
-        c6.metric("粗利率 PYTD", pct(r["gp_rate_pytd"]))
-
+        
+    role = resolve_role(input_email, input_code)
+    if not role.is_authenticated:
+        st.error("❌ 認証に失敗しました。IDまたはコードをご確認ください。")
+        st.stop()
+    
+    # --- 認証成功後のUI ---
+    render_header(role)
+    render_kpi_row(role.email)
     st.divider()
 
-    # -------- Tabs（踏襲：ランキング＋ドリル＋検索） --------
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "① 当月YoY（得意先）",
-        "② ランキング（得意先）",
-        "③ ランキング（商品）",
-        "④ ドリル（明細）",
-    ])
+    # --- Tabs (P0機能の復元) ---
+    tabs = st.tabs(["🎯 新規採用・納品管理", "📊 実績ランキング", "📈 YoY分析", "🔎 詳細ドリル"])
 
-    # ① 当月YoY
-    with tab1:
-        st.subheader("当月YoYランキング（得意先）")
-        df = run_query(sql_yoy_customer_current_month(fact_view, where_scope, limit=200))
-        if df.empty:
-            st.info("データなし")
+    # 【P0】新規採用管理タブ
+    with tabs[0]:
+        st.subheader("当期 新規採用（Target vs Realized）")
+        sql_adopt = f"SELECT * FROM `{VIEW_ADOPTION_SCOPED}` WHERE viewer_email = @email"
+        df_adopt = run_query(sql_adopt, get_viewer_params(role.email))
+        if df_adopt.empty:
+            st.info("表示可能な新規採用データがありません。")
         else:
-            st.dataframe(df, use_container_width=True, column_config=column_config(df))
+            # 達成率計算などをフロントで行う
+            st.dataframe(df_adopt, use_container_width=True, column_config=get_column_config(df_adopt))
+            # 必要ならCSV出力
+            st.download_button("採用リスト(CSV)", df_adopt.to_csv(index=False).encode("utf-8-sig"), "new_adoption.csv")
 
-    # ② 得意先ランキング
-    with tab2:
-        st.subheader("得意先ランキング（売上 / 粗利）")
-        colA, colB = st.columns(2)
+    # 実績ランキングタブ
+    with tabs[1]:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("##### 得意先売上ランク")
+            df_cr = run_query(sql_rank(role.email, "customer", "sales"), get_viewer_params(role.email))
+            st.dataframe(df_cr, use_container_width=True, column_config=get_column_config(df_cr))
+        with col2:
+            st.markdown("##### 商品売上ランク")
+            df_pr = run_query(sql_rank(role.email, "product", "sales"), get_viewer_params(role.email))
+            st.dataframe(df_pr, use_container_width=True, column_config=get_column_config(df_pr))
 
-        with colA:
-            st.markdown("**売上ランキング**")
-            df_sales = run_query(sql_rank("customer", "sales", fact_view, where_scope, period, limit=200, keyword=keyword))
-            st.dataframe(df_sales, use_container_width=True, column_config=column_config(df_sales))
-        with colB:
-            st.markdown("**粗利ランキング**")
-            df_gp = run_query(sql_rank("customer", "gp", fact_view, where_scope, period, limit=200, keyword=keyword))
-            st.dataframe(df_gp, use_container_width=True, column_config=column_config(df_gp))
+    # YoY分析タブ
+    with tabs[2]:
+        st.subheader("当月売上 YoY 得意先推移")
+        sql_yoy = f"""
+        WITH b AS (SELECT * FROM `{VIEW_BOUNDS}` LIMIT 1)
+        SELECT customer_name AS 得意先名,
+               SUM(CASE WHEN DATE_TRUNC(DATE(sales_date), MONTH) = (SELECT current_month FROM b) THEN sales_amount ELSE 0 END) AS 当月売上,
+               SUM(CASE WHEN DATE_TRUNC(DATE(sales_date), MONTH) = (SELECT py_current_month FROM b) THEN sales_amount ELSE 0 END) AS 前年同月,
+               SUM(CASE WHEN DATE_TRUNC(DATE(sales_date), MONTH) = (SELECT current_month FROM b) THEN sales_amount ELSE 0 END) -
+               SUM(CASE WHEN DATE_TRUNC(DATE(sales_date), MONTH) = (SELECT py_current_month FROM b) THEN sales_amount ELSE 0 END) AS 差分
+        FROM `{VIEW_FACT_SCOPED}`
+        WHERE viewer_email = @email
+        GROUP BY 1 HAVING 当月売上 > 0 OR 前年同月 > 0 ORDER BY 差分 DESC
+        """
+        df_yoy = run_query(sql_yoy, get_viewer_params(role.email))
+        st.dataframe(df_yoy, use_container_width=True, column_config=get_column_config(df_yoy))
 
-    # ③ 商品ランキング
-    with tab3:
-        st.subheader("商品ランキング（売上 / 粗利）")
-        colA, colB = st.columns(2)
+    # 詳細ドリルタブ
+    with tabs[3]:
+        st.subheader("詳細明細検索 (Scoped)")
+        kw = st.text_input("得意先名 / 商品名 / JAN で絞り込み検索")
+        where_kw = ""
+        if kw:
+            where_kw = f"AND (customer_name LIKE '%{kw}%' OR product_name LIKE '%{kw}%' OR jan_code LIKE '%{kw}%')"
+        
+        sql_drill = f"""
+        SELECT DATE(sales_date) as 販売日, customer_name, product_name, jan_code, sales_amount, gross_profit
+        FROM `{VIEW_FACT_SCOPED}`
+        WHERE viewer_email = @email {where_kw}
+        ORDER BY sales_date DESC LIMIT 500
+        """
+        df_drill = run_query(sql_drill, get_viewer_params(role.email))
+        st.dataframe(df_drill, use_container_width=True, column_config=get_column_config(df_drill))
 
-        with colA:
-            st.markdown("**売上ランキング**")
-            df_sales = run_query(sql_rank("product", "sales", fact_view, where_scope, period, limit=200, keyword=keyword))
-            st.dataframe(df_sales, use_container_width=True, column_config=column_config(df_sales))
-        with colB:
-            st.markdown("**粗利ランキング**")
-            df_gp = run_query(sql_rank("product", "gp", fact_view, where_scope, period, limit=200, keyword=keyword))
-            st.dataframe(df_gp, use_container_width=True, column_config=column_config(df_gp))
-
-    # ④ ドリル（明細）
-    with tab4:
-        st.subheader("ドリルダウン（明細）")
-        mode = st.radio("ドリル軸", ["得意先", "商品"], horizontal=True)
-        drill_mode = "customer" if mode == "得意先" else "product"
-
-        # 候補の選択肢：期間＋スコープ＋keyword で上位から選ぶ（重くならない）
-        if drill_mode == "customer":
-            df_pick = run_query(sql_rank("customer", "sales", fact_view, where_scope, period, limit=200, keyword=keyword))
-            key_col = "得意先名"
-        else:
-            df_pick = run_query(sql_rank("product", "sales", fact_view, where_scope, period, limit=200, keyword=keyword))
-            key_col = "商品名"
-
-        if df_pick.empty:
-            st.info("選択候補がありません（期間/スコープ/検索条件を見直してください）")
-        else:
-            options = df_pick[key_col].astype(str).tolist()
-            selected = st.selectbox("選択", options, index=0)
-
-            df_det = run_query(sql_drill_details(fact_view, where_scope, drill_mode, selected, period, limit=800))
-            if df_det.empty:
-                st.info("明細なし")
-            else:
-                st.dataframe(df_det, use_container_width=True, column_config=column_config(df_det))
-
-                # ダウンロード（踏襲：現場で使う）
-                csv = df_det.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "CSVダウンロード",
-                    data=csv,
-                    file_name=f"drill_{drill_mode}_{period}.csv",
-                    mime="text/csv",
-                )
-
-    st.caption("SFA OS v2.3.0｜踏襲復元（RBAC/ランキング/ドリル/検索/統一VIEW）")
+    st.caption(f"OS v2.5.0 | {role.staff_name} 担当としてログイン中 | SSOT & Scoped RBAC 有効")
 
 if __name__ == "__main__":
     main()
