@@ -1,12 +1,12 @@
 # app.py
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.9.8 (Master Integrated / High Performance)
+SFA｜戦略ダッシュボード - OS v2.0.0 (Secure Auth / High Performance)
 
-【更新履歴 v1.9.8】
-- [Integration] 担当者台帳(sales_staff_master)をマスターとして統合。
-- [Feature] ログインユーザーの「電話番号」表示およびメールアドレスベースの権限判定を実装。
-- [Structure] v1.9.7の動的SQLアーキテクチャを完全踏襲。
+【更新履歴 v2.0.0】
+- [Auth] ログインID(Email)とログインコード(携帯下4桁)による認証を実装。
+- [Master] 担当者台帳(sales_staff_master)に基づく動的権限管理。
+- [UX] ログイン後の担当者情報表示（名前・権限・電話番号）を強化。
 """
 
 from __future__ import annotations
@@ -34,10 +34,8 @@ APP_URL = "https://sfa-premium-app-2.streamlit.app/"
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
-# ★分析の土台となる統合View
+# 分析の土台となるView
 VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
-
-# KPIカード用などの既存View
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
@@ -46,20 +44,19 @@ VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_unc
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_FACT_DAILY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_login_jan_daily"
 
-# ★【更新】参照先をスプレッドシート連携テーブルに変更
+# 担当者マスタ（スプレッドシート連携テーブル）
 VIEW_ROLE = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.sales_staff_master"
 
-# 除外コード定義
 NOISE_JAN_SQL = "('0', '22221', '99998', '33334')"
 
 
 # -----------------------------
-# 2. Helpers (Display) - 変更なし
+# 2. Helpers (Display)
 # -----------------------------
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.9.8 (Master Integrated)｜BigQuery集計・動的SQL版")
+    st.caption("OS v2.0.0 (Secure Auth)｜BigQuery集計・動的SQL版")
 
 def get_qr_code_url(url: str) -> str:
     return f"https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={url}"
@@ -101,7 +98,7 @@ JP_COLS_YOY = {
 
 
 # -----------------------------
-# 3. BigQuery Connection
+# 3. BigQuery Connection & Auth Logic
 # -----------------------------
 def setup_bigquery_client() -> Tuple[bigquery.Client, str, str, str]:
     if "bigquery" not in st.secrets:
@@ -132,49 +129,51 @@ def query_df_safe(client: bigquery.Client, sql: str, params: Optional[Dict[str, 
         st.error(f"Query Failed: {label}\n{e}")
         return pd.DataFrame()
 
-# ★【更新】電話番号と表示名を追加
 @dataclass(frozen=True)
 class RoleInfo:
-    login_email: str
+    is_authenticated: bool = False
+    login_email: str = ""
     staff_name: str = "ゲスト"
-    role_key: str = "SALES"
+    role_key: str = "GUEST"
     role_admin_view: bool = False
     phone: str = "-"
     area_name: str = "未設定"
 
-# ★【更新】スプレッドシート(sales_staff_master)からデータを取得するように変更
-def resolve_role(client, login_email) -> RoleInfo:
-    # スプレッドシート側の列名に合わせてSQLを調整
-    sql = f"""
-    SELECT 
-        email, 
-        staff_name, 
-        role, 
-        phone 
-    FROM `{VIEW_ROLE}` 
-    WHERE email = @login_email 
-    LIMIT 1
+def resolve_role(client, login_email, login_code) -> RoleInfo:
     """
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Role Check")
+    ID(Email)とコード(携帯番号下4桁)で認証
+    """
+    if not login_email or not login_code:
+        return RoleInfo()
+
+    sql = f"SELECT email, staff_name, role, phone FROM `{VIEW_ROLE}` WHERE email = @login_email LIMIT 1"
+    df = query_df_safe(client, sql, {"login_email": login_email}, "Auth Check")
     
-    if df.empty: 
+    if df.empty:
         return RoleInfo(login_email=login_email)
     
     r = df.iloc[0]
-    raw_role = str(r.get("role", "")).strip().upper()
+    master_phone = str(r.get("phone", "")).replace("-", "").strip()
+    # 携帯番号の末尾4桁を取得
+    last_4_digits = master_phone[-4:]
     
-    # 権限判定（ADMIN文字が含まれるか、明示的なリストで判定）
-    is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
-    rk = "HQ_ADMIN" if is_admin else "SALES"
-    
-    return RoleInfo(
-        login_email=login_email,
-        staff_name=str(r.get("staff_name", "不明")),
-        role_key=rk,
-        role_admin_view=is_admin,
-        phone=str(r.get("phone", "-")),
-        area_name=raw_role # roleをそのままエリア名として流用
-    )
+    # 入力コードと末尾4桁が一致するか判定
+    if login_code == last_4_digits:
+        raw_role = str(r.get("role", "")).strip().upper()
+        is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
+        rk = "HQ_ADMIN" if is_admin else "SALES"
+        
+        return RoleInfo(
+            is_authenticated=True,
+            login_email=login_email,
+            staff_name=str(r.get("staff_name", "不明")),
+            role_key=rk,
+            role_admin_view=is_admin,
+            phone=str(r.get("phone", "-")),
+            area_name=raw_role
+        )
+    else:
+        return RoleInfo(is_authenticated=False, login_email=login_email)
 
 def run_scoped_query(client, sql_template, scope_col, login_email, allow_fallback=False):
     sql = sql_template.replace("__WHERE__", f"WHERE {scope_col} = @login_email")
@@ -187,7 +186,7 @@ def run_scoped_query(client, sql_template, scope_col, login_email, allow_fallbac
 
 
 # -----------------------------
-# 4. ★BigQuery Calculation Logic★ - 変更なし
+# 4. Calculation Logic (v1.9.8踏襲)
 # -----------------------------
 def fetch_ranking_from_bq(client, ranking_type: str, axis_mode: str, is_sales_mode: bool) -> pd.DataFrame:
     is_worst = (ranking_type == "worst")
@@ -248,20 +247,13 @@ def fetch_drilldown_from_bq(client, key_col: str, key_val: str, target_col: str,
 
 
 # -----------------------------
-# 5. UI Layout - 関数定義は踏襲
+# 5. UI Sections (v1.9.8踏襲)
 # -----------------------------
-def sidebar_controls() -> Dict[str, Any]:
-    st.sidebar.image(get_qr_code_url(APP_URL), caption="📱スマホでアクセス", width=150)
-    st.sidebar.divider()
-    if st.sidebar.button("Clear Cache"):
-        st.cache_data.clear()
-        st.sidebar.success("Cache Cleared.")
-    return {}
-
-def get_login_email_ui() -> str:
-    st.sidebar.header("Login Simulation")
-    default = st.secrets.get("default_login_email", "") if "default_login_email" in st.secrets else ""
-    return st.sidebar.text_input("Login Email", value=default).strip()
+def sidebar_login_panel() -> Tuple[str, str]:
+    st.sidebar.header("🔑 ログイン")
+    login_id = st.sidebar.text_input("ログインID (メールアドレス)", placeholder="example@company.com")
+    login_pw = st.sidebar.text_input("ログインコード (携帯下4桁)", type="password", help="登録携帯番号の末尾4桁")
+    return login_id.strip(), login_pw.strip()
 
 def render_interactive_ranking_matrix(client, ranking_type: str, axis_mode: str, is_sales_mode: bool):
     is_worst = (ranking_type == "worst")
@@ -273,10 +265,8 @@ def render_interactive_ranking_matrix(client, ranking_type: str, axis_mode: str,
         st.info("データがありません。")
         return
     df_disp = df_rank.rename(columns={"name": label_col, "sales_cur": "今年売上", "sales_prev": "前年売上", "sales_diff": "売上差額", "gp_cur": "今年粗利", "gp_diff": "粗利差額"})
-    if is_sales_mode: cols = [label_col, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
-    else: cols = [label_col, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
+    cols = [label_col, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"] if is_sales_mode else [label_col, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
     st.markdown(f"##### ① {label_col}を選択 ({mode_label}ベース)")
-    st.caption(f"※{mode_label}の増減額が大きい順 (計算: BigQuery)")
     key_suffix = f"{ranking_type}_{axis_mode}_{mode_label}"
     event = st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=create_default_column_config(df_disp), height=400, on_select="rerun", selection_mode="single-row", key=f"t1_{key_suffix}")
     if len(event.selection["rows"]) > 0:
@@ -287,18 +277,16 @@ def render_interactive_ranking_matrix(client, ranking_type: str, axis_mode: str,
         key_col = "product_name" if is_product else "customer_name"
         target_col = "customer_name" if is_product else "product_name"
         df_drill = fetch_drilldown_from_bq(client, key_col, selected_val, target_col, is_worst, is_sales_mode)
-        if df_drill.empty: st.warning("詳細データなし")
-        else:
+        if not df_drill.empty:
             drill_label = "得意先名" if is_product else "商品名"
-            if is_sales_mode: d_cols = [drill_label, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"]
-            else: d_cols = [drill_label, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
+            d_cols = [drill_label, "売上差額", "今年売上", "前年売上", "粗利差額", "今年粗利"] if is_sales_mode else [drill_label, "粗利差額", "今年粗利", "売上差額", "今年売上", "前年売上"]
             st.dataframe(df_drill[d_cols], use_container_width=True, hide_index=True, column_config=create_default_column_config(df_drill), key=f"t2_{key_suffix}")
 
 def render_fytd_org_section(client, login_email):
     st.subheader("🏢 年度累計（FYTD）｜全社")
     if st.button("全社データを読み込む", key="btn_org_load", use_container_width=True):
         st.session_state.org_data_loaded = True
-    if st.session_state.org_data_loaded:
+    if st.session_state.get('org_data_loaded'):
         sql_kpi = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 100"
         df_org = run_scoped_query(client, sql_kpi, "viewer_email", login_email, allow_fallback=True)
         if not df_org.empty:
@@ -310,26 +298,24 @@ def render_fytd_org_section(client, login_email):
             st.markdown("##### ■ 粗利 (Gross Profit)")
             c5, c6, c7, c8 = st.columns(4); c5.metric("① 現状", f"¥{gp_cur:,.0f}"); c6.metric("② 昨年", f"¥{gp_py:,.0f}"); c7.metric("③ 予測", f"¥{gp_fc:,.0f}"); c8.metric("④ GAP", f"¥{gp_fc - gp_py:,.0f}", delta_color="off")
             st.divider()
-        st.subheader("📊 増減要因分析 (多次元)")
+        st.subheader("📊 増減要因分析")
         c_axis, c_val = st.columns(2)
         with c_axis: axis_sel = st.radio("集計軸:", ["📦 商品軸", "🏥 得意先軸"], horizontal=True); axis_mode = "product" if "商品" in axis_sel else "customer"
         with c_val: val_sel = st.radio("評価指標:", ["💰 売上金額", "💹 粗利金額"], horizontal=True); is_sales_mode = "売上" in val_sel
-        tab_worst, tab_best = st.tabs(["📉 ワースト (減)", "📈 ベスト (増)"])
-        with tab_worst: render_interactive_ranking_matrix(client, "worst", axis_mode, is_sales_mode)
-        with tab_best: render_interactive_ranking_matrix(client, "best", axis_mode, is_sales_mode)
-    else: st.info("👆 上のボタンを押して全社データを読み込んでください")
+        t_w, t_b = st.tabs(["📉 ワースト", "📈 ベスト"])
+        with t_w: render_interactive_ranking_matrix(client, "worst", axis_mode, is_sales_mode)
+        with t_b: render_interactive_ranking_matrix(client, "best", axis_mode, is_sales_mode)
 
 def render_fytd_me_section(client, login_email):
     st.subheader("👤 年度累計（FYTD）｜自分")
     if st.button("自分データを読み込む", key="btn_me", use_container_width=True):
         sql = f"SELECT * FROM `{VIEW_FYTD_ME}` __WHERE__ LIMIT 100"
         df_me = run_scoped_query(client, sql, "login_email", login_email)
-        if df_me.empty: return
-        df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
-        cols = list(df_disp.columns)
-        if "担当者名" in cols: cols.remove("担当者名"); cols.insert(0, "担当者名")
-        col_cfg = create_default_column_config(df_disp[cols])
-        st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=col_cfg)
+        if not df_me.empty:
+            df_disp = rename_columns_for_display(df_me, JP_COLS_FYTD)
+            cols = list(df_disp.columns)
+            if "担当者名" in cols: cols.remove("担当者名"); cols.insert(0, "担当者名")
+            st.dataframe(df_disp[cols], use_container_width=True, hide_index=True, column_config=create_default_column_config(df_disp[cols]))
 
 def render_yoy_section(client, login_email, allow_fallback):
     st.subheader("📊 当月YoY（得意先ランキング）")
@@ -339,53 +325,77 @@ def render_yoy_section(client, login_email, allow_fallback):
             sql = f"SELECT * FROM `{view_name}` __WHERE__ LIMIT 200"
             df = run_scoped_query(client, sql, "login_email", login_email, allow_fallback)
             if not df.empty:
-                df_disp = rename_columns_for_display(df, JP_COLS_YOY)
-                st.dataframe(df_disp, use_container_width=True, hide_index=True)
-    with c1: _show_table("YoY Top (伸び)", VIEW_YOY_TOP, "btn_top")
-    with c2: _show_table("YoY Bottom (落ち)", VIEW_YOY_BOTTOM, "btn_btm")
+                st.dataframe(rename_columns_for_display(df, JP_COLS_YOY), use_container_width=True, hide_index=True)
+    with c1: _show_table("YoY Top", VIEW_YOY_TOP, "btn_top")
+    with c2: _show_table("YoY Bottom", VIEW_YOY_BOTTOM, "btn_btm")
     with c3: _show_table("新規/比較不能", VIEW_YOY_UNCOMP, "btn_unc")
 
 def render_customer_drilldown(client, login_email):
     st.subheader("🎯 得意先別・戦略提案")
     sql_cust = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_FACT_DAILY}` WHERE login_email = @login_email ORDER BY customer_code"
     df_cust = query_df_safe(client, sql_cust, {"login_email": login_email}, "Cust List")
-    if df_cust.empty: return
-    cust_options = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in df_cust.iterrows()}
-    selected_code = st.selectbox("分析する得意先を選択してください", options=cust_options.keys(), format_func=lambda x: cust_options[x])
-    if not selected_code: return
-    st.divider()
-    sql_rec = f"SELECT * FROM `{VIEW_RECOMMEND}` WHERE customer_code = @cust_code ORDER BY priority_rank ASC"
-    df_rec = query_df_safe(client, sql_rec, {"cust_code": selected_code}, "Recommendation")
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        st.markdown("#### 🏥 プロファイル")
-        strong = df_rec.iloc[0].get("strong_category", "-") if not df_rec.empty else "-"
-        st.info(f"主力領域: **{strong}**")
-    with c2:
-        st.markdown("#### 💡 AI提案リスト")
-        if not df_rec.empty:
-            disp_df = df_rec[["priority_rank", "recommend_product", "manufacturer", "market_scale"]].rename(columns={"priority_rank": "順位", "recommend_product": "商品", "manufacturer": "メーカー", "market_scale": "規模"})
-            st.dataframe(disp_df, use_container_width=True, hide_index=True)
-    with st.expander("参考: 現在の採用品リストを見る"):
-        sql_adopted = f"SELECT m.product_name, SUM(t.sales_amount) as sales_fytd, SUM(t.gross_profit) as gp_fytd FROM `{VIEW_FACT_DAILY}` t LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.vw_item_master_norm` m ON CAST(t.jan AS STRING) = CAST(m.jan_code AS STRING) WHERE t.customer_code = @cust_code AND t.fiscal_year = 2025 GROUP BY 1 ORDER BY 2 DESC LIMIT 100"
-        df_adopted = query_df_safe(client, sql_adopted, {"cust_code": selected_code}, "Adopted List")
-        renamed_df = df_adopted.rename(columns={"product_name": "商品名", "sales_fytd": "売上(FYTD)", "gp_fytd": "粗利(FYTD)"})
-        st.dataframe(renamed_df, use_container_width=True, column_config=create_default_column_config(renamed_df))
+    if not df_cust.empty:
+        opts = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in df_cust.iterrows()}
+        sel = st.selectbox("得意先を選択", options=opts.keys(), format_func=lambda x: opts[x])
+        if sel:
+            st.divider()
+            sql_rec = f"SELECT * FROM `{VIEW_RECOMMEND}` WHERE customer_code = @c ORDER BY priority_rank ASC"
+            df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
+            c1, c2 = st.columns([1, 2])
+            with c1: st.info(f"主力領域: **{df_rec.iloc[0].get('strong_category', '-')}**" if not df_rec.empty else "-")
+            with c2:
+                if not df_rec.empty:
+                    st.dataframe(df_rec[["priority_rank", "recommend_product", "manufacturer"]].rename(columns={"priority_rank":"順", "recommend_product":"商品", "manufacturer":"メーカー"}), use_container_width=True, hide_index=True)
 
 
 # -----------------------------
-# 6. Main - ★表示名と電話番号を追加
+# 6. Main (Auth Integration)
 # -----------------------------
 def main():
-    if 'org_data_loaded' not in st.session_state: st.session_state.org_data_loaded = False
     set_page()
-    client, project_id, location, sa_json = setup_bigquery_client()
-    _ = sidebar_controls()
-    login_email = get_login_email_ui()
+    client, _, _, _ = setup_bigquery_client()
+    
+    # サイドバーログイン
+    login_id, login_pw = sidebar_login_panel()
+    st.sidebar.divider()
+    if st.sidebar.button("Clear Cache"): st.cache_data.clear(); st.sidebar.success("Cleared.")
+    
+    if not login_id or not login_pw:
+        st.info("👈 サイドバーからログインしてください。")
+        st.stop()
+    
+    # 認証と権限の解決
+    role = resolve_role(client, login_id, login_pw)
+    
+    if not role.is_authenticated:
+        st.error("❌ ログインIDまたはコードが正しくありません。")
+        st.stop()
+    
+    # ログイン成功後の表示
+    st.success(f"🔓 ログイン中: {role.staff_name} さん")
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("👤 担当", role.staff_name)
+    c2.metric("🛡️ 権限", role.role_key)
+    c3.metric("📞 電話", role.phone)
     st.divider()
     
-    # ★権限情報の解決（sales_staff_masterを参照）
-    role = resolve_role(client, login_email)
-    
-    # ★表示を少しリッチに修正（名前と電話番号を表示）
-    st.write(f"👤 **担当:** {role.staff
+    is_admin = role.role_admin_view
+    if is_admin:
+        tabs = st.tabs(["🏢 全社状況", "👤 エリア/個人", "🎯 戦略提案"])
+        with tabs[0]: render_fytd_org_section(client, role.login_email)
+        with tabs[1]:
+            render_fytd_me_section(client, role.login_email)
+            st.divider()
+            render_yoy_section(client, role.login_email, True)
+        with tabs[2]: render_customer_drilldown(client, role.login_email)
+    else:
+        tabs = st.tabs(["👤 今年の成績", "📊 得意先分析", "🎯 提案を作る"])
+        with tabs[0]: render_fytd_me_section(client, role.login_email)
+        with tabs[1]: render_yoy_section(client, role.login_email, False)
+        with tabs[2]: render_customer_drilldown(client, role.login_email)
+
+    st.caption("Updated: v2.0.0 (Secure Auth Integration)")
+
+if __name__ == "__main__":
+    main()
