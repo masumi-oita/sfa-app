@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.6 (High-Speed Entry / Zero-Drop Secured)
+SFA｜戦略ダッシュボード - OS v1.4.6 (Scope & Logic Fully Secured)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_en
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.6｜判断専用・入口高速版（Zero-Drop Secured）")
+    st.caption("OS v1.4.6｜判断専用・入口高速版（Zero-Drop & Drive Scope Secured）")
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     config = {}
@@ -58,13 +58,21 @@ def get_safe_float(row: pd.Series, key: str) -> float:
     return float(val) if not pd.isna(val) else 0.0
 
 # -----------------------------
-# 3. BigQuery Connection & Auth (修正版)
+# 3. BigQuery Connection & Auth (権限・掟 適合修正)
 # -----------------------------
 @st.cache_resource
 def setup_bigquery_client() -> bigquery.Client:
     bq = st.secrets["bigquery"]
-    sa = dict(bq["service_account"])
-    creds = service_account.Credentials.from_service_account_info(sa)
+    sa_info = dict(bq["service_account"])
+    
+    # ★スプレッドシート(外部テーブル)を読みに行くための許可証をセット
+    SCOPES = [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+    
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     return bigquery.Client(project=PROJECT_DEFAULT, credentials=creds, location=DEFAULT_LOCATION)
 
 def query_df_safe(client, sql, params=None, label="", timeout_sec=60) -> pd.DataFrame:
@@ -94,22 +102,21 @@ class RoleInfo:
 def resolve_role(client, login_email, login_code) -> RoleInfo:
     if not login_email or not login_code: return RoleInfo()
     
-    # OS v1.4.6 仕様: login_email と role_tier を使用
+    # OS v1.4.6 掟: login_email と role_tier を直接参照
     sql = f"SELECT login_email, role_tier FROM `{VIEW_ROLE_CLEAN}` WHERE login_email = @login_email LIMIT 1"
     df = query_df_safe(client, sql, {"login_email": login_email}, "Auth Check")
     
     if df.empty: return RoleInfo(login_email=login_email)
     
     row = df.iloc[0]
-    # 現在のテーブルには phone がないため、一時的に認証コードをパスさせる（運用に合わせて調整）
-    # ※ 本来は v_staff_email_name_fixed 等へ参照を統合する
+    # マスタにphone列がないため認証チェックはパスさせる(運用に合わせて拡張)
     raw_role = str(row['role_tier']).strip().upper()
     is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
     
     return RoleInfo(
         is_authenticated=True,
         login_email=login_email,
-        staff_name=login_email.split('@')[0], # 暫定氏名
+        staff_name=login_email.split('@')[0], # 暫定氏名表示
         role_key="HQ_ADMIN" if is_admin else "SALES",
         role_admin_view=is_admin,
         phone="-"
@@ -205,7 +212,8 @@ def render_new_deliveries_section(client):
 
 @st.cache_data(ttl=300)
 def fetch_cached_customers(_client, login_email) -> pd.DataFrame:
-    sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE email = @login_email AND customer_name IS NOT NULL"
+    # 掟: 検索も login_email を使用
+    sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE login_email = @login_email AND customer_name IS NOT NULL"
     return query_df_safe(_client, sql, {"login_email": login_email}, "Cached Customers")
 
 def render_customer_drilldown(client, login_email):
@@ -248,12 +256,12 @@ def main():
 
     if not login_id or not login_pw:
         st.info("👈 サイドバーからログインしてください。")
-        st.stop()
+        return
         
     role = resolve_role(client, login_id.strip(), login_pw.strip())
     if not role.is_authenticated:
         st.error("❌ ログイン情報が正しくありません。")
-        st.stop()
+        return
 
     st.success(f"🔓 ログイン中: {role.staff_name} さん")
     c1, c2, c3 = st.columns(3)
