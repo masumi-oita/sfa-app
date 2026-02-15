@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.6 (Scope & Logic Fully Secured)
+SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration / Drive & Scope Secured)
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_en
 def set_page():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.6｜判断専用・入口高速版（Zero-Drop & Drive Scope Secured）")
+    st.caption("OS v1.4.6｜判断専用・入口高速版 (Zero-Drop & Drive Scope Secured)")
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     config = {}
@@ -58,7 +58,7 @@ def get_safe_float(row: pd.Series, key: str) -> float:
     return float(val) if not pd.isna(val) else 0.0
 
 # -----------------------------
-# 3. BigQuery Connection & Auth (権限・掟 適合修正)
+# 3. BigQuery Connection & Auth (統合・修正版)
 # -----------------------------
 @st.cache_resource
 def setup_bigquery_client() -> bigquery.Client:
@@ -109,7 +109,6 @@ def resolve_role(client, login_email, login_code) -> RoleInfo:
     if df.empty: return RoleInfo(login_email=login_email)
     
     row = df.iloc[0]
-    # マスタにphone列がないため認証チェックはパスさせる(運用に合わせて拡張)
     raw_role = str(row['role_tier']).strip().upper()
     is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
     
@@ -212,7 +211,6 @@ def render_new_deliveries_section(client):
 
 @st.cache_data(ttl=300)
 def fetch_cached_customers(_client, login_email) -> pd.DataFrame:
-    # 掟: 検索も login_email を使用
     sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE login_email = @login_email AND customer_name IS NOT NULL"
     return query_df_safe(_client, sql, {"login_email": login_email}, "Cached Customers")
 
