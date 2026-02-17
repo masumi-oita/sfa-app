@@ -287,14 +287,21 @@ def render_adoption_alerts_section(client, login_email, is_admin):
     else:
         st.info("現在、アラート対象のアイテムはありません。")
 
+# -------------------------------------------------------------------
+# ★ 修正：管理者の場合は「全社の得意先」を検索できるようにする
+# -------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def fetch_cached_customers(_client, login_email) -> pd.DataFrame:
-    sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE login_email = @login_email AND customer_name IS NOT NULL"
-    return query_df_safe(_client, sql, {"login_email": login_email}, "Cached Customers")
+def fetch_cached_customers(_client, login_email, is_admin) -> pd.DataFrame:
+    if is_admin:
+        sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE customer_name IS NOT NULL"
+        return query_df_safe(_client, sql, None, "Cached Customers")
+    else:
+        sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE login_email = @login_email AND customer_name IS NOT NULL"
+        return query_df_safe(_client, sql, {"login_email": login_email}, "Cached Customers")
 
-def render_customer_drilldown(client, login_email):
+def render_customer_drilldown(client, login_email, is_admin):
     st.subheader("🎯 担当先ドリルダウン ＆ 提案（Reco）")
-    df_cust = fetch_cached_customers(client, login_email)
+    df_cust = fetch_cached_customers(client, login_email, is_admin)
     
     if not df_cust.empty:
         search_term = st.text_input("🔍 得意先名で検索（一部入力）", placeholder="例：古賀")
@@ -307,9 +314,7 @@ def render_customer_drilldown(client, login_email):
             if sel:
                 st.divider()
                 
-                # ----------------------------------------------------
                 # ① 得意先ごとの「現在の採用アイテム一覧」
-                # ----------------------------------------------------
                 st.markdown("##### 📦 現在の採用アイテム（稼働状況）")
                 sql_adopt = f"""
                     SELECT 
@@ -346,9 +351,7 @@ def render_customer_drilldown(client, login_email):
 
                 st.markdown("<br>", unsafe_allow_html=True)
 
-                # ----------------------------------------------------
                 # ② 次の提案（AI 推奨）
-                # ----------------------------------------------------
                 st.markdown("##### 💡 AI 推奨提案商品（Reco）")
                 sql_rec = f"SELECT * FROM `{VIEW_RECOMMEND}` WHERE customer_code = @c ORDER BY priority_rank ASC LIMIT 10"
                 df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
@@ -358,6 +361,8 @@ def render_customer_drilldown(client, login_email):
                     st.dataframe(df_disp, use_container_width=True, hide_index=True)
                 else:
                     st.info("現在、この得意先への推奨商品はありません。")
+    else:
+        st.info("表示できる得意先データがありません。")
 
 # -----------------------------
 # 5. Main Loop
@@ -405,7 +410,7 @@ def main():
         st.divider()
         render_adoption_alerts_section(client, role.login_email, is_admin=True)
         st.divider()
-        render_customer_drilldown(client, role.login_email)
+        render_customer_drilldown(client, role.login_email, is_admin=True)
     else:
         render_fytd_me_section(client, role.login_email)
         st.divider()
@@ -415,7 +420,7 @@ def main():
         st.divider()
         render_adoption_alerts_section(client, role.login_email, is_admin=False)
         st.divider()
-        render_customer_drilldown(client, role.login_email)
+        render_customer_drilldown(client, role.login_email, is_admin=False)
 
 if __name__ == "__main__":
     main()
