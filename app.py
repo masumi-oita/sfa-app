@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration / YJ Drilldown YoY)
+SFA｜戦略ダッシュボード - OS v1.4.6 (Final Full Integration / YJ Drilldown & Pace Forecast)
 """
 
 from __future__ import annotations
@@ -23,8 +23,6 @@ DATASET_DEFAULT = "sales_data"
 
 VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
 VIEW_ROLE_CLEAN = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.dim_staff_role_clean"
-VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
-VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_top_fy_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_bottom_fy_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_uncomparable_fy_named"
@@ -115,55 +113,91 @@ def resolve_role(client, login_email, login_code) -> RoleInfo:
         phone="-"
     )
 
-def run_scoped_query(client, sql_template, scope_col, login_email, allow_fallback=False):
-    sql = sql_template.replace("__WHERE__", f"WHERE {scope_col} = @login_email")
-    df = query_df_safe(client, sql, {"login_email": login_email}, "Scoped Query")
-    if not df.empty: return df
-    if allow_fallback:
-        sql_all = sql_template.replace("__WHERE__", f'WHERE {scope_col} = "all" OR {scope_col} IS NULL')
-        return query_df_safe(client, sql_all, None, "Fallback Query")
-    return pd.DataFrame()
-
 # -----------------------------
 # 4. UI Sections (各セクション)
 # -----------------------------
+def render_summary_metrics(row):
+    s_cur = get_safe_float(row, 'sales_amount_fytd')
+    s_py_ytd = get_safe_float(row, 'sales_amount_py_ytd')
+    s_py_total = get_safe_float(row, 'sales_amount_py_total')
+    
+    # 季節変動を加味したペース予測
+    s_fc = s_cur * (s_py_total / s_py_ytd) if s_py_ytd > 0 else s_cur * 1.0 
+    
+    gp_cur = get_safe_float(row, 'gross_profit_fytd')
+    gp_py_ytd = get_safe_float(row, 'gross_profit_py_ytd')
+    gp_py_total = get_safe_float(row, 'gross_profit_py_total')
+    gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd > 0 else gp_cur * 1.0
+
+    st.caption("※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」による季節変動を加味した推移ペース（着地見込）です。")
+    
+    st.markdown("##### ■ 売上")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
+    c2.metric("② 前年同期", f"¥{s_py_ytd:,.0f}", delta=f"{int(s_cur - s_py_ytd):,.0f}" if s_py_ytd > 0 else None)
+    c3.metric("③ 昨年度着地", f"¥{s_py_total:,.0f}")
+    c4.metric("④ 今期予測", f"¥{s_fc:,.0f}")
+    c5.metric("⑤ 着地GAP", f"¥{s_fc - s_py_total:,.0f}", delta=f"{int(s_fc - s_py_total):,.0f}")
+    
+    st.markdown("##### ■ 粗利")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("① 今期累計", f"¥{gp_cur:,.0f}")
+    c2.metric("② 前年同期", f"¥{gp_py_ytd:,.0f}", delta=f"{int(gp_cur - gp_py_ytd):,.0f}" if gp_py_ytd > 0 else None)
+    c3.metric("③ 昨年度着地", f"¥{gp_py_total:,.0f}")
+    c4.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
+    c5.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,.0f}")
+
 def render_fytd_org_section(client, login_email):
     st.subheader("🏢 年度累計（FYTD）｜全社サマリー")
     if st.button("全社データを読み込む", key="btn_org_load"):
         st.session_state.org_data_loaded = True
+        
     if st.session_state.get('org_data_loaded'):
-        sql = f"SELECT * FROM `{VIEW_FYTD_ORG}` __WHERE__ LIMIT 1"
-        df_org = run_scoped_query(client, sql, "viewer_email", login_email, allow_fallback=True)
+        sql = f"""
+            WITH today_info AS (
+              SELECT 
+                CURRENT_DATE('Asia/Tokyo') AS today,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+            )
+            SELECT
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN gross_profit ELSE 0 END) AS gross_profit_py_total
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN today_info
+        """
+        df_org = query_df_safe(client, sql, None, "Org Summary")
         if not df_org.empty:
-            row = df_org.iloc[0]
-            s_cur, s_py, s_fc = get_safe_float(row,'sales_amount_fytd'), get_safe_float(row,'sales_amount_py_total'), get_safe_float(row,'sales_forecast_total')
-            gp_cur, gp_py, gp_fc = get_safe_float(row,'gross_profit_fytd'), get_safe_float(row,'gross_profit_py_total'), get_safe_float(row,'gp_forecast_total')
-            
-            st.markdown("##### ■ 売上")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
-            c2.metric("② 昨年度着地", f"¥{s_py:,.0f}")
-            c3.metric("③ 今期予測", f"¥{s_fc:,.0f}")
-            c4.metric("④ 前年比GAP", f"¥{s_fc - s_py:,.0f}", delta_color="off")
-            
-            st.markdown("##### ■ 粗利")
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("① 今期累計", f"¥{gp_cur:,.0f}")
-            c6.metric("② 昨年度着地", f"¥{gp_py:,.0f}")
-            c7.metric("③ 今期予測", f"¥{gp_fc:,.0f}")
-            c8.metric("④ 前年比GAP", f"¥{gp_fc - gp_py:,.0f}", delta_color="off")
+            render_summary_metrics(df_org.iloc[0])
 
 def render_fytd_me_section(client, login_email):
     st.subheader("👤 年度累計（FYTD）｜個人サマリー")
     if st.button("自分の成績を読み込む", key="btn_me_load"):
-        sql = f"SELECT * FROM `{VIEW_FYTD_ME}` __WHERE__ LIMIT 100"
-        df_me = run_scoped_query(client, sql, "login_email", login_email)
+        sql = f"""
+            WITH today_info AS (
+              SELECT 
+                CURRENT_DATE('Asia/Tokyo') AS today,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+            )
+            SELECT
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN gross_profit ELSE 0 END) AS gross_profit_py_total
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN today_info
+            WHERE login_email = @login_email
+        """
+        df_me = query_df_safe(client, sql, {"login_email": login_email}, "Me Summary")
         if not df_me.empty:
-            df_disp = df_me.rename(columns={
-                "display_name": "担当者名", "sales_amount_fytd": "売上累計", "gross_profit_fytd": "粗利累計",
-                "sales_forecast_total": "売上予測", "gp_forecast_total": "粗利予測"
-            })
-            st.dataframe(df_disp, use_container_width=True, hide_index=True, column_config=create_default_column_config(df_disp))
+            render_summary_metrics(df_me.iloc[0])
 
 def render_yoy_section(client, login_email, is_admin):
     st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
