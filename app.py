@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration Final)
+SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration / Annual YoY)
 """
 
 from __future__ import annotations
@@ -21,13 +21,15 @@ DEFAULT_LOCATION = "asia-northeast1"
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
+# 本命ビューの定義
 VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
 VIEW_ROLE_CLEAN = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.dim_staff_role_clean"
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
-VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_current_month_named"
-VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_current_month_named"
-VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
+# ★ 年間ビューに変更済み
+VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_fy_named"
+VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_fy_named"
+VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_fy_named"
 VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
@@ -138,12 +140,14 @@ def render_fytd_org_section(client, login_email):
             row = df_org.iloc[0]
             s_cur, s_py, s_fc = get_safe_float(row,'sales_amount_fytd'), get_safe_float(row,'sales_amount_py_total'), get_safe_float(row,'sales_forecast_total')
             gp_cur, gp_py, gp_fc = get_safe_float(row,'gross_profit_fytd'), get_safe_float(row,'gross_profit_py_total'), get_safe_float(row,'gp_forecast_total')
+            
             st.markdown("##### ■ 売上")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
             c2.metric("② 昨年度着地", f"¥{s_py:,.0f}")
             c3.metric("③ 今期予測", f"¥{s_fc:,.0f}")
             c4.metric("④ 前年比GAP", f"¥{s_fc - s_py:,.0f}", delta_color="off")
+            
             st.markdown("##### ■ 粗利")
             c5, c6, c7, c8 = st.columns(4)
             c5.metric("① 今期累計", f"¥{gp_cur:,.0f}")
@@ -164,7 +168,7 @@ def render_fytd_me_section(client, login_email):
             st.dataframe(df_disp, use_container_width=True, hide_index=True, column_config=create_default_column_config(df_disp))
 
 def render_yoy_section(client, login_email, is_admin):
-    st.subheader("📊 当月YoY ランキング（判断専用）")
+    st.subheader("📊 年間 YoY ランキング（今年度 vs 昨年度）")
     c1, c2, c3 = st.columns(3)
     def _show_table(title, view_name, key):
         if st.button(title, key=key, use_container_width=True):
@@ -175,13 +179,13 @@ def render_yoy_section(client, login_email, is_admin):
             
             if not df.empty:
                 df_disp = df.drop(columns=["login_email"], errors="ignore").rename(
-                    columns={"customer_name": "得意先名", "sales_amount": "当月売上", "gross_profit": "当月粗利", "sales_diff_yoy": "売上差額"}
+                    columns={"customer_name": "得意先名", "sales_amount": "今期売上累計", "gross_profit": "今期粗利", "sales_diff_yoy": "前年比差額"}
                 )
                 df_disp = df_disp.fillna(0)
                 styled_df = df_disp.style.format({
-                    "当月売上": "¥{:,.0f}",
-                    "当月粗利": "¥{:,.0f}",
-                    "売上差額": "¥{:,.0f}"
+                    "今期売上累計": "¥{:,.0f}",
+                    "今期粗利": "¥{:,.0f}",
+                    "前年比差額": "¥{:,.0f}"
                 })
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
             else:
