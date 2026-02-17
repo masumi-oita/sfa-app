@@ -31,7 +31,7 @@ VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bot
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
-VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status" # ★採用・失注アラート
+VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
 
 # -----------------------------
 # 2. Helpers (表示用)
@@ -45,13 +45,13 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
     config = {}
     for col in df.columns:
         if any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
-            config[col] = st.column_config.NumberColumn(col, format="¥,d") # ★カンマ区切りを確実にするため「¥,d」に修正
+            config[col] = st.column_config.NumberColumn(col, format="¥%d") # ★修正：文字化けを防ぐため元に戻す
         elif any(k in col for k in ["率", "比", "ペース"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
         elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
             config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
         elif is_numeric_dtype(df[col]):
-            config[col] = st.column_config.NumberColumn(col, format=",d")
+            config[col] = st.column_config.NumberColumn(col, format="%d")
         else:
             config[col] = st.column_config.TextColumn(col)
     return config
@@ -216,7 +216,6 @@ def render_adoption_alerts_section(client, login_email, is_admin):
     where_clause = "" if is_admin else "WHERE login_email = @login_email"
     params = None if is_admin else {"login_email": login_email}
 
-    # ★ 差額（今期 - 前期）計算と、ヤバい順（失注×差額マイナス）ソート
     sql = f"""
         SELECT 
             staff_name AS `担当者名`,
@@ -258,7 +257,6 @@ def render_adoption_alerts_section(client, login_email, is_admin):
                 default=[] 
             )
 
-        # フィルター適用
         df_display = df_alerts.copy()
         
         if selected_status:
@@ -268,19 +266,23 @@ def render_adoption_alerts_section(client, login_email, is_admin):
             df_display = df_display[df_display['担当者名'].isin(selected_staffs)]
 
         if not df_display.empty:
-            # ★ カンマ区切りと¥マークの完璧なフォーマット（d3-format仕様）
-            column_config = {
-                "最終購入日": st.column_config.DateColumn("最終購入日", format="YYYY-MM-DD"),
-                "今期売上": st.column_config.NumberColumn("今期売上", format="¥,d"),
-                "前期売上": st.column_config.NumberColumn("前期売上", format="¥,d"),
-                "売上差額": st.column_config.NumberColumn("売上差額", format="¥,d") 
-            }
+            # ★ 修正ポイント：NaN（空のデータ）を 0 に置換してエラーを完全に封殺
+            num_cols = ["今期売上", "前期売上", "売上差額"]
+            for col in num_cols:
+                df_display[col] = pd.to_numeric(df_display[col], errors='coerce').fillna(0)
+
+            # ★ 修正ポイント：Pandasのスタイル機能を使って、完璧なカンマ付きフォーマットを実現
+            styled_df = df_display.style.format({
+                "今期売上": "¥{:,.0f}",
+                "前期売上": "¥{:,.0f}",
+                "売上差額": "¥{:,.0f}",
+                "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""
+            })
             
             st.dataframe(
-                df_display, 
+                styled_df, 
                 use_container_width=True, 
-                hide_index=True, 
-                column_config=column_config
+                hide_index=True
             )
         else:
             st.info("選択された条件に一致するアイテムはありません。")
