@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration / Annual YoY with Previous Year Sales)
+SFA｜戦略ダッシュボード - OS v1.4.6 (Full Integration / YJ Drilldown YoY)
 """
 
 from __future__ import annotations
@@ -25,9 +25,9 @@ VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
 VIEW_ROLE_CLEAN = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.dim_staff_role_clean"
 VIEW_FYTD_ORG = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_admin_org_fytd_summary_scoped"
 VIEW_FYTD_ME = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_staff_fytd_summary_scoped"
-VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_top_fy_named"
-VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bottom_fy_named"
-VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_fy_named"
+VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_top_fy_named"
+VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_bottom_fy_named"
+VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_uncomparable_fy_named"
 VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
@@ -138,12 +138,14 @@ def render_fytd_org_section(client, login_email):
             row = df_org.iloc[0]
             s_cur, s_py, s_fc = get_safe_float(row,'sales_amount_fytd'), get_safe_float(row,'sales_amount_py_total'), get_safe_float(row,'sales_forecast_total')
             gp_cur, gp_py, gp_fc = get_safe_float(row,'gross_profit_fytd'), get_safe_float(row,'gross_profit_py_total'), get_safe_float(row,'gp_forecast_total')
+            
             st.markdown("##### ■ 売上")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
             c2.metric("② 昨年度着地", f"¥{s_py:,.0f}")
             c3.metric("③ 今期予測", f"¥{s_fc:,.0f}")
             c4.metric("④ 前年比GAP", f"¥{s_fc - s_py:,.0f}", delta_color="off")
+            
             st.markdown("##### ■ 粗利")
             c5, c6, c7, c8 = st.columns(4)
             c5.metric("① 今期累計", f"¥{gp_cur:,.0f}")
@@ -163,45 +165,101 @@ def render_fytd_me_section(client, login_email):
             })
             st.dataframe(df_disp, use_container_width=True, hide_index=True, column_config=create_default_column_config(df_disp))
 
-# ★ アップデート：前期売上を含んだYoYランキング
 def render_yoy_section(client, login_email, is_admin):
-    st.subheader("📊 年間 YoY ランキング（今年度 vs 昨年度）")
+    st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
+    
+    if 'yoy_mode' not in st.session_state:
+        st.session_state.yoy_mode = None
+    if 'yoy_df' not in st.session_state:
+        st.session_state.yoy_df = pd.DataFrame()
+
     c1, c2, c3 = st.columns(3)
-    def _show_table(title, view_name, key):
-        if st.button(title, key=key, use_container_width=True):
-            where_clause = "" if is_admin else "WHERE login_email = @login_email"
-            params = None if is_admin else {"login_email": login_email}
-            # ★ SQLに py_sales_amount を追加
-            sql = f"SELECT login_email, customer_name, sales_amount, gross_profit, py_sales_amount, sales_diff_yoy FROM `{view_name}` {where_clause} LIMIT 100"
-            df = query_df_safe(client, sql, params, title)
+    
+    def load_yj_data(mode_name, view_name):
+        st.session_state.yoy_mode = mode_name
+        where_clause = "" if is_admin else "WHERE login_email = @login_email"
+        params = None if is_admin else {"login_email": login_email}
+        sql = f"SELECT login_email, yj_code, product_name, sales_amount, py_sales_amount, sales_diff_yoy FROM `{view_name}` {where_clause} LIMIT 100"
+        st.session_state.yoy_df = query_df_safe(client, sql, params, mode_name)
+
+    with c1:
+        if st.button("📉 下落幅ワースト", use_container_width=True):
+            load_yj_data("ワースト", VIEW_YOY_BOTTOM)
+    with c2:
+        if st.button("📈 上昇幅ベスト", use_container_width=True):
+            load_yj_data("ベスト", VIEW_YOY_TOP)
+    with c3:
+        if st.button("🆕 新規/比較不能", use_container_width=True):
+            load_yj_data("新規", VIEW_YOY_UNCOMP)
             
-            if not df.empty:
-                df_disp = df.drop(columns=["login_email"], errors="ignore").rename(
-                    columns={
-                        "customer_name": "得意先名", 
-                        "sales_amount": "今期売上", 
-                        "py_sales_amount": "前期売上", 
-                        "sales_diff_yoy": "前年比差額",
-                        "gross_profit": "今期粗利"
-                    }
-                )
-                df_disp = df_disp.fillna(0)
-                # ★ 列の表示順を人間が見やすいように並び替え
-                df_disp = df_disp[["得意先名", "今期売上", "前期売上", "前年比差額", "今期粗利"]]
+    if not st.session_state.yoy_df.empty:
+        df = st.session_state.yoy_df.copy()
+        df_disp = df.drop(columns=["login_email"], errors="ignore").rename(
+            columns={
+                "yj_code": "YJコード",
+                "product_name": "代表商品名(成分)",
+                "sales_amount": "今期売上", 
+                "py_sales_amount": "前期売上", 
+                "sales_diff_yoy": "前年比差額"
+            }
+        )
+        df_disp = df_disp.fillna(0)
+        df_disp = df_disp[["YJコード", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]]
+        
+        st.markdown(f"#### 🏆 第一階層：成分（YJ）{st.session_state.yoy_mode} ランキング")
+        styled_df = df_disp.style.format({
+            "今期売上": "¥{:,.0f}",
+            "前期売上": "¥{:,.0f}",
+            "前年比差額": "¥{:,.0f}"
+        })
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        
+        st.divider()
+        
+        st.markdown("#### 🔍 第二階層：成分の「得意先別」内訳")
+        
+        yj_options = {row['YJコード']: f"{row['代表商品名(成分)']} (差額: ¥{row['前年比差額']:,.0f})" for _, row in df_disp.iterrows()}
+        selected_yj = st.selectbox("詳細を見たい成分（YJ）を選択してください", options=yj_options.keys(), format_func=lambda x: yj_options[x])
+        
+        if selected_yj:
+            where_ext = "" if is_admin else "AND login_email = @login_email"
+            params = {"yj": selected_yj}
+            if not is_admin:
+                params["login_email"] = login_email
                 
-                styled_df = df_disp.style.format({
+            sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
+            
+            sql_drill = f"""
+                WITH fy_cust AS (
+                    SELECT 
+                        customer_name,
+                        SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) THEN sales_amount ELSE 0 END) AS ty_sales,
+                        SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) - 1 THEN sales_amount ELSE 0 END) AS py_sales
+                    FROM `{VIEW_UNIFIED}`
+                    WHERE yj_code = @yj {where_ext}
+                    GROUP BY customer_name
+                )
+                SELECT 
+                    customer_name AS `得意先名`, 
+                    ty_sales AS `今期売上`, 
+                    py_sales AS `前期売上`, 
+                    (ty_sales - py_sales) AS `前年比差額`
+                FROM fy_cust
+                WHERE (ty_sales - py_sales) != 0 OR ty_sales > 0
+                ORDER BY `前年比差額` {sort_order}
+                LIMIT 50
+            """
+            df_drill = query_df_safe(client, sql_drill, params, "YJ Drilldown")
+            if not df_drill.empty:
+                df_drill = df_drill.fillna(0)
+                styled_drill = df_drill.style.format({
                     "今期売上": "¥{:,.0f}",
                     "前期売上": "¥{:,.0f}",
-                    "前年比差額": "¥{:,.0f}",
-                    "今期粗利": "¥{:,.0f}"
+                    "前年比差額": "¥{:,.0f}"
                 })
-                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                st.dataframe(styled_drill, use_container_width=True, hide_index=True)
             else:
-                st.info("条件に一致するデータがありません。")
-                
-    with c1: _show_table("📉 下落幅ワースト", VIEW_YOY_BOTTOM, "btn_btm")
-    with c2: _show_table("📈 上昇幅ベスト", VIEW_YOY_TOP, "btn_top")
-    with c3: _show_table("🆕 新規/比較不能", VIEW_YOY_UNCOMP, "btn_unc")
+                st.info("この成分の得意先内訳データが見つかりません。")
 
 def render_new_deliveries_section(client, login_email, is_admin):
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
