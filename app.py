@@ -427,6 +427,92 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             else:
                 st.info("この成分の得意先内訳データが見つかりません。")
 
+            st.markdown("#### 🧪 原因追及：明細内訳（JAN/年月）")
+            if str(selected_yj).strip() in {"0", "", "nan", "None"}:
+                st.warning(
+                    "選択中の YJコード は 0（未マッピング候補）です。\n"
+                    "商品マスタ紐付け漏れ・成分変換ルール・旧JAN混在が YoY を歪める可能性があります。"
+                )
+
+            sql_root_jan = f"""
+                WITH base AS (
+                    SELECT
+                        jan_code,
+                        product_name,
+                        fiscal_year,
+                        sales_amount,
+                        customer_code
+                    FROM `{VIEW_UNIFIED}`
+                    WHERE yj_code = @yj {where_ext}
+                ),
+                fy AS (
+                    SELECT
+                        (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+                )
+                SELECT
+                    jan_code AS `JAN`,
+                    ANY_VALUE(product_name) AS `代表商品名`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
+                      - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
+                    COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS `今期得意先数`,
+                    COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS `前期得意先数`
+                FROM base
+                CROSS JOIN fy
+                GROUP BY jan_code
+                ORDER BY `前年差額` ASC
+                LIMIT 30
+            """
+            df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
+            if not df_root_jan.empty:
+                st.caption("前年差額が大きいJANを優先表示（下位=悪化寄与）。")
+                st.dataframe(
+                    df_root_jan.fillna(0).style.format(
+                        {
+                            "今期売上": "¥{:,.0f}",
+                            "前期売上": "¥{:,.0f}",
+                            "前年差額": "¥{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            sql_root_month = f"""
+                WITH fy AS (
+                    SELECT
+                        (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+                )
+                SELECT
+                    FORMAT_DATE('%Y-%m', sales_date) AS `年月`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
+                      - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`
+                FROM `{VIEW_UNIFIED}`
+                CROSS JOIN fy
+                WHERE yj_code = @yj {where_ext}
+                GROUP BY `年月`
+                ORDER BY `年月`
+            """
+            df_root_month = query_df_safe(client, sql_root_month, params, "YJ Root Cause Month")
+            if not df_root_month.empty:
+                st.caption("月次推移（前年差額）で急落タイミングを確認してください。")
+                st.dataframe(
+                    df_root_month.fillna(0).style.format(
+                        {
+                            "今期売上": "¥{:,.0f}",
+                            "前期売上": "¥{:,.0f}",
+                            "前年差額": "¥{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
 
 def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
