@@ -45,7 +45,7 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
     config = {}
     for col in df.columns:
         if any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
-            config[col] = st.column_config.NumberColumn(col, format="¥%d") # ★修正：文字化けを防ぐため元に戻す
+            config[col] = st.column_config.NumberColumn(col, format="¥%d") 
         elif any(k in col for k in ["率", "比", "ペース"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
         elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -266,12 +266,10 @@ def render_adoption_alerts_section(client, login_email, is_admin):
             df_display = df_display[df_display['担当者名'].isin(selected_staffs)]
 
         if not df_display.empty:
-            # ★ 修正ポイント：NaN（空のデータ）を 0 に置換してエラーを完全に封殺
             num_cols = ["今期売上", "前期売上", "売上差額"]
             for col in num_cols:
                 df_display[col] = pd.to_numeric(df_display[col], errors='coerce').fillna(0)
 
-            # ★ 修正ポイント：Pandasのスタイル機能を使って、完璧なカンマ付きフォーマットを実現
             styled_df = df_display.style.format({
                 "今期売上": "¥{:,.0f}",
                 "前期売上": "¥{:,.0f}",
@@ -297,19 +295,69 @@ def fetch_cached_customers(_client, login_email) -> pd.DataFrame:
 def render_customer_drilldown(client, login_email):
     st.subheader("🎯 担当先ドリルダウン ＆ 提案（Reco）")
     df_cust = fetch_cached_customers(client, login_email)
+    
     if not df_cust.empty:
         search_term = st.text_input("🔍 得意先名で検索（一部入力）", placeholder="例：古賀")
         filtered_df = df_cust[df_cust['customer_name'].str.contains(search_term, na=False)] if search_term else df_cust
+        
         if not filtered_df.empty:
             opts = {row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}" for _, row in filtered_df.iterrows()}
             sel = st.selectbox("得意先を選択", options=opts.keys(), format_func=lambda x: opts[x])
+            
             if sel:
                 st.divider()
+                
+                # ----------------------------------------------------
+                # ① 得意先ごとの「現在の採用アイテム一覧」
+                # ----------------------------------------------------
+                st.markdown("##### 📦 現在の採用アイテム（稼働状況）")
+                sql_adopt = f"""
+                    SELECT 
+                        product_name AS `商品名`,
+                        adoption_status AS `ステータス`,
+                        last_purchase_date AS `最終購入日`,
+                        current_fy_sales AS `今期売上`,
+                        previous_fy_sales AS `前期売上`
+                    FROM `{VIEW_ADOPTION}`
+                    WHERE customer_code = @c
+                    ORDER BY 
+                        CASE 
+                            WHEN adoption_status LIKE '%🟢%' THEN 1  
+                            WHEN adoption_status LIKE '%🟡%' THEN 2  
+                            ELSE 3                                   
+                        END, 
+                        current_fy_sales DESC 
+                """
+                df_adopt = query_df_safe(client, sql_adopt, {"c": sel}, "Customer Adoption")
+                
+                if not df_adopt.empty:
+                    num_cols = ["今期売上", "前期売上"]
+                    for col in num_cols:
+                        df_adopt[col] = pd.to_numeric(df_adopt[col], errors='coerce').fillna(0)
+                        
+                    styled_adopt = df_adopt.style.format({
+                        "今期売上": "¥{:,.0f}",
+                        "前期売上": "¥{:,.0f}",
+                        "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""
+                    })
+                    st.dataframe(styled_adopt, use_container_width=True, hide_index=True)
+                else:
+                    st.info("この得意先の採用データはありません。")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # ----------------------------------------------------
+                # ② 次の提案（AI 推奨）
+                # ----------------------------------------------------
+                st.markdown("##### 💡 AI 推奨提案商品（Reco）")
                 sql_rec = f"SELECT * FROM `{VIEW_RECOMMEND}` WHERE customer_code = @c ORDER BY priority_rank ASC LIMIT 10"
                 df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
+                
                 if not df_rec.empty:
                     df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer"]].rename(columns={"priority_rank":"順位", "recommend_product":"推奨商品", "manufacturer":"メーカー"})
                     st.dataframe(df_disp, use_container_width=True, hide_index=True)
+                else:
+                    st.info("現在、この得意先への推奨商品はありません。")
 
 # -----------------------------
 # 5. Main Loop
