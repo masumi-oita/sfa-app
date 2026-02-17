@@ -41,7 +41,7 @@ VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.7｜認証強化・型安全化・YJドリル安定化")
+    st.caption("OS v1.4.8｜実態解明モード（YJ=0はJANキーで追跡）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -365,7 +365,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         )
 
         st.divider()
-        st.markdown("#### 🔍 第二階層：成分の「得意先別」内訳")
+        st.markdown("#### 🔍 第二階層：分析キー（YJ or JAN）の得意先別内訳")
 
         # 重複YJコードがあっても先頭1件を採用し、辞書上書きを防止
         yj_master = df_disp.drop_duplicates(subset=["YJコード"], keep="first").copy()
@@ -398,7 +398,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
                             - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) - 1
                             THEN sales_amount ELSE 0 END) AS py_sales
                     FROM `{VIEW_UNIFIED}`
-                    WHERE yj_code = @yj {where_ext}
+                    WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
                     GROUP BY customer_name
                 )
                 SELECT
@@ -430,8 +430,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             st.markdown("#### 🧪 原因追及：明細内訳（JAN/年月）")
             if str(selected_yj).strip() in {"0", "", "nan", "None"}:
                 st.warning(
-                    "選択中の YJコード は 0（未マッピング候補）です。\n"
-                    "商品マスタ紐付け漏れ・成分変換ルール・旧JAN混在が YoY を歪める可能性があります。"
+                    "選択中キーは未マッピング（YJ=0/NULL）候補です。\n"
+                    "表示名が実態と乖離する可能性があるため、JAN別内訳を優先確認してください。"
                 )
 
             sql_root_jan = f"""
@@ -443,7 +443,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
                         sales_amount,
                         customer_code
                     FROM `{VIEW_UNIFIED}`
-                    WHERE yj_code = @yj {where_ext}
+                    WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
                 ),
                 fy AS (
                     SELECT
@@ -494,7 +494,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
                       - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`
                 FROM `{VIEW_UNIFIED}`
                 CROSS JOIN fy
-                WHERE yj_code = @yj {where_ext}
+                WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
                 GROUP BY `年月`
                 ORDER BY `年月`
             """
