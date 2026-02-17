@@ -31,6 +31,7 @@ VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bot
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
+VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status" # ★追加：採用・失注アラートビュー
 
 # -----------------------------
 # 2. Helpers (表示用)
@@ -58,7 +59,7 @@ def get_safe_float(row: pd.Series, key: str) -> float:
     return float(val) if not pd.isna(val) else 0.0
 
 # -----------------------------
-# 3. BigQuery Connection & Auth (統合・修正版)
+# 3. BigQuery Connection & Auth
 # -----------------------------
 @st.cache_resource
 def setup_bigquery_client() -> bigquery.Client:
@@ -102,7 +103,6 @@ class RoleInfo:
 def resolve_role(client, login_email, login_code) -> RoleInfo:
     if not login_email or not login_code: return RoleInfo()
     
-    # OS v1.4.6 掟: login_email と role_tier を直接参照
     sql = f"SELECT login_email, role_tier FROM `{VIEW_ROLE_CLEAN}` WHERE login_email = @login_email LIMIT 1"
     df = query_df_safe(client, sql, {"login_email": login_email}, "Auth Check")
     
@@ -115,7 +115,7 @@ def resolve_role(client, login_email, login_code) -> RoleInfo:
     return RoleInfo(
         is_authenticated=True,
         login_email=login_email,
-        staff_name=login_email.split('@')[0], # 暫定氏名表示
+        staff_name=login_email.split('@')[0],
         role_key="HQ_ADMIN" if is_admin else "SALES",
         role_admin_view=is_admin,
         phone="-"
@@ -209,6 +209,57 @@ def render_new_deliveries_section(client):
         if not df_new.empty:
             st.dataframe(df_new, use_container_width=True, hide_index=True, column_config=create_default_column_config(df_new))
 
+# ★ 新規追加：採用・失注アラート
+def render_adoption_alerts_section(client, login_email, is_admin):
+    st.subheader("🚨 採用アイテム・失注アラート")
+    
+    # 管理者は全件、一般社員は自分のデータのみを抽出
+    where_clause = "" if is_admin else "WHERE login_email = @login_email"
+    params = None if is_admin else {"login_email": login_email}
+
+    sql = f"""
+        SELECT 
+            customer_name AS `得意先名`,
+            product_name AS `商品名`,
+            last_purchase_date AS `最終購入日`,
+            adoption_status AS `ステータス`,
+            current_fy_sales AS `今期売上`,
+            previous_fy_sales AS `前期売上`
+        FROM `{VIEW_ADOPTION}`
+        {where_clause}
+        ORDER BY 
+            CASE 
+                WHEN adoption_status LIKE '%🟡%' THEN 1 
+                WHEN adoption_status LIKE '%🔴%' THEN 2
+                ELSE 3 
+            END, 
+            last_purchase_date DESC
+    """
+    
+    df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
+
+    if not df_alerts.empty:
+        # デフォルトで🟡（失注警戒）のみを抽出し、営業のアクションを促す
+        selected_status = st.multiselect(
+            "ステータスフィルター", 
+            options=df_alerts['ステータス'].unique(),
+            default=[s for s in df_alerts['ステータス'].unique() if '🟡' in s] 
+        )
+        
+        if selected_status:
+            df_display = df_alerts[df_alerts['ステータス'].isin(selected_status)]
+        else:
+            df_display = df_alerts
+
+        styled_df = df_display.style.format({
+            "今期売上": "¥{:,.0f}",
+            "前期売上": "¥{:,.0f}",
+            "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""
+        })
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("現在、アラート対象のアイテムはありません。")
+
 @st.cache_data(ttl=300)
 def fetch_cached_customers(_client, login_email) -> pd.DataFrame:
     sql = f"SELECT DISTINCT customer_code, customer_name FROM `{VIEW_UNIFIED}` WHERE login_email = @login_email AND customer_name IS NOT NULL"
@@ -268,12 +319,15 @@ def main():
     c3.metric("📞 電話", role.phone)
     st.divider()
 
+    # ★ 権限に応じた画面構成（アラートセクションを追加）
     if role.role_admin_view:
         render_fytd_org_section(client, role.login_email)
         st.divider()
         render_yoy_section(client, role.login_email, allow_fallback=True)
         st.divider()
         render_new_deliveries_section(client)
+        st.divider()
+        render_adoption_alerts_section(client, role.login_email, is_admin=True)
         st.divider()
         render_customer_drilldown(client, role.login_email)
     else:
@@ -282,6 +336,8 @@ def main():
         render_yoy_section(client, role.login_email, allow_fallback=False)
         st.divider()
         render_new_deliveries_section(client)
+        st.divider()
+        render_adoption_alerts_section(client, role.login_email, is_admin=False)
         st.divider()
         render_customer_drilldown(client, role.login_email)
 
