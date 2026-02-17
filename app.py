@@ -31,7 +31,7 @@ VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_bot
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_customer_yoy_uncomparable_current_month_named"
 VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
-VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status" # ★追加：採用・失注アラートビュー
+VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status" # ★採用・失注アラート
 
 # -----------------------------
 # 2. Helpers (表示用)
@@ -48,6 +48,9 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
             config[col] = st.column_config.NumberColumn(col, format="¥%d")
         elif any(k in col for k in ["率", "比", "ペース"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+        # ★ 日付系のカラムを安全にフォーマットするための処理を追加
+        elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
+            config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
         elif is_numeric_dtype(df[col]):
             config[col] = st.column_config.NumberColumn(col, format="%d")
         else:
@@ -66,7 +69,6 @@ def setup_bigquery_client() -> bigquery.Client:
     bq = st.secrets["bigquery"]
     sa_info = dict(bq["service_account"])
     
-    # ★スプレッドシート(外部テーブル)を読みに行くための許可証をセット
     SCOPES = [
         "https://www.googleapis.com/auth/bigquery",
         "https://www.googleapis.com/auth/drive",
@@ -209,16 +211,15 @@ def render_new_deliveries_section(client):
         if not df_new.empty:
             st.dataframe(df_new, use_container_width=True, hide_index=True, column_config=create_default_column_config(df_new))
 
-# ★ 新規追加：採用・失注アラート
 def render_adoption_alerts_section(client, login_email, is_admin):
     st.subheader("🚨 採用アイテム・失注アラート")
     
-    # 管理者は全件、一般社員は自分のデータのみを抽出
     where_clause = "" if is_admin else "WHERE login_email = @login_email"
     params = None if is_admin else {"login_email": login_email}
 
     sql = f"""
         SELECT 
+            staff_name AS `担当者名`,
             customer_name AS `得意先名`,
             product_name AS `商品名`,
             last_purchase_date AS `最終購入日`,
@@ -239,24 +240,43 @@ def render_adoption_alerts_section(client, login_email, is_admin):
     df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
 
     if not df_alerts.empty:
-        # デフォルトで🟡（失注警戒）のみを抽出し、営業のアクションを促す
-        selected_status = st.multiselect(
-            "ステータスフィルター", 
-            options=df_alerts['ステータス'].unique(),
-            default=[s for s in df_alerts['ステータス'].unique() if '🟡' in s] 
-        )
+        # ★ エラー回避策：空データ（None/NaN）を安全な文字列に置き換える
+        df_alerts['担当者名'] = df_alerts['担当者名'].fillna("未設定")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_status = st.multiselect(
+                "🎯 ステータスで絞り込み", 
+                options=df_alerts['ステータス'].unique(),
+                default=[s for s in df_alerts['ステータス'].unique() if '🟡' in s] 
+            )
+        with col2:
+            all_staffs = sorted(df_alerts['担当者名'].unique().tolist())
+            selected_staffs = st.multiselect(
+                "👤 担当者で絞り込み", 
+                options=all_staffs,
+                default=[] 
+            )
+
+        # フィルター適用
+        df_display = df_alerts.copy()
         
         if selected_status:
-            df_display = df_alerts[df_alerts['ステータス'].isin(selected_status)]
-        else:
-            df_display = df_alerts
+            df_display = df_display[df_display['ステータス'].isin(selected_status)]
+            
+        if selected_staffs:
+            df_display = df_display[df_display['担当者名'].isin(selected_staffs)]
 
-        styled_df = df_display.style.format({
-            "今期売上": "¥{:,.0f}",
-            "前期売上": "¥{:,.0f}",
-            "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""
-        })
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        # ★ エラー回避策：危険な `.style.format` を廃止し、安全な `column_config` に統一！
+        if not df_display.empty:
+            st.dataframe(
+                df_display, 
+                use_container_width=True, 
+                hide_index=True, 
+                column_config=create_default_column_config(df_display)
+            )
+        else:
+            st.info("選択された条件に一致するアイテムはありません。")
     else:
         st.info("現在、アラート対象のアイテムはありません。")
 
@@ -319,7 +339,6 @@ def main():
     c3.metric("📞 電話", role.phone)
     st.divider()
 
-    # ★ 権限に応じた画面構成（アラートセクションを追加）
     if role.role_admin_view:
         render_fytd_org_section(client, role.login_email)
         st.divider()
