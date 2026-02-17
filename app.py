@@ -146,24 +146,53 @@ class RoleInfo:
     phone: str = "-"
 
 
+def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
+    parts = table_fqn.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid table FQN: {table_fqn}")
+    return parts[0], parts[1], parts[2]
+
+
+@st.cache_data(ttl=3600)
+def role_table_has_login_code(_client: bigquery.Client) -> bool:
+    project_id, dataset_id, table_name = _split_table_fqn(VIEW_ROLE_CLEAN)
+    sql = f"""
+        SELECT 1
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = @table_name
+          AND column_name = 'login_code'
+        LIMIT 1
+    """
+    df = query_df_safe(_client, sql, {"table_name": table_name}, "Role Schema Check")
+    return not df.empty
+
+
 def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> RoleInfo:
     if not login_email or not login_code:
         return RoleInfo()
 
-    # login_code を認証に利用（最小修正）。
-    sql = f"""
-        SELECT login_email, role_tier
-        FROM `{VIEW_ROLE_CLEAN}`
-        WHERE login_email = @login_email
-          AND CAST(login_code AS STRING) = @login_code
-        LIMIT 1
-    """
-    df = query_df_safe(
-        client,
-        sql,
-        {"login_email": login_email, "login_code": login_code},
-        "Auth Check",
-    )
+    has_login_code = role_table_has_login_code(client)
+
+    if has_login_code:
+        sql = f"""
+            SELECT login_email, role_tier
+            FROM `{VIEW_ROLE_CLEAN}`
+            WHERE login_email = @login_email
+              AND CAST(login_code AS STRING) = @login_code
+            LIMIT 1
+        """
+        params: Dict[str, Any] = {"login_email": login_email, "login_code": login_code}
+    else:
+        # 既存テーブルに login_code 列が無い環境の後方互換対応
+        sql = f"""
+            SELECT login_email, role_tier
+            FROM `{VIEW_ROLE_CLEAN}`
+            WHERE login_email = @login_email
+            LIMIT 1
+        """
+        params = {"login_email": login_email}
+
+    df = query_df_safe(client, sql, params, "Auth Check")
 
     if df.empty:
         return RoleInfo(login_email=login_email)
