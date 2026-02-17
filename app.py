@@ -45,14 +45,13 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
     config = {}
     for col in df.columns:
         if any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
-            config[col] = st.column_config.NumberColumn(col, format="¥%d")
+            config[col] = st.column_config.NumberColumn(col, format="¥,d") # ★カンマ区切りを確実にするため「¥,d」に修正
         elif any(k in col for k in ["率", "比", "ペース"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
-        # ★ 日付系のカラムを安全にフォーマットするための処理を追加
         elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
             config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
         elif is_numeric_dtype(df[col]):
-            config[col] = st.column_config.NumberColumn(col, format="%d")
+            config[col] = st.column_config.NumberColumn(col, format=",d")
         else:
             config[col] = st.column_config.TextColumn(col)
     return config
@@ -217,6 +216,7 @@ def render_adoption_alerts_section(client, login_email, is_admin):
     where_clause = "" if is_admin else "WHERE login_email = @login_email"
     params = None if is_admin else {"login_email": login_email}
 
+    # ★ 差額（今期 - 前期）計算と、ヤバい順（失注×差額マイナス）ソート
     sql = f"""
         SELECT 
             staff_name AS `担当者名`,
@@ -225,22 +225,22 @@ def render_adoption_alerts_section(client, login_email, is_admin):
             last_purchase_date AS `最終購入日`,
             adoption_status AS `ステータス`,
             current_fy_sales AS `今期売上`,
-            previous_fy_sales AS `前期売上`
+            previous_fy_sales AS `前期売上`,
+            (current_fy_sales - previous_fy_sales) AS `売上差額`
         FROM `{VIEW_ADOPTION}`
         {where_clause}
         ORDER BY 
             CASE 
-                WHEN adoption_status LIKE '%🟡%' THEN 1 
-                WHEN adoption_status LIKE '%🔴%' THEN 2
-                ELSE 3 
+                WHEN adoption_status LIKE '%🔴%' THEN 1 
+                WHEN adoption_status LIKE '%🟡%' THEN 2 
+                ELSE 3                                  
             END, 
-            last_purchase_date DESC
+            `売上差額` ASC
     """
     
     df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
 
     if not df_alerts.empty:
-        # ★ エラー回避策：空データ（None/NaN）を安全な文字列に置き換える
         df_alerts['担当者名'] = df_alerts['担当者名'].fillna("未設定")
         
         col1, col2 = st.columns(2)
@@ -248,7 +248,7 @@ def render_adoption_alerts_section(client, login_email, is_admin):
             selected_status = st.multiselect(
                 "🎯 ステータスで絞り込み", 
                 options=df_alerts['ステータス'].unique(),
-                default=[s for s in df_alerts['ステータス'].unique() if '🟡' in s] 
+                default=[s for s in df_alerts['ステータス'].unique() if '🟡' in s or '🔴' in s] 
             )
         with col2:
             all_staffs = sorted(df_alerts['担当者名'].unique().tolist())
@@ -267,13 +267,20 @@ def render_adoption_alerts_section(client, login_email, is_admin):
         if selected_staffs:
             df_display = df_display[df_display['担当者名'].isin(selected_staffs)]
 
-        # ★ エラー回避策：危険な `.style.format` を廃止し、安全な `column_config` に統一！
         if not df_display.empty:
+            # ★ カンマ区切りと¥マークの完璧なフォーマット（d3-format仕様）
+            column_config = {
+                "最終購入日": st.column_config.DateColumn("最終購入日", format="YYYY-MM-DD"),
+                "今期売上": st.column_config.NumberColumn("今期売上", format="¥,d"),
+                "前期売上": st.column_config.NumberColumn("前期売上", format="¥,d"),
+                "売上差額": st.column_config.NumberColumn("売上差額", format="¥,d") 
+            }
+            
             st.dataframe(
                 df_display, 
                 use_container_width=True, 
                 hide_index=True, 
-                column_config=create_default_column_config(df_display)
+                column_config=column_config
             )
         else:
             st.info("選択された条件に一致するアイテムはありません。")
