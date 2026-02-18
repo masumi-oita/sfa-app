@@ -40,6 +40,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
     "customer_segment",
     "channel_group",
     "chain_name",
+    "sales_group_name"
 )
 
 
