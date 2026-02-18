@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.5.0
-(Advanced Filtering: Group/Customer Filter + Strategic Deep Drilldown)
+SFA｜戦略ダッシュボード - OS v1.4.7
+(Integrated Update / Auth Hardening & Typed Params)
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
 from google.cloud import bigquery
@@ -21,27 +24,64 @@ DEFAULT_LOCATION = "asia-northeast1"
 PROJECT_DEFAULT = "salesdb-479915"
 DATASET_DEFAULT = "sales_data"
 
-# ビュー定義
 VIEW_UNIFIED = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_fact_unified"
 VIEW_ROLE_CLEAN = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.dim_staff_role_clean"
 VIEW_YOY_TOP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_top_fy_named"
 VIEW_YOY_BOTTOM = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_bottom_fy_named"
 VIEW_YOY_UNCOMP = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_yj_yoy_uncomparable_fy_named"
-VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
+VIEW_NEW_DELIVERY = (
+    f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_realized_daily_fact_all_months"
+)
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
 
+CUSTOMER_GROUP_COLUMN_CANDIDATES = (
+    "customer_group_name",
+    "customer_group",
+    "customer_segment",
+    "channel_group",
+    "chain_name",
+)
+
 # -----------------------------
-# 2. Helpers
+# 2. Helpers (表示用)
 # -----------------------------
+
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.5.0｜多次元フィルタリング（グループ・得意先）× 実態解明ドリルダウン")
+    st.caption("OS v1.4.8｜実態解明モード（YJ=0はJANキーで追跡）")
+
+
+def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
+    config: Dict[str, st.column_config.Column] = {}
+    for col in df.columns:
+        if any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
+            config[col] = st.column_config.NumberColumn(col, format="¥%d")
+        elif any(k in col for k in ["率", "比", "ペース"]):
+            config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+        elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
+            config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
+        elif is_numeric_dtype(df[col]):
+            config[col] = st.column_config.NumberColumn(col, format="%d")
+        else:
+            config[col] = st.column_config.TextColumn(col)
+    return config
+
 
 def get_safe_float(row: pd.Series, key: str) -> float:
     val = row.get(key)
     return float(val) if not pd.isna(val) else 0.0
+
+
+def normalize_product_display_name(name: Any) -> str:
+    """表示用: 包装・入数表記（例: /B500T, /1V, /10テスト用）を除去。"""
+    if pd.isna(name):
+        return ""
+    text = str(name).strip()
+    text = re.sub(r"[/／].*$", "", text)
+    return text.strip()
+
 
 # -----------------------------
 # 3. BigQuery Connection & Auth
@@ -50,28 +90,69 @@ def get_safe_float(row: pd.Series, key: str) -> float:
 def setup_bigquery_client() -> bigquery.Client:
     bq = st.secrets["bigquery"]
     sa_info = dict(bq["service_account"])
-    scopes = ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/drive"]
+    scopes = [
+        "https://www.googleapis.com/auth/bigquery",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
-    return bigquery.Client(project=PROJECT_DEFAULT, credentials=creds, location=DEFAULT_LOCATION)
+    return bigquery.Client(
+        project=PROJECT_DEFAULT,
+        credentials=creds,
+        location=DEFAULT_LOCATION,
+    )
 
-def _normalize_param(value: Any) -> Tuple[str, Optional[Any]]:
-    if isinstance(value, tuple) and len(value) == 2: return str(value[0]).upper(), value[1]
-    if value is None: return "STRING", None
-    if isinstance(value, bool): return "BOOL", value
-    if isinstance(value, int): return "INT64", value
-    if isinstance(value, float): return "FLOAT64", value
+
+def _normalize_param(
+    value: Any,
+) -> Tuple[str, Optional[Any]]:
+    """
+    query_df_safe() 用の型推定ヘルパー
+    - tuple("TYPE", value) の場合は明示型を優先
+    - それ以外は値型から推定
+    """
+    if isinstance(value, tuple) and len(value) == 2:
+        p_type, p_value = value
+        return str(p_type).upper(), p_value
+
+    if value is None:
+        return "STRING", None
+    if isinstance(value, bool):
+        return "BOOL", value
+    if isinstance(value, int):
+        return "INT64", value
+    if isinstance(value, float):
+        return "FLOAT64", value
+    if isinstance(value, pd.Timestamp):
+        return "TIMESTAMP", value.to_pydatetime()
+
     return "STRING", str(value)
 
-def query_df_safe(client: bigquery.Client, sql: str, params: Optional[Dict[str, Any]] = None, label: str = "") -> pd.DataFrame:
+
+def query_df_safe(
+    client: bigquery.Client,
+    sql: str,
+    params: Optional[Dict[str, Any]] = None,
+    label: str = "",
+    timeout_sec: int = 60,
+) -> pd.DataFrame:
     use_bqstorage = st.session_state.get("use_bqstorage", True)
     try:
         job_config = bigquery.QueryJobConfig()
         if params:
-            job_config.query_parameters = [bigquery.ScalarQueryParameter(k, *_normalize_param(v)) for k, v in params.items()]
-        return client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=use_bqstorage)
+            query_params = []
+            for key, raw_value in params.items():
+                p_type, p_value = _normalize_param(raw_value)
+                query_params.append(bigquery.ScalarQueryParameter(key, p_type, p_value))
+            job_config.query_parameters = query_params
+
+        job = client.query(sql, job_config=job_config)
+        job.result(timeout=timeout_sec)
+        return job.to_dataframe(create_bqstorage_client=use_bqstorage)
     except Exception as e:
-        st.error(f"クエリエラー ({label}): {e}")
+        st.error(f"クエリエラー ({label}):\n{e}")
         return pd.DataFrame()
+
 
 @dataclass(frozen=True)
 class RoleInfo:
@@ -80,206 +161,755 @@ class RoleInfo:
     staff_name: str = "ゲスト"
     role_key: str = "GUEST"
     role_admin_view: bool = False
+    phone: str = "-"
+
+
+def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
+    parts = table_fqn.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid table FQN: {table_fqn}")
+    return parts[0], parts[1], parts[2]
+
 
 @st.cache_data(ttl=3600)
-def check_login_code_col(_client: bigquery.Client) -> bool:
-    parts = VIEW_ROLE_CLEAN.split(".")
-    sql = f"SELECT 1 FROM `{parts[0]}.{parts[1]}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name = @t AND column_name = 'login_code' LIMIT 1"
-    df = query_df_safe(_client, sql, {"t": parts[2]})
+def role_table_has_login_code(_client: bigquery.Client) -> bool:
+    project_id, dataset_id, table_name = _split_table_fqn(VIEW_ROLE_CLEAN)
+    sql = f"""
+        SELECT 1
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = @table_name
+          AND column_name = 'login_code'
+        LIMIT 1
+    """
+    df = query_df_safe(_client, sql, {"table_name": table_name}, "Role Schema Check")
     return not df.empty
 
-def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> RoleInfo:
-    if not login_email or not login_code: return RoleInfo()
-    has_code = check_login_code_col(client)
-    sql = f"SELECT login_email, role_tier FROM `{VIEW_ROLE_CLEAN}` WHERE login_email = @email"
-    if has_code: sql += " AND CAST(login_code AS STRING) = @code"
-    df = query_df_safe(client, sql, {"email": login_email, "code": login_code}, "Auth Check")
-    if df.empty: return RoleInfo(login_email=login_email)
-    row = df.iloc[0]
-    is_admin = any(x in str(row["role_tier"]).upper() for x in ["ADMIN", "MANAGER", "HQ"])
-    return RoleInfo(True, login_email, login_email.split("@")[0], "HQ_ADMIN" if is_admin else "SALES", is_admin)
 
-# -----------------------------
-# 4. Filter Logic (万能フィルター)
-# -----------------------------
-def render_filters(client: bigquery.Client, role: RoleInfo) -> Tuple[str, Dict[str, Any]]:
-    where_parts = []
-    params = {}
-
-    # 基本権限
-    if not role.role_admin_view:
-        where_parts.append("login_email = @login_email")
-        params["login_email"] = role.login_email
-
-    st.markdown("### 🔍 分析スコープ設定")
-    with st.expander("詳細絞り込みを開く", expanded=True):
-        c1, c2, c3 = st.columns([1, 2, 2])
-        
-        # モード表示
-        current_scope = "全社" if role.role_admin_view else "担当エリア"
-        c1.info(f"権限: **{current_scope}**")
-
-        # グループ絞り込み (管理者の場合)
-        group_val = None
-        if role.role_admin_view:
-            try:
-                base_sql = f"SELECT DISTINCT sales_group_name FROM `{VIEW_UNIFIED}` WHERE sales_group_name IS NOT NULL ORDER BY 1"
-                df_grp = query_df_safe(client, base_sql)
-                if not df_grp.empty:
-                    group_opts = ["指定なし"] + df_grp["sales_group_name"].tolist()
-                    group_val = c2.selectbox("営業所 / グループ", group_opts)
-            except:
-                c2.warning("グループ情報取得不可")
-
-        if group_val and group_val != "指定なし":
-            where_parts.append("sales_group_name = @s_group")
-            params["s_group"] = group_val
-
-        # 得意先絞り込み
-        cust_input = c3.text_input("得意先名で絞り込み（部分一致）", placeholder="病院名・薬局名を入力...")
-        if cust_input:
-            where_parts.append("customer_name LIKE @cust_name")
-            params["cust_name"] = f"%{cust_input}%"
-
-    where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
-    return where_clause, params
-
-# -----------------------------
-# 5. UI Sections (動的集計)
-# -----------------------------
-
-def render_summary(client, where_clause, params):
-    """サマリー（フィルター連動）"""
+@st.cache_data(ttl=3600)
+def get_unified_columns(_client: bigquery.Client) -> set[str]:
+    project_id, dataset_id, table_name = _split_table_fqn(VIEW_UNIFIED)
     sql = f"""
-        WITH info AS (
-          SELECT CURRENT_DATE('Asia/Tokyo') AS td, DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_td,
-          (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS cfy
-        )
-        SELECT
-          SUM(CASE WHEN fiscal_year = cfy THEN sales_amount ELSE 0 END) AS ty,
-          SUM(CASE WHEN fiscal_year = cfy - 1 AND sales_date <= py_td THEN sales_amount ELSE 0 END) AS py_ytd,
-          SUM(CASE WHEN fiscal_year = cfy - 1 THEN sales_amount ELSE 0 END) AS py_tot
-        FROM `{VIEW_UNIFIED}` CROSS JOIN info {where_clause}
+        SELECT column_name
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = @table_name
     """
-    df = query_df_safe(client, sql, params, "Summary")
-    if not df.empty:
-        row = df.iloc[0]
-        ty, py_ytd, py_tot = get_safe_float(row, "ty"), get_safe_float(row, "py_ytd"), get_safe_float(row, "py_tot")
-        fc = ty * (py_tot / py_ytd) if py_ytd > 0 else ty
-        
-        st.markdown("##### ■ 売上進捗（スコープ集計）")
-        cols = st.columns(5)
-        cols[0].metric("今期累計", f"¥{ty:,.0f}")
-        cols[1].metric("前年同期比", f"¥{py_ytd:,.0f}", delta=f"{int(ty-py_ytd):,.0f}")
-        cols[2].metric("昨年度着地", f"¥{py_tot:,.0f}")
-        cols[3].metric("着地予測", f"¥{fc:,.0f}")
-        cols[4].metric("GAP", f"¥{fc-py_tot:,.0f}", delta=f"{int(fc-py_tot):,.0f}")
+    df = query_df_safe(_client, sql, {"table_name": table_name}, "Unified Schema Check")
+    if df.empty or "column_name" not in df.columns:
+        return set()
+    return {str(c).lower() for c in df["column_name"].dropna().tolist()}
 
-def render_strategic_ranking(client, where_clause, params):
-    """成分（YJ）ランキング & ドリルダウン（フィルター連動）"""
-    st.subheader("📊 年間 YoY ランキング（絞り込み対象）")
-    
-    if "rank_mode" not in st.session_state: st.session_state.rank_mode = "bottom"
-    
-    c1, c2 = st.columns(2)
-    if c1.button("📉 下落幅ワースト", use_container_width=True): st.session_state.rank_mode = "bottom"
-    if c2.button("📈 上昇幅ベスト", use_container_width=True): st.session_state.rank_mode = "top"
-    
-    sort_dir = "ASC" if st.session_state.rank_mode == "bottom" else "DESC"
-    
-    # 動的集計：YJ=0対策済み
-    sql = f"""
-        WITH base AS (
-            SELECT 
-                COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) AS code,
-                MAX(product_name) AS name,
-                SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) AS ty,
-                SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) AS py
+
+def get_available_customer_group_columns(_client: bigquery.Client) -> list[str]:
+    columns = get_unified_columns(_client)
+    return [col for col in CUSTOMER_GROUP_COLUMN_CANDIDATES if col in columns]
+
+
+@st.cache_data(ttl=3600)
+def get_customer_group_column_profiles(_client: bigquery.Client) -> pd.DataFrame:
+    available_cols = get_available_customer_group_columns(_client)
+    if not available_cols:
+        return pd.DataFrame()
+
+    union_parts = []
+    for col in available_cols:
+        union_parts.append(
+            f"""
+            SELECT
+              '{col}' AS column_name,
+              COUNT(*) AS total_rows,
+              COUNTIF(COALESCE(NULLIF(CAST({col} AS STRING), ''), '') != '') AS non_null_rows,
+              COUNT(DISTINCT NULLIF(CAST({col} AS STRING), '')) AS distinct_groups
             FROM `{VIEW_UNIFIED}`
-            {where_clause}
-            GROUP BY 1
+            """
         )
-        SELECT code AS `YJコード`, name AS `成分名`, ty AS `今期`, py AS `前期`, (ty - py) AS `差額`
-        FROM base
-        WHERE py > 0 AND (ty - py) != 0
-        ORDER BY `差額` {sort_dir}
-        LIMIT 50
-    """
-    
-    df = query_df_safe(client, sql, params, "Ranking")
-    if not df.empty:
-        st.dataframe(df.style.format({"今期": "¥{:,.0f}", "前期": "¥{:,.0f}", "差額": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
-        
-        # --- ドリルダウン ---
+
+    sql = "\nUNION ALL\n".join(union_parts) + "\nORDER BY non_null_rows DESC, distinct_groups DESC"
+    df = query_df_safe(_client, sql, label="Customer Group Column Profile")
+    if df.empty:
+        return df
+    return df
+
+
+def resolve_customer_group_column(_client: bigquery.Client) -> Optional[str]:
+    profiles = get_customer_group_column_profiles(_client)
+    if not profiles.empty and "column_name" in profiles.columns:
+        return str(profiles.iloc[0]["column_name"])
+
+    available_cols = get_available_customer_group_columns(_client)
+    return available_cols[0] if available_cols else None
+
+
+def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> RoleInfo:
+    if not login_email or not login_code:
+        return RoleInfo()
+
+    has_login_code = role_table_has_login_code(client)
+
+    if has_login_code:
+        sql = f"""
+            SELECT login_email, role_tier
+            FROM `{VIEW_ROLE_CLEAN}`
+            WHERE login_email = @login_email
+              AND CAST(login_code AS STRING) = @login_code
+            LIMIT 1
+        """
+        params: Dict[str, Any] = {"login_email": login_email, "login_code": login_code}
+    else:
+        # 既存テーブルに login_code 列が無い環境の後方互換対応
+        sql = f"""
+            SELECT login_email, role_tier
+            FROM `{VIEW_ROLE_CLEAN}`
+            WHERE login_email = @login_email
+            LIMIT 1
+        """
+        params = {"login_email": login_email}
+
+    df = query_df_safe(client, sql, params, "Auth Check")
+
+    if df.empty:
+        return RoleInfo(login_email=login_email)
+
+    row = df.iloc[0]
+    raw_role = str(row["role_tier"]).strip().upper()
+    is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
+
+    return RoleInfo(
+        is_authenticated=True,
+        login_email=login_email,
+        staff_name=login_email.split("@")[0],
+        role_key="HQ_ADMIN" if is_admin else "SALES",
+        role_admin_view=is_admin,
+        phone="-",
+    )
+
+
+# -----------------------------
+# 4. UI Sections (各セクション)
+# -----------------------------
+
+def render_summary_metrics(row: pd.Series) -> None:
+    s_cur = get_safe_float(row, "sales_amount_fytd")
+    s_py_ytd = get_safe_float(row, "sales_amount_py_ytd")
+    s_py_total = get_safe_float(row, "sales_amount_py_total")
+
+    # 季節変動を加味したペース予測
+    s_fc = s_cur * (s_py_total / s_py_ytd) if s_py_ytd > 0 else s_cur
+
+    gp_cur = get_safe_float(row, "gross_profit_fytd")
+    gp_py_ytd = get_safe_float(row, "gross_profit_py_ytd")
+    gp_py_total = get_safe_float(row, "gross_profit_py_total")
+    gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd > 0 else gp_cur
+
+    st.caption(
+        "※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」"
+        "による季節変動を加味した推移ペース（着地見込）です。"
+    )
+
+    st.markdown("##### ■ 売上")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
+    c2.metric("② 前年同期", f"¥{s_py_ytd:,.0f}", delta=f"{int(s_cur - s_py_ytd):,.0f}" if s_py_ytd > 0 else None)
+    c3.metric("③ 昨年度着地", f"¥{s_py_total:,.0f}")
+    c4.metric("④ 今期予測", f"¥{s_fc:,.0f}")
+    c5.metric("⑤ 着地GAP", f"¥{s_fc - s_py_total:,.0f}", delta=f"{int(s_fc - s_py_total):,.0f}")
+
+    st.markdown("##### ■ 粗利")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("① 今期累計", f"¥{gp_cur:,.0f}")
+    c2.metric("② 前年同期", f"¥{gp_py_ytd:,.0f}", delta=f"{int(gp_cur - gp_py_ytd):,.0f}" if gp_py_ytd > 0 else None)
+    c3.metric("③ 昨年度着地", f"¥{gp_py_total:,.0f}")
+    c4.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
+    c5.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,.0f}")
+
+
+def render_fytd_org_section(client: bigquery.Client, login_email: str) -> None:
+    del login_email
+    st.subheader("🏢 年度累計（FYTD）｜全社サマリー")
+    if st.button("全社データを読み込む", key="btn_org_load"):
+        st.session_state.org_data_loaded = True
+
+    if st.session_state.get("org_data_loaded"):
+        sql = f"""
+            WITH today_info AS (
+              SELECT
+                CURRENT_DATE('Asia/Tokyo') AS today,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                    - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+            )
+            SELECT
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN gross_profit ELSE 0 END) AS gross_profit_py_total
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN today_info
+        """
+        df_org = query_df_safe(client, sql, None, "Org Summary")
+        if not df_org.empty:
+            render_summary_metrics(df_org.iloc[0])
+
+
+def render_fytd_me_section(client: bigquery.Client, login_email: str) -> None:
+    st.subheader("👤 年度累計（FYTD）｜個人サマリー")
+    if st.button("自分の成績を読み込む", key="btn_me_load"):
+        sql = f"""
+            WITH today_info AS (
+              SELECT
+                CURRENT_DATE('Asia/Tokyo') AS today,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                    - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+            )
+            SELECT
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 THEN gross_profit ELSE 0 END) AS gross_profit_py_total
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN today_info
+            WHERE login_email = @login_email
+        """
+        df_me = query_df_safe(client, sql, {"login_email": login_email}, "Me Summary")
+        if not df_me.empty:
+            render_summary_metrics(df_me.iloc[0])
+
+
+def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+    st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
+
+    if "yoy_mode" not in st.session_state:
+        st.session_state.yoy_mode = None
+    if "yoy_df" not in st.session_state:
+        st.session_state.yoy_df = pd.DataFrame()
+
+    c1, c2, c3 = st.columns(3)
+
+    def load_yj_data(mode_name: str, view_name: str) -> None:
+        st.session_state.yoy_mode = mode_name
+        where_clause = "" if is_admin else "WHERE login_email = @login_email"
+        params = None if is_admin else {"login_email": login_email}
+        sql = (
+            "SELECT login_email, yj_code, product_name, sales_amount, py_sales_amount, sales_diff_yoy "
+            f"FROM `{view_name}` {where_clause} LIMIT 100"
+        )
+        st.session_state.yoy_df = query_df_safe(client, sql, params, mode_name)
+
+    with c1:
+        if st.button("📉 下落幅ワースト", use_container_width=True):
+            load_yj_data("ワースト", VIEW_YOY_BOTTOM)
+    with c2:
+        if st.button("📈 上昇幅ベスト", use_container_width=True):
+            load_yj_data("ベスト", VIEW_YOY_TOP)
+    with c3:
+        if st.button("🆕 新規/比較不能", use_container_width=True):
+            load_yj_data("新規", VIEW_YOY_UNCOMP)
+
+    if not st.session_state.yoy_df.empty:
+        df = st.session_state.yoy_df.copy()
+        df_disp = df.drop(columns=["login_email"], errors="ignore").rename(
+            columns={
+                "yj_code": "YJコード",
+                "product_name": "代表商品名(成分)",
+                "sales_amount": "今期売上",
+                "py_sales_amount": "前期売上",
+                "sales_diff_yoy": "前年比差額",
+            }
+        )
+        if "代表商品名(成分)" in df_disp.columns:
+            df_disp["代表商品名(成分)"] = df_disp["代表商品名(成分)"].apply(normalize_product_display_name)
+        df_disp = df_disp.fillna(0)
+        df_disp = df_disp[["YJコード", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]]
+
+        st.markdown(f"#### 🏆 第一階層：成分（YJ）{st.session_state.yoy_mode} ランキング")
+        st.dataframe(
+            df_disp.style.format(
+                {
+                    "今期売上": "¥{:,.0f}",
+                    "前期売上": "¥{:,.0f}",
+                    "前年比差額": "¥{:,.0f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
         st.divider()
-        sel_code = st.selectbox("🎯 成分/JANを選択して詳細分析", options=df["YJコード"].tolist(), format_func=lambda x: f"{x} : {df[df['YJコード']==x]['成分名'].values[0]}")
-        
-        if sel_code:
-            p_drill = params.copy()
-            p_drill["code"] = sel_code
-            
-            # JAN内訳
-            st.markdown("##### 🧪 要因分析：JANコード（単品）別 内訳")
-            if str(sel_code).strip() in {"0", "", "nan", "None"}:
-                st.warning("⚠️ 選択されたコードは未分類です。以下のJANコード内訳で実態を確認してください。")
+        st.markdown("#### 🔍 第二階層：分析キー（YJ or JAN）の得意先別内訳")
 
-            sql_jan = f"""
-                SELECT jan_code, ANY_VALUE(product_name) as pname,
-                SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) as ty,
-                SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) as py,
-                (SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END)) as diff
-                FROM `{VIEW_UNIFIED}`
-                {where_clause} AND COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @code
-                GROUP BY 1 ORDER BY diff {sort_dir} LIMIT 20
-            """
-            df_jan = query_df_safe(client, sql_jan, p_drill, "JAN Drill")
-            st.dataframe(df_jan.style.format({"ty": "¥{:,.0f}", "py": "¥{:,.0f}", "diff": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
+        # 重複YJコードがあっても先頭1件を採用し、辞書上書きを防止
+        yj_master = df_disp.drop_duplicates(subset=["YJコード"], keep="first").copy()
+        yj_options = {
+            row["YJコード"]: f"{row['代表商品名(成分)']} (差額: ¥{row['前年比差額']:,.0f})"
+            for _, row in yj_master.iterrows()
+        }
+        selected_yj = st.selectbox(
+            "詳細を見たい成分（YJ）を選択してください",
+            options=list(yj_options.keys()),
+            format_func=lambda x: yj_options[x],
+        )
 
-            # 得意先内訳
-            st.markdown("##### 🏥 アクション先：得意先別 内訳")
-            sql_cust = f"""
-                SELECT customer_name AS `得意先`,
-                SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) AS `今期`,
-                SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END) AS `前期`,
-                (SUM(CASE WHEN fiscal_year = 2025 THEN sales_amount ELSE 0 END) - SUM(CASE WHEN fiscal_year = 2024 THEN sales_amount ELSE 0 END)) AS `差額`
-                FROM `{VIEW_UNIFIED}`
-                {where_clause} AND COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @code
-                GROUP BY 1 ORDER BY `差額` {sort_dir} LIMIT 30
+        if selected_yj:
+            where_ext = "" if is_admin else "AND login_email = @login_email"
+            params: Dict[str, Any] = {"yj": selected_yj}
+            if not is_admin:
+                params["login_email"] = login_email
+
+            sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
+
+            sql_drill = f"""
+                WITH fy_cust AS (
+                    SELECT
+                        customer_name,
+                        SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END))
+                            THEN sales_amount ELSE 0 END) AS ty_sales,
+                        SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) - 1
+                            THEN sales_amount ELSE 0 END) AS py_sales
+                    FROM `{VIEW_UNIFIED}`
+                    WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
+                    GROUP BY customer_name
+                )
+                SELECT
+                    customer_name AS `得意先名`,
+                    ty_sales AS `今期売上`,
+                    py_sales AS `前期売上`,
+                    (ty_sales - py_sales) AS `前年比差額`
+                FROM fy_cust
+                WHERE (ty_sales - py_sales) != 0 OR ty_sales > 0
+                ORDER BY `前年比差額` {sort_order}
+                LIMIT 50
             """
-            df_d = query_df_safe(client, sql_cust, p_drill, "Cust Drill")
-            st.dataframe(df_d.style.format({"今期": "¥{:,.0f}", "前期": "¥{:,.0f}", "差額": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
+            df_drill = query_df_safe(client, sql_drill, params, "YJ Drilldown")
+            if not df_drill.empty:
+                st.dataframe(
+                    df_drill.fillna(0).style.format(
+                        {
+                            "今期売上": "¥{:,.0f}",
+                            "前期売上": "¥{:,.0f}",
+                            "前年比差額": "¥{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("この成分の得意先内訳データが見つかりません。")
+
+            st.markdown("#### 🏷️ 得意先グループ別内訳")
+            group_col = resolve_customer_group_column(client)
+            if group_col:
+                sql_group = f"""
+                    WITH fy_group AS (
+                        SELECT
+                            COALESCE(NULLIF(CAST({group_col} AS STRING), ''), '未設定') AS customer_group,
+                            SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                                - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END))
+                                THEN sales_amount ELSE 0 END) AS ty_sales,
+                            SUM(CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                                - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) - 1
+                                THEN sales_amount ELSE 0 END) AS py_sales,
+                            COUNT(DISTINCT CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                                - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END))
+                                THEN customer_code END) AS ty_customers,
+                            COUNT(DISTINCT CASE WHEN fiscal_year = (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                                - (CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END)) - 1
+                                THEN customer_code END) AS py_customers
+                        FROM `{VIEW_UNIFIED}`
+                        WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
+                        GROUP BY customer_group
+                    )
+                    SELECT
+                        customer_group AS `得意先グループ`,
+                        ty_sales AS `今期売上`,
+                        py_sales AS `前期売上`,
+                        (ty_sales - py_sales) AS `前年比差額`,
+                        ty_customers AS `今期得意先数`,
+                        py_customers AS `前期得意先数`
+                    FROM fy_group
+                    WHERE ty_sales > 0 OR py_sales > 0
+                    ORDER BY `前年比差額` {sort_order}
+                    LIMIT 30
+                """
+                df_group = query_df_safe(client, sql_group, params, "YJ Group Drilldown")
+                if not df_group.empty:
+                    available_group_cols = get_available_customer_group_columns(client)
+                    profile_df = get_customer_group_column_profiles(client)
+                    st.caption(
+                        "グループ抽出元（SQL判定）: "
+                        f"`{VIEW_UNIFIED}.{group_col}` "
+                        f"（候補: {', '.join(CUSTOMER_GROUP_COLUMN_CANDIDATES)} / 利用可能: {', '.join(available_group_cols)}）"
+                    )
+                    with st.expander("判定根拠（列ごとの非NULL件数・グループ数）", expanded=False):
+                        if not profile_df.empty:
+                            st.dataframe(profile_df, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        df_group.fillna(0).style.format(
+                            {
+                                "今期売上": "¥{:,.0f}",
+                                "前期売上": "¥{:,.0f}",
+                                "前年比差額": "¥{:,.0f}",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.info("この成分の得意先グループ内訳データが見つかりません。")
+            else:
+                st.info("得意先グループ列がデータソースに存在しないため、グループ内訳は表示できません。")
+
+            st.markdown("#### 🧪 原因追及：明細内訳（JAN/年月）")
+            if str(selected_yj).strip() in {"0", "", "nan", "None"}:
+                st.warning(
+                    "選択中キーは未マッピング（YJ=0/NULL）候補です。\n"
+                    "表示名が実態と乖離する可能性があるため、JAN別内訳を優先確認してください。"
+                )
+
+            sql_root_jan = f"""
+                WITH base AS (
+                    SELECT
+                        jan_code,
+                        product_name,
+                        fiscal_year,
+                        sales_amount,
+                        customer_code
+                    FROM `{VIEW_UNIFIED}`
+                    WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
+                ),
+                fy AS (
+                    SELECT
+                        (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+                )
+                SELECT
+                    jan_code AS `JAN`,
+                    ANY_VALUE(REGEXP_REPLACE(product_name, r"[/／].*$", "")) AS `代表商品名`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
+                      - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
+                    COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS `今期得意先数`,
+                    COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS `前期得意先数`
+                FROM base
+                CROSS JOIN fy
+                GROUP BY jan_code
+                ORDER BY `前年差額` ASC
+                LIMIT 30
+            """
+            df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
+            if not df_root_jan.empty:
+                st.caption("前年差額が大きいJANを優先表示（下位=悪化寄与）。")
+                st.dataframe(
+                    df_root_jan.fillna(0).style.format(
+                        {
+                            "今期売上": "¥{:,.0f}",
+                            "前期売上": "¥{:,.0f}",
+                            "前年差額": "¥{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            sql_root_month = f"""
+                WITH fy AS (
+                    SELECT
+                        (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
+                )
+                SELECT
+                    FORMAT_DATE('%Y-%m', sales_date) AS `年月`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
+                    SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
+                      - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`
+                FROM `{VIEW_UNIFIED}`
+                CROSS JOIN fy
+                WHERE COALESCE(NULLIF(CAST(yj_code AS STRING), "0"), CAST(jan_code AS STRING)) = @yj {where_ext}
+                GROUP BY `年月`
+                ORDER BY `年月`
+            """
+            df_root_month = query_df_safe(client, sql_root_month, params, "YJ Root Cause Month")
+            if not df_root_month.empty:
+                st.caption("月次推移（前年差額）で急落タイミングを確認してください。")
+                st.dataframe(
+                    df_root_month.fillna(0).style.format(
+                        {
+                            "今期売上": "¥{:,.0f}",
+                            "前期売上": "¥{:,.0f}",
+                            "前年差額": "¥{:,.0f}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
+def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+    st.subheader("🎉 新規納品サマリー（Realized / 実績）")
+    if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
+        where_ext = "" if is_admin else "AND login_email = @login_email"
+        params = None if is_admin else {"login_email": login_email}
+
+        sql = f"""
+        WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+        SELECT
+          '① 昨日' AS `期間`, COUNT(DISTINCT customer_code) AS `得意先数`, COUNT(DISTINCT jan_code) AS `品目数`, SUM(sales_amount) AS `売上`, SUM(gross_profit) AS `粗利`
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
+        UNION ALL
+        SELECT '② 直近7日', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
+        UNION ALL
+        SELECT '③ 当月', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE DATE_TRUNC(first_sales_date, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
+        ORDER BY `期間`
+        """
+        df_new = query_df_safe(client, sql, params, label="New Deliveries")
+
+        if not df_new.empty:
+            df_new[["売上", "粗利"]] = df_new[["売上", "粗利"]].fillna(0)
+            st.dataframe(
+                df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("新規納品データがありません。")
+
+
+def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+    st.subheader("🚨 採用アイテム・失注アラート")
+    where_clause = "" if is_admin else "WHERE login_email = @login_email"
+    params = None if is_admin else {"login_email": login_email}
+    sql = f"""
+        SELECT
+            staff_name AS `担当者名`,
+            customer_name AS `得意先名`,
+            product_name AS `商品名`,
+            last_purchase_date AS `最終購入日`,
+            adoption_status AS `ステータス`,
+            current_fy_sales AS `今期売上`,
+            previous_fy_sales AS `前期売上`,
+            (current_fy_sales - previous_fy_sales) AS `売上差額`
+        FROM `{VIEW_ADOPTION}`
+        {where_clause}
+        ORDER BY
+            CASE
+                WHEN adoption_status LIKE '%🔴%' THEN 1
+                WHEN adoption_status LIKE '%🟡%' THEN 2
+                ELSE 3
+            END,
+            `売上差額` ASC
+    """
+    df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
+    if not df_alerts.empty:
+        df_alerts["担当者名"] = df_alerts["担当者名"].fillna("未設定")
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_status = st.multiselect(
+                "🎯 ステータスで絞り込み",
+                options=df_alerts["ステータス"].unique(),
+                default=[s for s in df_alerts["ステータス"].unique() if "🟡" in s or "🔴" in s],
+            )
+        with col2:
+            all_staffs = sorted(df_alerts["担当者名"].unique().tolist())
+            selected_staffs = st.multiselect("👤 担当者で絞り込み", options=all_staffs, default=[])
+
+        df_display = df_alerts.copy()
+        if selected_status:
+            df_display = df_display[df_display["ステータス"].isin(selected_status)]
+        if selected_staffs:
+            df_display = df_display[df_display["担当者名"].isin(selected_staffs)]
+
+        if not df_display.empty:
+            for col in ["今期売上", "前期売上", "売上差額"]:
+                df_display[col] = pd.to_numeric(df_display[col], errors="coerce").fillna(0)
+            st.dataframe(
+                df_display.style.format(
+                    {
+                        "今期売上": "¥{:,.0f}",
+                        "前期売上": "¥{:,.0f}",
+                        "売上差額": "¥{:,.0f}",
+                        "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("選択された条件に一致するアイテムはありません。")
+    else:
+        st.info("現在、アラート対象のアイテムはありません。")
+
+
+@st.cache_data(ttl=300)
+def fetch_cached_customers(_client: bigquery.Client, login_email: str, is_admin: bool) -> pd.DataFrame:
+    if is_admin:
+        sql = (
+            f"SELECT DISTINCT customer_code, customer_name "
+            f"FROM `{VIEW_UNIFIED}` WHERE customer_name IS NOT NULL"
+        )
+        return query_df_safe(_client, sql, None, "Cached Customers")
+
+    sql = f"""
+        SELECT DISTINCT customer_code, customer_name
+        FROM `{VIEW_UNIFIED}`
+        WHERE login_email = @login_email
+          AND customer_name IS NOT NULL
+    """
+    return query_df_safe(_client, sql, {"login_email": login_email}, "Cached Customers")
+
+
+def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+    st.subheader("🎯 担当先ドリルダウン ＆ 提案（Reco）")
+    df_cust = fetch_cached_customers(client, login_email, is_admin)
+    if df_cust.empty:
+        st.info("表示できる得意先データがありません。")
+        return
+
+    search_term = st.text_input("🔍 得意先名で検索（一部入力）", placeholder="例：古賀")
+    filtered_df = (
+        df_cust[df_cust["customer_name"].str.contains(search_term, na=False)]
+        if search_term
+        else df_cust
+    )
+    if filtered_df.empty:
+        st.info("検索条件に一致する得意先がありません。")
+        return
+
+    opts = {
+        row["customer_code"]: f"{row['customer_code']} : {row['customer_name']}"
+        for _, row in filtered_df.iterrows()
+    }
+    sel = st.selectbox("得意先を選択", options=list(opts.keys()), format_func=lambda x: opts[x])
+    if not sel:
+        return
+
+    st.divider()
+    st.markdown("##### 📦 現在の採用アイテム（稼働状況）")
+    sql_adopt = f"""
+        SELECT
+            product_name AS `商品名`,
+            adoption_status AS `ステータス`,
+            last_purchase_date AS `最終購入日`,
+            current_fy_sales AS `今期売上`,
+            previous_fy_sales AS `前期売上`
+        FROM `{VIEW_ADOPTION}`
+        WHERE customer_code = @c
+        ORDER BY
+            CASE
+                WHEN adoption_status LIKE '%🟢%' THEN 1
+                WHEN adoption_status LIKE '%🟡%' THEN 2
+                ELSE 3
+            END,
+            current_fy_sales DESC
+    """
+    df_adopt = query_df_safe(client, sql_adopt, {"c": sel}, "Customer Adoption")
+    if not df_adopt.empty:
+        for col in ["今期売上", "前期売上"]:
+            df_adopt[col] = pd.to_numeric(df_adopt[col], errors="coerce").fillna(0)
+        st.dataframe(
+            df_adopt.style.format(
+                {
+                    "今期売上": "¥{:,.0f}",
+                    "前期売上": "¥{:,.0f}",
+                    "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("この得意先の採用データはありません。")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("##### 💡 AI 推奨提案商品（Reco）")
+    sql_rec = f"""
+        SELECT *
+        FROM `{VIEW_RECOMMEND}`
+        WHERE customer_code = @c
+        ORDER BY priority_rank ASC
+        LIMIT 10
+    """
+    df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
+    if not df_rec.empty:
+        df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer"]].rename(
+            columns={"priority_rank": "順位", "recommend_product": "推奨商品", "manufacturer": "メーカー"}
+        )
+        st.dataframe(df_disp, use_container_width=True, hide_index=True)
+    else:
+        st.info("現在、この得意先への推奨商品はありません。")
+
 
 # -----------------------------
-# 6. Main
+# 5. Main Loop
 # -----------------------------
-def main():
+
+def main() -> None:
     set_page()
     client = setup_bigquery_client()
-    
+
     with st.sidebar:
-        st.header("🔑 Login")
-        l_id = st.text_input("Email")
-        l_pw = st.text_input("Password", type="password")
-        if st.button("Clear Cache"): st.cache_data.clear()
+        st.header("🔑 ログイン")
+        login_id = st.text_input("ログインID (メールアドレス)")
+        login_pw = st.text_input("パスコード (携帯下4桁)", type="password")
 
-    if not l_id or not l_pw:
-        st.info("ログインしてください。")
+        st.divider()
+        st.session_state.use_bqstorage = st.checkbox("高速読込 (Storage API)", value=True)
+
+        if st.button("📡 通信ヘルスチェック"):
+            try:
+                client.query("SELECT 1").result(timeout=10)
+                st.success("BigQuery 接続正常")
+            except Exception:
+                st.error("接続エラー")
+
+        if st.button("🧹 キャッシュクリア"):
+            st.cache_data.clear()
+
+    if not login_id or not login_pw:
+        st.info("👈 サイドバーからログインしてください。")
         return
 
-    role = resolve_role(client, l_id.strip(), l_pw.strip())
+    role = resolve_role(client, login_id.strip(), login_pw.strip())
     if not role.is_authenticated:
-        st.error("ログイン失敗")
+        st.error("❌ ログイン情報が正しくありません。")
         return
 
-    st.success(f"ログイン中: {role.staff_name}")
-    
-    # フィルタリング
-    where_clause, params = render_filters(client, role)
-    
-    # 各セクション
-    render_summary(client, where_clause, params)
+    st.success(f"🔓 ログイン中: {role.staff_name} さん")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("👤 担当", role.staff_name)
+    c2.metric("🛡️ 権限", role.role_key)
+    c3.metric("📞 電話", role.phone)
     st.divider()
-    render_strategic_ranking(client, where_clause, params)
+
+    if role.role_admin_view:
+        render_fytd_org_section(client, role.login_email)
+        st.divider()
+        render_yoy_section(client, role.login_email, is_admin=True)
+        st.divider()
+        render_new_deliveries_section(client, role.login_email, is_admin=True)
+        st.divider()
+        render_adoption_alerts_section(client, role.login_email, is_admin=True)
+        st.divider()
+        render_customer_drilldown(client, role.login_email, is_admin=True)
+    else:
+        render_fytd_me_section(client, role.login_email)
+        st.divider()
+        render_yoy_section(client, role.login_email, is_admin=False)
+        st.divider()
+        render_new_deliveries_section(client, role.login_email, is_admin=False)
+        st.divider()
+        render_adoption_alerts_section(client, role.login_email, is_admin=False)
+        st.divider()
+        render_customer_drilldown(client, role.login_email, is_admin=False)
+
 
 if __name__ == "__main__":
     main()
