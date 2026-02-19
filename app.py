@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.8
-(Integrated Update / Auth Hardening & Typed Params)
+SFA｜戦略ダッシュボード - OS v1.4.8 (Safety Update)
 - YoY：VIEW_UNIFIED から動的集計に統一（YJ同一で商品名が2行問題を抑止）
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
 - スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定（存在しない場合は非表示）
@@ -36,7 +35,6 @@ VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_en
 VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
 
 # ★ここが「UIで使うグループ列の優先順位」
-# ※ get_unified_columns() は lower-case で返すので候補も lower-case に統一
 CUSTOMER_GROUP_COLUMN_CANDIDATES = (
     "customer_group_display",   # ★最優先：表示用（official（raw）など）
     "customer_group_official",
@@ -105,11 +103,6 @@ def setup_bigquery_client() -> bigquery.Client:
 
 
 def _normalize_param(value: Any) -> Tuple[str, Optional[Any]]:
-    """
-    query_df_safe() 用の型推定ヘルパー
-    - tuple("TYPE", value) の場合は明示型を優先
-    - それ以外は値型から推定
-    """
     if isinstance(value, tuple) and len(value) == 2:
         p_type, p_value = value
         return str(p_type).upper(), p_value
@@ -254,12 +247,6 @@ def resolve_customer_group_column(_client: bigquery.Client) -> Optional[str]:
 
 
 def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns:
-      (group_display_expr, source_debug)
-      - group_display_expr: SELECT/GROUP BY/WHERE で使う「表示用グループ名」のSQL式
-      - source_debug: どの列を使ったか（UI表示用）
-    """
     cols = get_unified_columns(_client)
 
     has_display = "customer_group_display" in cols
@@ -267,12 +254,10 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
     has_raw = "customer_group_raw" in cols
     has_old = "sales_group_name" in cols
 
-    # 1) display列があるなら最優先（そのまま使う）
     if has_display:
         expr = "COALESCE(NULLIF(CAST(customer_group_display AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_display"
 
-    # 2) official/raw があるなら「official（raw）」を組み立て（rawが違う時だけ併記）
     if has_official and has_raw:
         official = "NULLIF(CAST(customer_group_official AS STRING), '')"
         raw = "NULLIF(CAST(customer_group_raw AS STRING), '')"
@@ -290,17 +275,14 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
         """
         return " ".join(expr.split()), f"{VIEW_UNIFIED}.customer_group_official + customer_group_raw"
 
-    # 3) official だけ
     if has_official:
         expr = "COALESCE(NULLIF(CAST(customer_group_official AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_official"
 
-    # 4) raw だけ
     if has_raw:
         expr = "COALESCE(NULLIF(CAST(customer_group_raw AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_raw"
 
-    # 5) 旧列
     if has_old:
         expr = "COALESCE(NULLIF(CAST(sales_group_name AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.sales_group_name"
@@ -401,12 +383,15 @@ def render_summary_metrics(row: pd.Series) -> None:
     s_py_ytd = get_safe_float(row, "sales_amount_py_ytd")
     s_py_total = get_safe_float(row, "sales_amount_py_total")
 
-    s_fc = s_cur * (s_py_total / s_py_ytd) if s_py_ytd > 0 else s_cur
+    # 修正: ゼロ除算を安全に回避
+    s_fc = s_cur * (s_py_total / s_py_ytd) if s_py_ytd != 0 else s_cur
 
     gp_cur = get_safe_float(row, "gross_profit_fytd")
     gp_py_ytd = get_safe_float(row, "gross_profit_py_ytd")
     gp_py_total = get_safe_float(row, "gross_profit_py_total")
-    gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd > 0 else gp_cur
+    
+    # 修正: ゼロ除算を安全に回避
+    gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd != 0 else gp_cur
 
     st.caption(
         "※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」"
@@ -563,7 +548,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     if "yoy_df" not in st.session_state:
         st.session_state.yoy_df = pd.DataFrame()
 
-    # ★クリック選択保持
     if "selected_yj" not in st.session_state:
         st.session_state.selected_yj = None
 
@@ -669,7 +653,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         )
     )
 
-    # ★現在のランキングに存在しない selected_yj はリセット
     if st.session_state.selected_yj and st.session_state.selected_yj not in set(df_disp["YJコード"].astype(str)):
         st.session_state.selected_yj = None
 
@@ -685,8 +668,15 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         on_select="rerun",
     )
 
+    # 修正: より安全なSelectionハンドリング
     try:
-        sel_rows = event.selection.rows if hasattr(event, "selection") else []
+        # st.dataframe のイベントオブジェクト構造に柔軟に対応
+        sel_rows = []
+        if hasattr(event, "selection") and hasattr(event.selection, "rows"):
+            sel_rows = event.selection.rows
+        elif isinstance(event, dict) and "selection" in event:
+            sel_rows = event["selection"].get("rows", [])
+
         if sel_rows:
             idx = sel_rows[0]
             st.session_state.selected_yj = str(df_disp.iloc[idx]["YJコード"])
@@ -1117,28 +1107,22 @@ def main() -> None:
     scope = render_scope_filters(client, role)
     st.divider()
 
+    # 修正: 重複していたUI呼び出しを共通化し、コードの見通しを良くしました
     if role.role_admin_view:
         render_fytd_org_section(client)
-        st.divider()
-        render_group_underperformance_section(client, role, scope)
-        st.divider()
-        render_yoy_section(client, role.login_email, is_admin=True, scope=scope)
-        st.divider()
-        render_new_deliveries_section(client, role.login_email, is_admin=True)
-        st.divider()
-        render_adoption_alerts_section(client, role.login_email, is_admin=True)
-        st.divider()
-        render_customer_drilldown(client, role.login_email, is_admin=True, scope=scope)
     else:
         render_fytd_me_section(client, role.login_email)
-        st.divider()
-        render_yoy_section(client, role.login_email, is_admin=False, scope=scope)
-        st.divider()
-        render_new_deliveries_section(client, role.login_email, is_admin=False)
-        st.divider()
-        render_adoption_alerts_section(client, role.login_email, is_admin=False)
-        st.divider()
-        render_customer_drilldown(client, role.login_email, is_admin=False, scope=scope)
+    
+    st.divider()
+    render_group_underperformance_section(client, role, scope)
+    st.divider()
+    render_yoy_section(client, role.login_email, is_admin=role.role_admin_view, scope=scope)
+    st.divider()
+    render_new_deliveries_section(client, role.login_email, is_admin=role.role_admin_view)
+    st.divider()
+    render_adoption_alerts_section(client, role.login_email, is_admin=role.role_admin_view)
+    st.divider()
+    render_customer_drilldown(client, role.login_email, is_admin=role.role_admin_view, scope=scope)
 
 
 if __name__ == "__main__":
