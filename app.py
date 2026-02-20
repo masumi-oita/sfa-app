@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.8
-(Integrated Update / Auth Hardening & Typed Params)
+SFA｜戦略ダッシュボード - OS v1.4.8 (Safety & Full Feature Update)
 - YoY：VIEW_UNIFIED から動的集計に統一（YJ同一で商品名が2行問題を抑止）
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
 - スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定（存在しない場合は非表示）
-- ★Group Display: official先頭 + raw併記（置換ではなく併記）
+- Group Display: official先頭 + raw併記
+- 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン
+- 新機能：順位アイコンの追加と、不要なYJコード列の非表示
 """
 
 from __future__ import annotations
@@ -35,13 +36,11 @@ VIEW_NEW_DELIVERY = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_new_deliveries_reali
 VIEW_RECOMMEND = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_sales_recommendation_engine"
 VIEW_ADOPTION = f"{PROJECT_DEFAULT}.{DATASET_DEFAULT}.v_customer_adoption_status"
 
-# ★ここが「UIで使うグループ列の優先順位」
-# ※ get_unified_columns() は lower-case で返すので候補も lower-case に統一
 CUSTOMER_GROUP_COLUMN_CANDIDATES = (
-    "customer_group_display",   # ★最優先：表示用（official（raw）など）
+    "customer_group_display",
     "customer_group_official",
     "customer_group_raw",
-    "sales_group_name",         # 旧互換
+    "sales_group_name",
 )
 
 
@@ -76,7 +75,6 @@ def get_safe_float(row: pd.Series, key: str) -> float:
 
 
 def normalize_product_display_name(name: Any) -> str:
-    """表示用: 包装・入数表記（例: /B500T, /1V, /10テスト用）を除去。"""
     if pd.isna(name):
         return ""
     text = str(name).strip()
@@ -105,11 +103,6 @@ def setup_bigquery_client() -> bigquery.Client:
 
 
 def _normalize_param(value: Any) -> Tuple[str, Optional[Any]]:
-    """
-    query_df_safe() 用の型推定ヘルパー
-    - tuple("TYPE", value) の場合は明示型を優先
-    - それ以外は値型から推定
-    """
     if isinstance(value, tuple) and len(value) == 2:
         p_type, p_value = value
         return str(p_type).upper(), p_value
@@ -254,12 +247,6 @@ def resolve_customer_group_column(_client: bigquery.Client) -> Optional[str]:
 
 
 def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns:
-      (group_display_expr, source_debug)
-      - group_display_expr: SELECT/GROUP BY/WHERE で使う「表示用グループ名」のSQL式
-      - source_debug: どの列を使ったか（UI表示用）
-    """
     cols = get_unified_columns(_client)
 
     has_display = "customer_group_display" in cols
@@ -267,12 +254,10 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
     has_raw = "customer_group_raw" in cols
     has_old = "sales_group_name" in cols
 
-    # 1) display列があるなら最優先（そのまま使う）
     if has_display:
         expr = "COALESCE(NULLIF(CAST(customer_group_display AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_display"
 
-    # 2) official/raw があるなら「official（raw）」を組み立て（rawが違う時だけ併記）
     if has_official and has_raw:
         official = "NULLIF(CAST(customer_group_official AS STRING), '')"
         raw = "NULLIF(CAST(customer_group_raw AS STRING), '')"
@@ -290,17 +275,14 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
         """
         return " ".join(expr.split()), f"{VIEW_UNIFIED}.customer_group_official + customer_group_raw"
 
-    # 3) official だけ
     if has_official:
         expr = "COALESCE(NULLIF(CAST(customer_group_official AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_official"
 
-    # 4) raw だけ
     if has_raw:
         expr = "COALESCE(NULLIF(CAST(customer_group_raw AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.customer_group_raw"
 
-    # 5) 旧列
     if has_old:
         expr = "COALESCE(NULLIF(CAST(sales_group_name AS STRING), ''), '未設定')"
         return expr, f"{VIEW_UNIFIED}.sales_group_name"
@@ -489,7 +471,6 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str) -> None:
 def render_group_underperformance_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
 
-    # ★ 追加: ラジオボタンで表示をスマートに切り替え
     c1, c2 = st.columns(2)
     view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True)
     mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True)
@@ -570,10 +551,23 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
     )
     df_parent["粗利差額"] = df_parent["今期粗利"] - df_parent["前年同期粗利"]
 
+    def get_parent_rank_icon(rank: int, mode: str) -> str:
+        if mode == "ベスト":
+            if rank == 1: return "🥇 1位"
+            if rank == 2: return "🥈 2位"
+            if rank == 3: return "🥉 3位"
+            return f"🌟 {rank}位"
+        else:
+            if rank == 1: return "🚨 1位"
+            if rank == 2: return "⚠️ 2位"
+            if rank == 3: return "⚡ 3位"
+            return f"📉 {rank}位"
+
+    df_parent.insert(0, "順位", [get_parent_rank_icon(i + 1, perf_mode) for i in range(len(df_parent))])
+
     if perf_view == "グループ別" and group_src:
         st.caption(f"抽出元グループ列: `{group_src}`")
 
-    # 親表の描画とクリックイベントの取得
     event = st.dataframe(
         df_parent.style.format(
             {
@@ -590,10 +584,9 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         hide_index=True,
         selection_mode="single-row",
         on_select="rerun",
-        key=f"grid_parent_{perf_view}_{perf_mode}" # 切替時に選択状態をリセット
+        key=f"grid_parent_{perf_view}_{perf_mode}"
     )
 
-    # 選択された行の特定
     selected_parent_id = None
     selected_parent_name = None
 
@@ -615,11 +608,9 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
     except Exception:
         pass
 
-    # --- 子表（ドリルダウン要因分析）の表示 ---
     if selected_parent_id:
-        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品・成分ベース {perf_mode}）")
+        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}）")
         
-        # フィルタに選択したグループまたは得意先を追加
         drill_params = dict(params)
         if perf_view == "グループ別":
             drill_filter_sql = _compose_where(filter_sql, f"{group_expr} = @parent_id")
@@ -677,20 +668,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             df_drill["product_name"] = df_drill["product_name"].apply(normalize_product_display_name)
             df_drill = df_drill.fillna(0)
 
-            # アイコン付与
-            def get_rank_icon(rank: int, mode: str) -> str:
-                if mode == "ベスト":
-                    if rank == 1: return "🥇 1位"
-                    if rank == 2: return "🥈 2位"
-                    if rank == 3: return "🥉 3位"
-                    return f"🌟 {rank}位"
-                else:
-                    if rank == 1: return "🚨 1位"
-                    if rank == 2: return "⚠️ 2位"
-                    if rank == 3: return "⚡ 3位"
-                    return f"📉 {rank}位"
-
-            df_drill.insert(0, "要因順位", [get_rank_icon(i + 1, perf_mode) for i in range(len(df_drill))])
+            df_drill.insert(0, "要因順位", [get_parent_rank_icon(i + 1, perf_mode) for i in range(len(df_drill))])
 
             st.dataframe(
                 df_drill[["要因順位", "product_name", "sales_amount", "py_sales_amount", "sales_diff_yoy"]].rename(
@@ -709,15 +687,128 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         else:
             st.info("要因データが見つかりません。")
 
-    # ★修正1: モードに合わせて再度ソートをかけ直す
+
+def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
+    st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
+
+    if "yoy_mode" not in st.session_state:
+        st.session_state.yoy_mode = None
+    if "yoy_df" not in st.session_state:
+        st.session_state.yoy_df = pd.DataFrame()
+
+    if "selected_yj" not in st.session_state:
+        st.session_state.selected_yj = None
+
+    c1, c2, c3 = st.columns(3)
+
+    def load_yj_data(mode_name: str) -> None:
+        st.session_state.yoy_mode = mode_name
+
+        role_filter = "" if is_admin else "login_email = @login_email"
+        scope_filter = scope.where_clause()
+        combined_where = _compose_where(role_filter, scope_filter)
+
+        params: Dict[str, Any] = dict(scope.params or {})
+        if not is_admin:
+            params["login_email"] = login_email
+
+        if mode_name == "ワースト":
+            diff_filter = "py_sales > 0 AND (ty_sales - py_sales) < 0"
+            order_by = "sales_diff_yoy ASC"
+        elif mode_name == "ベスト":
+            diff_filter = "py_sales > 0 AND (ty_sales - py_sales) > 0"
+            order_by = "sales_diff_yoy DESC"
+        else:
+            diff_filter = "py_sales = 0 AND ty_sales > 0"
+            order_by = "ty_sales DESC"
+
+        sql = f"""
+            WITH fy AS (
+              SELECT (
+                EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
+              ) AS current_fy
+            ),
+            base_raw AS (
+              SELECT
+                COALESCE(
+                  NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ''), '0'),
+                  NULLIF(NULLIF(TRIM(CAST(jan_code AS STRING)), ''), '0'),
+                  TRIM(CAST(product_name AS STRING))
+                ) AS yj_key,
+                REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "") AS product_base,
+                SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
+                SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales
+              FROM `{VIEW_UNIFIED}`
+              CROSS JOIN fy
+              {combined_where}
+              GROUP BY yj_key, product_base
+            ),
+            base AS (
+              SELECT
+                yj_key AS yj_code,
+                ARRAY_AGG(product_base ORDER BY ty_sales DESC LIMIT 1)[OFFSET(0)] AS product_name,
+                SUM(ty_sales) AS ty_sales,
+                SUM(py_sales) AS py_sales
+              FROM base_raw
+              GROUP BY yj_code
+            )
+            SELECT
+              yj_code,
+              product_name,
+              ty_sales AS sales_amount,
+              py_sales AS py_sales_amount,
+              (ty_sales - py_sales) AS sales_diff_yoy
+            FROM base
+            WHERE {diff_filter}
+            ORDER BY {order_by}
+            LIMIT 100
+        """
+        st.session_state.yoy_df = query_df_safe(client, sql, params, mode_name)
+
+    with c1:
+        if st.button("📉 下落幅ワースト", use_container_width=True):
+            load_yj_data("ワースト")
+    with c2:
+        if st.button("📈 上昇幅ベスト", use_container_width=True):
+            load_yj_data("ベスト")
+    with c3:
+        if st.button("🆕 新規/比較不能", use_container_width=True):
+            load_yj_data("新規")
+
+    if st.session_state.yoy_df.empty:
+        return
+
+    df = st.session_state.yoy_df.copy()
+    df["product_name"] = df["product_name"].apply(normalize_product_display_name)
+    df = df.fillna(0)
+
+    df_disp = (
+        df.groupby(["yj_code"], as_index=False)
+        .agg(
+            product_name=("product_name", "first"),
+            sales_amount=("sales_amount", "sum"),
+            py_sales_amount=("py_sales_amount", "sum"),
+            sales_diff_yoy=("sales_diff_yoy", "sum"),
+        )
+        .rename(
+            columns={
+                "yj_code": "YJコード",
+                "product_name": "代表商品名(成分)",
+                "sales_amount": "今期売上",
+                "py_sales_amount": "前期売上",
+                "sales_diff_yoy": "前年比差額",
+            }
+        )
+    )
+
     if st.session_state.yoy_mode == "ワースト":
         df_disp = df_disp.sort_values("前年比差額", ascending=True).reset_index(drop=True)
     elif st.session_state.yoy_mode == "ベスト":
         df_disp = df_disp.sort_values("前年比差額", ascending=False).reset_index(drop=True)
-    else: # 新規
+    else: 
         df_disp = df_disp.sort_values("今期売上", ascending=False).reset_index(drop=True)
 
-    # ★修正2: 順位とアイコンの付与
     def get_rank_icon(rank: int, mode: str) -> str:
         if mode == "ベスト":
             if rank == 1: return "🥇 1位"
@@ -729,13 +820,12 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             if rank == 2: return "⚠️ 2位"
             if rank == 3: return "⚡ 3位"
             return f"📉 {rank}位"
-        else: # 新規
+        else:
             if rank == 1: return "👑 1位"
             if rank == 2: return "💎 2位"
             if rank == 3: return "✨ 3位"
             return f"💠 {rank}位"
 
-    # 先頭に「順位」カラムを挿入
     df_disp.insert(0, "順位", [get_rank_icon(i + 1, st.session_state.yoy_mode) for i in range(len(df_disp))])
 
     if st.session_state.selected_yj and st.session_state.selected_yj not in set(df_disp["YJコード"].astype(str)):
@@ -743,9 +833,8 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
 
     st.markdown(f"#### 🏆 第一階層：成分（YJ）{st.session_state.yoy_mode} ランキング")
 
-    # ★表示項目に「順位」を追加
     event = st.dataframe(
-        df_disp[["順位", "YJコード", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]].style.format(
+        df_disp[["順位", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]].style.format(
             {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}
         ),
         use_container_width=True,
@@ -777,7 +866,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             for _, row in df_disp.iterrows()
         }
         selected_yj = st.selectbox(
-            "詳細を見たい成分（YJ）を選択してください",
+            "詳細を見たい成分を選択してください",
             options=list(yj_options.keys()),
             format_func=lambda x: yj_options[x],
         )
@@ -791,440 +880,6 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
     
     filter_sql = _compose_where(
         'COALESCE(NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ""), "0"), NULLIF(NULLIF(TRIM(CAST(jan_code AS STRING)), ""), "0"), TRIM(CAST(product_name AS STRING))) = @yj',
-        role_filter,
-        scope_filter,
-    )
-    params: Dict[str, Any] = {"yj": selected_yj, **(scope.params or {})}
-    if not is_admin:
-        params["login_email"] = login_email
-
-    sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
-
-    # --- 得意先別 ---
-    st.markdown("#### 🧾 得意先別内訳（前年差額）")
-    sql_drill = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        ),
-        base AS (
-          SELECT
-            customer_name,
-            SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-            SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales
-          FROM `{VIEW_UNIFIED}`
-          CROSS JOIN fy
-          {filter_sql}
-          GROUP BY customer_name
-        )
-        SELECT
-          customer_name AS `得意先名`,
-          ty_sales AS `今期売上`,
-          py_sales AS `前期売上`,
-          (ty_sales - py_sales) AS `前年差額`
-        FROM base
-        WHERE ty_sales > 0 OR py_sales > 0
-        ORDER BY `前年差額` {sort_order}
-        LIMIT 50
-    """
-    df_drill = query_df_safe(client, sql_drill, params, "YJ Drilldown Customers")
-    if not df_drill.empty:
-        st.dataframe(
-            df_drill.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("この成分の得意先内訳データが見つかりません。")
-
-    # --- グループ別 ---
-    st.markdown("#### 🏷️ 得意先グループ別内訳（前年差額）")
-    group_expr, group_src = resolve_customer_group_sql_expr(client)
-    if group_expr:
-        sql_group = f"""
-            WITH fy AS (
-              SELECT (
-                EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-                - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-              ) AS current_fy
-            ),
-            base AS (
-              SELECT
-                {group_expr} AS customer_group,
-                SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-                SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales,
-                COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS ty_customers,
-                COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS py_customers
-              FROM `{VIEW_UNIFIED}`
-              CROSS JOIN fy
-              {filter_sql}
-              GROUP BY customer_group
-            )
-            SELECT
-              customer_group AS `得意先グループ`,
-              ty_sales AS `今期売上`,
-              py_sales AS `前期売上`,
-              (ty_sales - py_sales) AS `前年差額`,
-              ty_customers AS `今期得意先数`,
-              py_customers AS `前期得意先数`
-            FROM base
-            WHERE ty_sales > 0 OR py_sales > 0
-            ORDER BY `前年差額` {sort_order}
-            LIMIT 30
-        """
-        df_group = query_df_safe(client, sql_group, params, "YJ Drilldown Groups")
-        if not df_group.empty:
-            if group_src:
-                st.caption(f"抽出元グループ列: `{group_src}`")
-            st.dataframe(
-                df_group.fillna(0).style.format(
-                    {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("この成分の得意先グループ内訳データが見つかりません。")
-    else:
-        st.info("得意先グループ列がデータソースに存在しないため、グループ内訳は表示できません。")
-
-    # --- 原因追及：JAN別 ---
-    st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
-    sql_root_jan = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        )
-        SELECT
-          jan_code AS `JAN`,
-          ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS `代表商品名`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
-            - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS `今期得意先数`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS `前期得意先数`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY jan_code
-        ORDER BY `前年差額` ASC
-        LIMIT 30
-    """
-    df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
-    if not df_root_jan.empty:
-        st.dataframe(
-            df_root_jan.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # --- 原因追及：月次 ---
-    st.markdown("#### 📅 原因追及：月次推移（前年差額）")
-    sql_root_month = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        )
-        SELECT
-          FORMAT_DATE('%Y-%m', sales_date) AS `年月`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
-            - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY `年月`
-        ORDER BY `年月`
-    """
-    df_root_month = query_df_safe(client, sql_root_month, params, "YJ Root Cause Month")
-    if not df_root_month.empty:
-        st.dataframe(
-            df_root_month.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    if st.session_state.selected_yj and st.session_state.selected_yj not in set(df_disp["YJコード"].astype(str)):
-        st.session_state.selected_yj = None
-
-    st.markdown(f"#### 🏆 第一階層：成分（YJ）{st.session_state.yoy_mode} ランキング")
-
-    event = st.dataframe(
-        df_disp[["YJコード", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]].style.format(
-            {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}
-        ),
-        use_container_width=True,
-        hide_index=True,
-        selection_mode="single-row",
-        on_select="rerun",
-    )
-
-    try:
-        sel_rows = []
-        if hasattr(event, "selection") and hasattr(event.selection, "rows"):
-            sel_rows = event.selection.rows
-        elif isinstance(event, dict) and "selection" in event:
-            sel_rows = event["selection"].get("rows", [])
-
-        if sel_rows:
-            idx = sel_rows[0]
-            st.session_state.selected_yj = str(df_disp.iloc[idx]["YJコード"])
-    except Exception:
-        pass
-
-    st.divider()
-    st.markdown("#### 🔍 第二階層：得意先別 / グループ別 / 原因追及（JAN・月次）")
-
-    selected_yj = st.session_state.selected_yj
-    if not selected_yj:
-        yj_options = {
-            str(row["YJコード"]): f"{row['代表商品名(成分)']} (差額: ¥{row['前年比差額']:,.0f})"
-            for _, row in df_disp.iterrows()
-        }
-        selected_yj = st.selectbox(
-            "詳細を見たい成分（YJ）を選択してください",
-            options=list(yj_options.keys()),
-            format_func=lambda x: yj_options[x],
-        )
-        st.session_state.selected_yj = selected_yj
-
-    if not selected_yj:
-        return
-
-    role_filter = "" if is_admin else "login_email = @login_email"
-    scope_filter = scope.where_clause()
-    
-    # ★修正: ドリルダウンする際も、YJ/JANが無い場合は商品名で検索するように条件を合わせる
-    filter_sql = _compose_where(
-        'COALESCE(NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ""), "0"), NULLIF(NULLIF(TRIM(CAST(jan_code AS STRING)), ""), "0"), TRIM(CAST(product_name AS STRING))) = @yj',
-        role_filter,
-        scope_filter,
-    )
-    params: Dict[str, Any] = {"yj": selected_yj, **(scope.params or {})}
-    if not is_admin:
-        params["login_email"] = login_email
-
-    sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
-
-    # --- 得意先別 ---
-    st.markdown("#### 🧾 得意先別内訳（前年差額）")
-    sql_drill = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        ),
-        base AS (
-          SELECT
-            customer_name,
-            SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-            SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales
-          FROM `{VIEW_UNIFIED}`
-          CROSS JOIN fy
-          {filter_sql}
-          GROUP BY customer_name
-        )
-        SELECT
-          customer_name AS `得意先名`,
-          ty_sales AS `今期売上`,
-          py_sales AS `前期売上`,
-          (ty_sales - py_sales) AS `前年差額`
-        FROM base
-        WHERE ty_sales > 0 OR py_sales > 0
-        ORDER BY `前年差額` {sort_order}
-        LIMIT 50
-    """
-    df_drill = query_df_safe(client, sql_drill, params, "YJ Drilldown Customers")
-    if not df_drill.empty:
-        st.dataframe(
-            df_drill.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("この成分の得意先内訳データが見つかりません。")
-
-    # --- グループ別 ---
-    st.markdown("#### 🏷️ 得意先グループ別内訳（前年差額）")
-    group_expr, group_src = resolve_customer_group_sql_expr(client)
-    if group_expr:
-        sql_group = f"""
-            WITH fy AS (
-              SELECT (
-                EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-                - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-              ) AS current_fy
-            ),
-            base AS (
-              SELECT
-                {group_expr} AS customer_group,
-                SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-                SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales,
-                COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS ty_customers,
-                COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS py_customers
-              FROM `{VIEW_UNIFIED}`
-              CROSS JOIN fy
-              {filter_sql}
-              GROUP BY customer_group
-            )
-            SELECT
-              customer_group AS `得意先グループ`,
-              ty_sales AS `今期売上`,
-              py_sales AS `前期売上`,
-              (ty_sales - py_sales) AS `前年差額`,
-              ty_customers AS `今期得意先数`,
-              py_customers AS `前期得意先数`
-            FROM base
-            WHERE ty_sales > 0 OR py_sales > 0
-            ORDER BY `前年差額` {sort_order}
-            LIMIT 30
-        """
-        df_group = query_df_safe(client, sql_group, params, "YJ Drilldown Groups")
-        if not df_group.empty:
-            if group_src:
-                st.caption(f"抽出元グループ列: `{group_src}`")
-            st.dataframe(
-                df_group.fillna(0).style.format(
-                    {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("この成分の得意先グループ内訳データが見つかりません。")
-    else:
-        st.info("得意先グループ列がデータソースに存在しないため、グループ内訳は表示できません。")
-
-    # --- 原因追及：JAN別 ---
-    st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
-    sql_root_jan = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        )
-        SELECT
-          jan_code AS `JAN`,
-          ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS `代表商品名`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
-            - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS `今期得意先数`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS `前期得意先数`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY jan_code
-        ORDER BY `前年差額` ASC
-        LIMIT 30
-    """
-    df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
-    if not df_root_jan.empty:
-        st.dataframe(
-            df_root_jan.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # --- 原因追及：月次 ---
-    st.markdown("#### 📅 原因追及：月次推移（前年差額）")
-    sql_root_month = f"""
-        WITH fy AS (
-          SELECT (
-            EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-          ) AS current_fy
-        )
-        SELECT
-          FORMAT_DATE('%Y-%m', sales_date) AS `年月`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
-            - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY `年月`
-        ORDER BY `年月`
-    """
-    df_root_month = query_df_safe(client, sql_root_month, params, "YJ Root Cause Month")
-    if not df_root_month.empty:
-        st.dataframe(
-            df_root_month.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    # ★現在のランキングに存在しない selected_yj はリセット
-    if st.session_state.selected_yj and st.session_state.selected_yj not in set(df_disp["YJコード"].astype(str)):
-        st.session_state.selected_yj = None
-
-    st.markdown(f"#### 🏆 第一階層：成分（YJ）{st.session_state.yoy_mode} ランキング")
-
-    event = st.dataframe(
-        df_disp[["YJコード", "代表商品名(成分)", "今期売上", "前期売上", "前年比差額"]].style.format(
-            {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}
-        ),
-        use_container_width=True,
-        hide_index=True,
-        selection_mode="single-row",
-        on_select="rerun",
-    )
-
-    try:
-        sel_rows = event.selection.rows if hasattr(event, "selection") else []
-        if sel_rows:
-            idx = sel_rows[0]
-            st.session_state.selected_yj = str(df_disp.iloc[idx]["YJコード"])
-    except Exception:
-        pass
-
-    st.divider()
-    st.markdown("#### 🔍 第二階層：得意先別 / グループ別 / 原因追及（JAN・月次）")
-
-    selected_yj = st.session_state.selected_yj
-    if not selected_yj:
-        yj_options = {
-            str(row["YJコード"]): f"{row['代表商品名(成分)']} (差額: ¥{row['前年比差額']:,.0f})"
-            for _, row in df_disp.iterrows()
-        }
-        selected_yj = st.selectbox(
-            "詳細を見たい成分（YJ）を選択してください",
-            options=list(yj_options.keys()),
-            format_func=lambda x: yj_options[x],
-        )
-        st.session_state.selected_yj = selected_yj
-
-    if not selected_yj:
-        return
-
-    role_filter = "" if is_admin else "login_email = @login_email"
-    scope_filter = scope.where_clause()
-    filter_sql = _compose_where(
-        'COALESCE(NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ""), "0"), TRIM(CAST(jan_code AS STRING))) = @yj',
         role_filter,
         scope_filter,
     )
