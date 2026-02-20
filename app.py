@@ -7,6 +7,7 @@ SFA｜戦略ダッシュボード - OS v1.4.8 (Safety & Full Feature Update)
 - Group Display: official先頭 + raw併記
 - 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン
 - 新機能：順位アイコンの追加と、不要なYJコード列の非表示
+- 修正：要因分析時のWHERE二重エラー解消 ＆ 全件一覧表示対応
 """
 
 from __future__ import annotations
@@ -485,8 +486,10 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         return
 
     role_filter = "" if role.role_admin_view else "login_email = @login_email"
-    scope_filter = scope.where_clause()
-    filter_sql = _compose_where(role_filter, scope_filter)
+    scope_filter_clause = scope.where_clause()
+    
+    # 親表用のフィルタ
+    filter_sql = _compose_where(role_filter, scope_filter_clause)
 
     params: Dict[str, Any] = dict(scope.params or {})
     if not role.role_admin_view:
@@ -609,16 +612,18 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         pass
 
     if selected_parent_id:
-        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}）")
+        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件）")
         
         drill_params = dict(params)
+        # ★修正: WHERE句の二重化エラーを防ぐため、文字列を直接組み立てずに_compose_whereの引数として渡す
         if perf_view == "グループ別":
-            drill_filter_sql = _compose_where(filter_sql, f"{group_expr} = @parent_id")
+            drill_filter_sql = _compose_where(role_filter, scope_filter_clause, f"{group_expr} = @parent_id")
         else:
-            drill_filter_sql = _compose_where(filter_sql, "customer_code = @parent_id")
+            drill_filter_sql = _compose_where(role_filter, scope_filter_clause, "customer_code = @parent_id")
         
         drill_params["parent_id"] = selected_parent_id
 
+        # ★修正: LIMITを外し、全商品を対象とする
         sql_drill = f"""
             WITH fy AS (
               SELECT (
@@ -660,7 +665,6 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             FROM base
             WHERE ty_sales > 0 OR py_sales > 0
             ORDER BY sales_diff_yoy {sort_order}
-            LIMIT 30
         """
         df_drill = query_df_safe(client, sql_drill, drill_params, "Parent Drilldown")
 
@@ -1239,9 +1243,6 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
 # -----------------------------
 # 5. Main Loop
 # -----------------------------
-# -----------------------------
-# 5. Main Loop
-# -----------------------------
 def main() -> None:
     set_page()
     client = setup_bigquery_client()
@@ -1281,7 +1282,6 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
-    # ★修正：まず「年度累計サマリー」を最上部に表示
     if role.role_admin_view:
         render_fytd_org_section(client)
     else:
@@ -1289,11 +1289,9 @@ def main() -> None:
     
     st.divider()
 
-    # ★修正：「分析スコープ設定」をサマリーの下に移動
     scope = render_scope_filters(client, role)
     st.divider()
 
-    # 以降、スコープフィルタの影響を受ける詳細セクション
     if role.role_admin_view:
         render_group_underperformance_section(client, role, scope)
         st.divider()
