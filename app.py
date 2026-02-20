@@ -994,10 +994,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     else:
         st.info("得意先グループ列がデータソースに存在しないため、グループ内訳は表示できません。")
 
-    # --- 原因追及：JAN別 ---
+   # --- 原因追及：JAN別 ---
     st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
-    
-    # 修正：包装（フルネームの `/` 以降）を抽出するロジックを追加
     sql_root_jan = f"""
         WITH fy AS (
           SELECT (
@@ -1007,10 +1005,9 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         )
         SELECT
           jan_code AS `JAN`,
-          -- 代表商品名（/より前）
           ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS `代表商品名`,
-          -- 包装・規格（/より後ろ。なければ空欄）
-          ANY_VALUE(
+          -- ★修正：空欄を避け、包装表記（/以降）を持つデータを最優先で引っ張ってくる
+          MAX(
             CASE 
               WHEN REGEXP_CONTAINS(CAST(product_name AS STRING), r"[/／]") 
               THEN REGEXP_EXTRACT(CAST(product_name AS STRING), r"[/／](.*)$") 
@@ -1027,8 +1024,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         CROSS JOIN fy
         {filter_sql}
         GROUP BY jan_code
-        ORDER BY `前年差額` {sort_order} -- ★ソート順をモード（ワースト/ベスト）に合わせる
-        LIMIT 30
+        ORDER BY `前年差額` {sort_order}
     """
     df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
     if not df_root_jan.empty:
