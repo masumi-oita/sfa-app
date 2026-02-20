@@ -996,9 +996,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
    # --- 原因追及：JAN別 ---
     st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
-    
-    # ★修正：Pythonでの処理や複雑な切り出しは一切やめ、
-    # おっしゃる通り「JANコードを軸にしてマスタ(item_master)から引っ張る」シンプルなSQLにしました。
     sql_root_jan = f"""
         WITH fy AS (
           SELECT (
@@ -1007,11 +1004,11 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
           ) AS current_fy
         ),
         base AS (
-          -- ① まず売上データをJANコード単位でシンプルに集計
           SELECT
             jan_code AS JAN_STR,
             SAFE_CAST(jan_code AS INT64) AS JAN_INT,
-            ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS fallback_name,
+            -- 文字化けJAN等のためのバックアップとして、直近の商品名を保持
+            ARRAY_AGG(CAST(product_name AS STRING) ORDER BY sales_date DESC LIMIT 1)[OFFSET(0)] AS raw_product_name,
             SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
             SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales,
             COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS ty_customers,
@@ -1021,13 +1018,22 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
           {filter_sql}
           GROUP BY jan_code
         )
-        -- ② JANコードを軸にして、商品マスタ(item_master)から名前と包装を引っ張る
         SELECT
           b.JAN_STR AS `JAN`,
-          -- マスタの名称を採用（マスタに無い文字化けJAN等は売上データの名前を予備として使用）
-          COALESCE(ANY_VALUE(m.`正式名称`), ANY_VALUE(b.fallback_name)) AS `代表商品名`,
-          -- マスタの包装単位をそのまま表示
-          ANY_VALUE(m.`包装単位`) AS `包装`,
+          -- ① マスタにあれば正式名称、なければ直近商品名の「/」より前
+          COALESCE(
+            MAX(CAST(m.`正式名称` AS STRING)), 
+            REGEXP_REPLACE(MAX(b.raw_product_name), r"[/／].*$", "")
+          ) AS `代表商品名`,
+          -- ② マスタにあれば包装単位、なければ直近商品名の「/」より後ろ
+          COALESCE(
+            MAX(CAST(m.`包装単位` AS STRING)), 
+            CASE 
+              WHEN REGEXP_CONTAINS(MAX(b.raw_product_name), r"[/／]") 
+              THEN REGEXP_EXTRACT(MAX(b.raw_product_name), r"[/／](.*)$") 
+              ELSE '' 
+            END
+          ) AS `包装`,
           SUM(b.ty_sales) AS `今期売上`,
           SUM(b.py_sales) AS `前期売上`,
           SUM(b.ty_sales - b.py_sales) AS `前年差額`,
@@ -1041,8 +1047,14 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     """
     df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
     if not df_root_jan.empty:
+        # ★修正：文字列の列に「0」が入らないように処理を改善
+        fill_values = {
+            "JAN": "", "代表商品名": "", "包装": "", 
+            "今期売上": 0, "前期売上": 0, "前年差額": 0, "今期得意先数": 0, "前期得意先数": 0
+        }
+        df_root_jan = df_root_jan.fillna(fill_values)
         st.dataframe(
-            df_root_jan.fillna(0).style.format(
+            df_root_jan.style.format(
                 {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
             ),
             use_container_width=True,
