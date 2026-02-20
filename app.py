@@ -3,11 +3,11 @@
 SFA｜戦略ダッシュボード - OS v1.4.8 (Safety & Full Feature Update)
 - YoY：VIEW_UNIFIED から動的集計に統一（YJ同一で商品名が2行問題を抑止）
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
-- スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定（存在しない場合は非表示）
+- スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定
 - Group Display: official先頭 + raw併記
-- 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン
+- 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
 - 新機能：順位アイコンの追加と、不要なYJコード列の非表示
-- 修正：要因分析時のWHERE二重エラー解消 ＆ 全件一覧表示対応
+- 修正：WHERE二重エラー解消 ＆ 選択状態の消失バグ解消 ＆ 表示順序の最適化
 """
 
 from __future__ import annotations
@@ -472,6 +472,9 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str) -> None:
 def render_group_underperformance_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
 
+    if "group_perf_mode" not in st.session_state:
+        st.session_state.group_perf_mode = "ワースト"
+
     c1, c2 = st.columns(2)
     view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True)
     mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True)
@@ -485,10 +488,11 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         st.info("グループ分析に利用できる列が見つかりません（VIEW_UNIFIEDにグループ列がありません）。")
         return
 
+    # ★修正：フィルタの構築（WHEREが二重にならないように配慮）
     role_filter = "" if role.role_admin_view else "login_email = @login_email"
     scope_filter_clause = scope.where_clause()
     
-    # 親表用のフィルタ
+    # 親表用のフィルタ（"WHERE ..." という1つの文字列になる）
     filter_sql = _compose_where(role_filter, scope_filter_clause)
 
     params: Dict[str, Any] = dict(scope.params or {})
@@ -612,10 +616,11 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         pass
 
     if selected_parent_id:
-        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件）")
+        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件一覧）")
         
         drill_params = dict(params)
-        # ★修正: WHERE句の二重化エラーを防ぐため、文字列を直接組み立てずに_compose_whereの引数として渡す
+        
+        # ★修正：WHEREエラー防止。個別の条件を直接 _compose_where に渡す。
         if perf_view == "グループ別":
             drill_filter_sql = _compose_where(role_filter, scope_filter_clause, f"{group_expr} = @parent_id")
         else:
@@ -623,7 +628,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         
         drill_params["parent_id"] = selected_parent_id
 
-        # ★修正: LIMITを外し、全商品を対象とする
+        # ★修正：LIMITを外して全件表示
         sql_drill = f"""
             WITH fy AS (
               SELECT (
@@ -845,8 +850,10 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         hide_index=True,
         selection_mode="single-row",
         on_select="rerun",
+        key=f"grid_yoy_{st.session_state.yoy_mode}"
     )
 
+    # ★修正：行の選択解除時に状態が残ってバグるのを完全に防止
     try:
         sel_rows = []
         if hasattr(event, "selection") and hasattr(event.selection, "rows"):
@@ -857,6 +864,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         if sel_rows:
             idx = sel_rows[0]
             st.session_state.selected_yj = str(df_disp.iloc[idx]["YJコード"])
+        else:
+            st.session_state.selected_yj = None
     except Exception:
         pass
 
@@ -1282,6 +1291,7 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
+    # ★表示順序の修正：サマリーを最上部に
     if role.role_admin_view:
         render_fytd_org_section(client)
     else:
@@ -1289,6 +1299,7 @@ def main() -> None:
     
     st.divider()
 
+    # ★表示順序の修正：その下にスコープ設定
     scope = render_scope_filters(client, role)
     st.divider()
 
