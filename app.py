@@ -996,34 +996,47 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
    # --- 原因追及：JAN別 ---
     st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
+    
+    # ★修正：Pythonでの処理や複雑な切り出しは一切やめ、
+    # おっしゃる通り「JANコードを軸にしてマスタ(item_master)から引っ張る」シンプルなSQLにしました。
     sql_root_jan = f"""
         WITH fy AS (
           SELECT (
             EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
             - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
           ) AS current_fy
+        ),
+        base AS (
+          -- ① まず売上データをJANコード単位でシンプルに集計
+          SELECT
+            jan_code AS JAN_STR,
+            SAFE_CAST(jan_code AS INT64) AS JAN_INT,
+            ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS fallback_name,
+            SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
+            SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales,
+            COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS ty_customers,
+            COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS py_customers
+          FROM `{VIEW_UNIFIED}`
+          CROSS JOIN fy
+          {filter_sql}
+          GROUP BY jan_code
         )
+        -- ② JANコードを軸にして、商品マスタ(item_master)から名前と包装を引っ張る
         SELECT
-          jan_code AS `JAN`,
-          ANY_VALUE(REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "")) AS `代表商品名`,
-          -- ★修正：空欄を避け、包装表記（/以降）を持つデータを最優先で引っ張ってくる
-          MAX(
-            CASE 
-              WHEN REGEXP_CONTAINS(CAST(product_name AS STRING), r"[/／]") 
-              THEN REGEXP_EXTRACT(CAST(product_name AS STRING), r"[/／](.*)$") 
-              ELSE '' 
-            END
-          ) AS `包装`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END)
-            - SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS `今期得意先数`,
-          COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS `前期得意先数`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY jan_code
+          b.JAN_STR AS `JAN`,
+          -- マスタの名称を採用（マスタに無い文字化けJAN等は売上データの名前を予備として使用）
+          COALESCE(ANY_VALUE(m.`正式名称`), ANY_VALUE(b.fallback_name)) AS `代表商品名`,
+          -- マスタの包装単位をそのまま表示
+          ANY_VALUE(m.`包装単位`) AS `包装`,
+          SUM(b.ty_sales) AS `今期売上`,
+          SUM(b.py_sales) AS `前期売上`,
+          SUM(b.ty_sales - b.py_sales) AS `前年差額`,
+          SUM(b.ty_customers) AS `今期得意先数`,
+          SUM(b.py_customers) AS `前期得意先数`
+        FROM base b
+        LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.item_master` m
+          ON b.JAN_INT = m.JAN
+        GROUP BY b.JAN_STR
         ORDER BY `前年差額` {sort_order}
     """
     df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
