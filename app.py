@@ -1239,6 +1239,9 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
 # -----------------------------
 # 5. Main Loop
 # -----------------------------
+# -----------------------------
+# 5. Main Loop
+# -----------------------------
 def main() -> None:
     set_page()
     client = setup_bigquery_client()
@@ -1278,12 +1281,20 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
+    # ★修正：まず「年度累計サマリー」を最上部に表示
+    if role.role_admin_view:
+        render_fytd_org_section(client)
+    else:
+        render_fytd_me_section(client, role.login_email)
+    
+    st.divider()
+
+    # ★修正：「分析スコープ設定」をサマリーの下に移動
     scope = render_scope_filters(client, role)
     st.divider()
 
+    # 以降、スコープフィルタの影響を受ける詳細セクション
     if role.role_admin_view:
-        render_fytd_org_section(client)
-        st.divider()
         render_group_underperformance_section(client, role, scope)
         st.divider()
         render_yoy_section(client, role.login_email, is_admin=True, scope=scope)
@@ -1294,8 +1305,6 @@ def main() -> None:
         st.divider()
         render_customer_drilldown(client, role.login_email, is_admin=True, scope=scope)
     else:
-        render_fytd_me_section(client, role.login_email)
-        st.divider()
         render_yoy_section(client, role.login_email, is_admin=False, scope=scope)
         st.divider()
         render_new_deliveries_section(client, role.login_email, is_admin=False)
