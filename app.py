@@ -487,10 +487,19 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str) -> None:
 
 
 def render_group_underperformance_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
-    st.subheader("🏢 得意先グループ別パフォーマンス（前年比ワースト順）")
+    st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
+
+    # ★ 追加: ラジオボタンで表示をスマートに切り替え
+    c1, c2 = st.columns(2)
+    view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True)
+    mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True)
+
+    perf_view = "グループ別" if "グループ別" in view_choice else "得意先別"
+    perf_mode = "ワースト" if "ワースト" in mode_choice else "ベスト"
+    sort_order = "ASC" if perf_mode == "ワースト" else "DESC"
 
     group_expr, group_src = resolve_customer_group_sql_expr(client)
-    if not group_expr:
+    if perf_view == "グループ別" and not group_expr:
         st.info("グループ分析に利用できる列が見つかりません（VIEW_UNIFIEDにグループ列がありません）。")
         return
 
@@ -502,44 +511,71 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
     if not role.role_admin_view:
         params["login_email"] = role.login_email
 
-    sql = f"""
-        WITH fy AS (
-          SELECT
-            (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-             - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy,
-            DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
-        )
-        SELECT
-          {group_expr} AS `得意先グループ`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS `前年同期売上`,
-          SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS `今期粗利`,
-          SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS `前年同期粗利`
-        FROM `{VIEW_UNIFIED}`
-        CROSS JOIN fy
-        {filter_sql}
-        GROUP BY `得意先グループ`
-        HAVING `前年同期売上` > 0 OR `今期売上` > 0
-        ORDER BY (`今期売上` - `前年同期売上`) ASC
-        LIMIT 50
-    """
-    df = query_df_safe(client, sql, params, "Group Performance")
-    if df.empty:
-        st.info("表示できるグループデータがありません。")
+    # --- 親表のSQL構築 ---
+    if perf_view == "グループ別":
+        sql_parent = f"""
+            WITH fy AS (
+              SELECT
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                 - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
+            )
+            SELECT
+              {group_expr} AS `名称`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS `前年同期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS `今期粗利`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS `前年同期粗利`
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN fy
+            {filter_sql}
+            GROUP BY `名称`
+            HAVING `前年同期売上` > 0 OR `今期売上` > 0
+            ORDER BY (`今期売上` - `前年同期売上`) {sort_order}
+            LIMIT 50
+        """
+    else:
+        sql_parent = f"""
+            WITH fy AS (
+              SELECT
+                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+                 - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy,
+                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
+            )
+            SELECT
+              customer_code AS `コード`,
+              ANY_VALUE(customer_name) AS `名称`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS `前年同期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS `今期粗利`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS `前年同期粗利`
+            FROM `{VIEW_UNIFIED}`
+            CROSS JOIN fy
+            {filter_sql}
+            GROUP BY `コード`
+            HAVING `前年同期売上` > 0 OR `今期売上` > 0
+            ORDER BY (`今期売上` - `前年同期売上`) {sort_order}
+            LIMIT 50
+        """
+
+    df_parent = query_df_safe(client, sql_parent, params, f"Parent Perf {perf_view}")
+    if df_parent.empty:
+        st.info("表示できるデータがありません。")
         return
 
-    df["売上差額"] = df["今期売上"] - df["前年同期売上"]
-    df["売上成長率"] = df.apply(
+    df_parent["売上差額"] = df_parent["今期売上"] - df_parent["前年同期売上"]
+    df_parent["売上成長率"] = df_parent.apply(
         lambda r: ((r["今期売上"] / r["前年同期売上"] - 1) * 100) if r["前年同期売上"] else 0,
         axis=1,
     )
-    df["粗利差額"] = df["今期粗利"] - df["前年同期粗利"]
+    df_parent["粗利差額"] = df_parent["今期粗利"] - df_parent["前年同期粗利"]
 
-    if group_src:
+    if perf_view == "グループ別" and group_src:
         st.caption(f"抽出元グループ列: `{group_src}`")
 
-    st.dataframe(
-        df.style.format(
+    # 親表の描画とクリックイベントの取得
+    event = st.dataframe(
+        df_parent.style.format(
             {
                 "今期売上": "¥{:,.0f}",
                 "前年同期売上": "¥{:,.0f}",
@@ -552,48 +588,53 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         ),
         use_container_width=True,
         hide_index=True,
+        selection_mode="single-row",
+        on_select="rerun",
+        key=f"grid_parent_{perf_view}_{perf_mode}" # 切替時に選択状態をリセット
     )
 
-def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
-    st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
+    # 選択された行の特定
+    selected_parent_id = None
+    selected_parent_name = None
 
-    if "yoy_mode" not in st.session_state:
-        st.session_state.yoy_mode = None
-    if "yoy_df" not in st.session_state:
-        st.session_state.yoy_df = pd.DataFrame()
+    try:
+        sel_rows = []
+        if hasattr(event, "selection") and hasattr(event.selection, "rows"):
+            sel_rows = event.selection.rows
+        elif isinstance(event, dict) and "selection" in event:
+            sel_rows = event["selection"].get("rows", [])
 
-    if "selected_yj" not in st.session_state:
-        st.session_state.selected_yj = None
+        if sel_rows:
+            idx = sel_rows[0]
+            if perf_view == "グループ別":
+                selected_parent_id = str(df_parent.iloc[idx]["名称"])
+                selected_parent_name = selected_parent_id
+            else:
+                selected_parent_id = str(df_parent.iloc[idx]["コード"])
+                selected_parent_name = str(df_parent.iloc[idx]["名称"])
+    except Exception:
+        pass
 
-    c1, c2, c3 = st.columns(3)
-
-    def load_yj_data(mode_name: str) -> None:
-        st.session_state.yoy_mode = mode_name
-
-        role_filter = "" if is_admin else "login_email = @login_email"
-        scope_filter = scope.where_clause()
-        combined_where = _compose_where(role_filter, scope_filter)
-
-        params: Dict[str, Any] = dict(scope.params or {})
-        if not is_admin:
-            params["login_email"] = login_email
-
-        if mode_name == "ワースト":
-            diff_filter = "py_sales > 0 AND (ty_sales - py_sales) < 0"
-            order_by = "sales_diff_yoy ASC"
-        elif mode_name == "ベスト":
-            diff_filter = "py_sales > 0 AND (ty_sales - py_sales) > 0"
-            order_by = "sales_diff_yoy DESC"
+    # --- 子表（ドリルダウン要因分析）の表示 ---
+    if selected_parent_id:
+        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品・成分ベース {perf_mode}）")
+        
+        # フィルタに選択したグループまたは得意先を追加
+        drill_params = dict(params)
+        if perf_view == "グループ別":
+            drill_filter_sql = _compose_where(filter_sql, f"{group_expr} = @parent_id")
         else:
-            diff_filter = "py_sales = 0 AND ty_sales > 0"
-            order_by = "ty_sales DESC"
+            drill_filter_sql = _compose_where(filter_sql, "customer_code = @parent_id")
+        
+        drill_params["parent_id"] = selected_parent_id
 
-        sql = f"""
+        sql_drill = f"""
             WITH fy AS (
               SELECT (
                 EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
                 - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-              ) AS current_fy
+              ) AS current_fy,
+              DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
             ),
             base_raw AS (
               SELECT
@@ -604,10 +645,10 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
                 ) AS yj_key,
                 REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "") AS product_base,
                 SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-                SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales
+                SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS py_sales
               FROM `{VIEW_UNIFIED}`
               CROSS JOIN fy
-              {combined_where}
+              {drill_filter_sql}
               GROUP BY yj_key, product_base
             ),
             base AS (
@@ -626,48 +667,47 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
               py_sales AS py_sales_amount,
               (ty_sales - py_sales) AS sales_diff_yoy
             FROM base
-            WHERE {diff_filter}
-            ORDER BY {order_by}
-            LIMIT 100
+            WHERE ty_sales > 0 OR py_sales > 0
+            ORDER BY sales_diff_yoy {sort_order}
+            LIMIT 30
         """
-        st.session_state.yoy_df = query_df_safe(client, sql, params, mode_name)
+        df_drill = query_df_safe(client, sql_drill, drill_params, "Parent Drilldown")
 
-    with c1:
-        if st.button("📉 下落幅ワースト", use_container_width=True):
-            load_yj_data("ワースト")
-    with c2:
-        if st.button("📈 上昇幅ベスト", use_container_width=True):
-            load_yj_data("ベスト")
-    with c3:
-        if st.button("🆕 新規/比較不能", use_container_width=True):
-            load_yj_data("新規")
+        if not df_drill.empty:
+            df_drill["product_name"] = df_drill["product_name"].apply(normalize_product_display_name)
+            df_drill = df_drill.fillna(0)
 
-    if st.session_state.yoy_df.empty:
-        return
+            # アイコン付与
+            def get_rank_icon(rank: int, mode: str) -> str:
+                if mode == "ベスト":
+                    if rank == 1: return "🥇 1位"
+                    if rank == 2: return "🥈 2位"
+                    if rank == 3: return "🥉 3位"
+                    return f"🌟 {rank}位"
+                else:
+                    if rank == 1: return "🚨 1位"
+                    if rank == 2: return "⚠️ 2位"
+                    if rank == 3: return "⚡ 3位"
+                    return f"📉 {rank}位"
 
-    df = st.session_state.yoy_df.copy()
-    df["product_name"] = df["product_name"].apply(normalize_product_display_name)
-    df = df.fillna(0)
+            df_drill.insert(0, "要因順位", [get_rank_icon(i + 1, perf_mode) for i in range(len(df_drill))])
 
-    # YJごとに集約 (この時点でPandasの仕様によりYJコード順に並んでしまう)
-    df_disp = (
-        df.groupby(["yj_code"], as_index=False)
-        .agg(
-            product_name=("product_name", "first"),
-            sales_amount=("sales_amount", "sum"),
-            py_sales_amount=("py_sales_amount", "sum"),
-            sales_diff_yoy=("sales_diff_yoy", "sum"),
-        )
-        .rename(
-            columns={
-                "yj_code": "YJコード",
-                "product_name": "代表商品名(成分)",
-                "sales_amount": "今期売上",
-                "py_sales_amount": "前期売上",
-                "sales_diff_yoy": "前年比差額",
-            }
-        )
-    )
+            st.dataframe(
+                df_drill[["要因順位", "product_name", "sales_amount", "py_sales_amount", "sales_diff_yoy"]].rename(
+                    columns={
+                        "product_name": "代表商品名(成分)",
+                        "sales_amount": "今期売上",
+                        "py_sales_amount": "前年同期売上",
+                        "sales_diff_yoy": "前年比差額",
+                    }
+                ).style.format(
+                    {"今期売上": "¥{:,.0f}", "前年同期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("要因データが見つかりません。")
 
     # ★修正1: モードに合わせて再度ソートをかけ直す
     if st.session_state.yoy_mode == "ワースト":
