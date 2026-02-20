@@ -994,60 +994,36 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     else:
         st.info("得意先グループ列がデータソースに存在しないため、グループ内訳は表示できません。")
 
-   # --- 原因追及：JAN別 ---
-    st.markdown("#### 🧪 原因追及：JAN別（前年差額寄与）")
+   # --- 原因追及：JAN・商品別（BigQuery View完結版） ---
+    st.markdown("#### 🧪 原因追及：JAN・商品別（前年差額寄与）")
+    
+    # ★修正：Python側での複雑なJOINや文字の切り出しはすべて撤廃！
+    # BigQuery側ですでにクレンジング済みのビューを、信じてシンプルに集計するだけです。
     sql_root_jan = f"""
         WITH fy AS (
           SELECT (
             EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
             - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
           ) AS current_fy
-        ),
-        base AS (
-          SELECT
-            jan_code AS JAN_STR,
-            SAFE_CAST(jan_code AS INT64) AS JAN_INT,
-            -- 文字化けJAN等のためのバックアップとして、直近の商品名を保持
-            ARRAY_AGG(CAST(product_name AS STRING) ORDER BY sales_date DESC LIMIT 1)[OFFSET(0)] AS raw_product_name,
-            SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
-            SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales,
-            COUNT(DISTINCT CASE WHEN fiscal_year = current_fy THEN customer_code END) AS ty_customers,
-            COUNT(DISTINCT CASE WHEN fiscal_year = current_fy - 1 THEN customer_code END) AS py_customers
-          FROM `{VIEW_UNIFIED}`
-          CROSS JOIN fy
-          {filter_sql}
-          GROUP BY jan_code
         )
         SELECT
-          b.JAN_STR AS `JAN`,
-          -- ① マスタにあれば正式名称、なければ直近商品名の「/」より前
-          COALESCE(
-            MAX(CAST(m.`正式名称` AS STRING)), 
-            REGEXP_REPLACE(MAX(b.raw_product_name), r"[/／].*$", "")
-          ) AS `代表商品名`,
-          -- ② マスタにあれば包装単位、なければ直近商品名の「/」より後ろ
-          COALESCE(
-            MAX(CAST(m.`包装単位` AS STRING)), 
-            CASE 
-              WHEN REGEXP_CONTAINS(MAX(b.raw_product_name), r"[/／]") 
-              THEN REGEXP_EXTRACT(MAX(b.raw_product_name), r"[/／](.*)$") 
-              ELSE '' 
-            END
-          ) AS `包装`,
-          SUM(b.ty_sales) AS `今期売上`,
-          SUM(b.py_sales) AS `前期売上`,
-          SUM(b.ty_sales - b.py_sales) AS `前年差額`,
-          SUM(b.ty_customers) AS `今期得意先数`,
-          SUM(b.py_customers) AS `前期得意先数`
-        FROM base b
-        LEFT JOIN `{PROJECT_DEFAULT}.{DATASET_DEFAULT}.item_master` m
-          ON b.JAN_INT = m.JAN
-        GROUP BY b.JAN_STR
+          CAST(jan_code AS STRING) AS `JAN`,
+          CAST(product_name AS STRING) AS `代表商品名`,
+          CAST(package_unit AS STRING) AS `包装`,  -- ★ビュー側で新設された包装列
+          SUM(CASE WHEN fiscal_year = fy.current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+          SUM(CASE WHEN fiscal_year = fy.current_fy - 1 THEN sales_amount ELSE 0 END) AS `前期売上`,
+          SUM(CASE WHEN fiscal_year = fy.current_fy THEN sales_amount ELSE 0 END) 
+            - SUM(CASE WHEN fiscal_year = fy.current_fy - 1 THEN sales_amount ELSE 0 END) AS `前年差額`,
+          COUNT(DISTINCT CASE WHEN fiscal_year = fy.current_fy THEN customer_code END) AS `今期得意先数`,
+          COUNT(DISTINCT CASE WHEN fiscal_year = fy.current_fy - 1 THEN customer_code END) AS `前期得意先数`
+        FROM `{VIEW_UNIFIED}`
+        CROSS JOIN fy
+        {filter_sql}
+        GROUP BY `JAN`, `代表商品名`, `包装`
         ORDER BY `前年差額` {sort_order}
     """
-    df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause JAN")
+    df_root_jan = query_df_safe(client, sql_root_jan, params, "YJ Root Cause Product")
     if not df_root_jan.empty:
-        # ★修正：文字列の列に「0」が入らないように処理を改善
         fill_values = {
             "JAN": "", "代表商品名": "", "包装": "", 
             "今期売上": 0, "前期売上": 0, "前年差額": 0, "今期得意先数": 0, "前期得意先数": 0
