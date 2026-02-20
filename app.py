@@ -700,26 +700,24 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
 def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
     st.subheader("📊 年間 YoY ランキング（成分・YJベース）")
 
+    # 状態の初期化
     if "yoy_mode" not in st.session_state:
-        st.session_state.yoy_mode = None
+        st.session_state.yoy_mode = "ワースト"
     if "yoy_df" not in st.session_state:
         st.session_state.yoy_df = pd.DataFrame()
-
     if "selected_yj" not in st.session_state:
-        st.session_state.selected_yj = None
+        st.session_state.selected_yj = "全成分を表示"
 
     c1, c2, c3 = st.columns(3)
 
+    # --- データ読み込みロジック ---
     def load_yj_data(mode_name: str) -> None:
         st.session_state.yoy_mode = mode_name
-
         role_filter = "" if is_admin else "login_email = @login_email"
-        scope_filter = scope.where_clause()
-        combined_where = _compose_where(role_filter, scope_filter)
-
+        scope_where = scope.where_clause()
+        combined_where = _compose_where(role_filter, scope_where)
         params: Dict[str, Any] = dict(scope.params or {})
-        if not is_admin:
-            params["login_email"] = login_email
+        if not is_admin: params["login_email"] = login_email
 
         if mode_name == "ワースト":
             diff_filter = "py_sales > 0 AND (ty_sales - py_sales) < 0"
@@ -733,83 +731,150 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
         sql = f"""
             WITH fy AS (
-              SELECT (
-                EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-                - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
-              ) AS current_fy
+              SELECT (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
             ),
-            base_raw AS (
+            base AS (
               SELECT
-                COALESCE(
-                  NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ''), '0'),
-                  NULLIF(NULLIF(TRIM(CAST(jan_code AS STRING)), ''), '0'),
-                  TRIM(CAST(product_name AS STRING))
-                ) AS yj_key,
-                REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "") AS product_base,
+                yj_code,
+                ANY_VALUE(product_name) AS product_name,
                 SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
                 SUM(CASE WHEN fiscal_year = current_fy - 1 THEN sales_amount ELSE 0 END) AS py_sales
               FROM `{VIEW_UNIFIED}`
               CROSS JOIN fy
               {combined_where}
-              GROUP BY yj_key, product_base
-            ),
-            base AS (
-              SELECT
-                yj_key AS yj_code,
-                ARRAY_AGG(product_base ORDER BY ty_sales DESC LIMIT 1)[OFFSET(0)] AS product_name,
-                SUM(ty_sales) AS ty_sales,
-                SUM(py_sales) AS py_sales
-              FROM base_raw
               GROUP BY yj_code
             )
-            SELECT
-              yj_code,
-              product_name,
-              ty_sales AS sales_amount,
-              py_sales AS py_sales_amount,
-              (ty_sales - py_sales) AS sales_diff_yoy
-            FROM base
+            SELECT *, (ty_sales - py_sales) AS sales_diff_yoy FROM base
             WHERE {diff_filter}
-            ORDER BY {order_by}
-            LIMIT 100
+            ORDER BY {order_by} LIMIT 100
         """
         st.session_state.yoy_df = query_df_safe(client, sql, params, mode_name)
 
+    # --- ボタン配置 ---
     with c1:
-        if st.button("📉 下落幅ワースト", use_container_width=True):
-            load_yj_data("ワースト")
+        if st.button("📉 下落幅ワースト", use_container_width=True): load_yj_data("ワースト")
     with c2:
-        if st.button("📈 上昇幅ベスト", use_container_width=True):
-            load_yj_data("ベスト")
+        if st.button("📈 上昇幅ベスト", use_container_width=True): load_yj_data("ベスト")
     with c3:
-        if st.button("🆕 新規/比較不能", use_container_width=True):
-            load_yj_data("新規")
+        if st.button("🆕 新規/比較不能", use_container_width=True): load_yj_data("新規")
 
     if st.session_state.yoy_df.empty:
+        st.info("ランキングを読み込むにはボタンを押してください。")
         return
 
-    df = st.session_state.yoy_df.copy()
-    df["product_name"] = df["product_name"].apply(normalize_product_display_name)
-    df = df.fillna(0)
-
-    df_disp = (
-        df.groupby(["yj_code"], as_index=False)
-        .agg(
-            product_name=("product_name", "first"),
-            sales_amount=("sales_amount", "sum"),
-            py_sales_amount=("py_sales_amount", "sum"),
-            sales_diff_yoy=("sales_diff_yoy", "sum"),
-        )
-        .rename(
-            columns={
-                "yj_code": "YJコード",
-                "product_name": "代表商品名(成分)",
-                "sales_amount": "今期売上",
-                "py_sales_amount": "前期売上",
-                "sales_diff_yoy": "前年比差額",
-            }
-        )
+    # --- 第一階層：ランキング表示 ---
+    df_disp = st.session_state.yoy_df.copy()
+    df_disp["product_name"] = df_disp["product_name"].apply(normalize_product_display_name)
+    
+    st.markdown(f"#### 🏆 第一階層：成分（YJ）ベース {st.session_state.yoy_mode} ランキング")
+    event = st.dataframe(
+        df_disp[["product_name", "ty_sales", "py_sales", "sales_diff_yoy"]].rename(
+            columns={"product_name": "代表商品名(成分)", "ty_sales": "今期売上", "py_sales": "前期売上", "sales_diff_yoy": "前年比差額"}
+        ).style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}),
+        use_container_width=True, hide_index=True, selection_mode="single-row", on_select="rerun", key=f"grid_yoy_{st.session_state.yoy_mode}"
     )
+
+    # クリック選択時の連動ロジック
+    try:
+        sel_rows = event.selection.rows if hasattr(event, "selection") else []
+        if sel_rows:
+            st.session_state.selected_yj = str(df_disp.iloc[sel_rows[0]]["yj_code"])
+        else:
+            st.session_state.selected_yj = "全成分を表示"
+    except: pass
+
+    st.divider()
+    
+    # ---------------------------------------------------------
+    # 🔍 第二階層：詳細分析（スコープ内全量）
+    # ---------------------------------------------------------
+    st.header("🔍 第二階層：詳細分析（スコープ内全量）")
+
+    # セレクトボックスの選択肢作成
+    yj_opts = ["全成分を表示"] + list(df_disp["yj_code"].unique())
+    yj_display_map = {"全成分を表示": "🚩 スコープ内の全成分を合計して表示"}
+    for _, r in df_disp.iterrows():
+        yj_display_map[str(r["yj_code"])] = f"{normalize_product_display_name(r['product_name'])} (差額: ¥{r['sales_diff_yoy']:,.0f})"
+
+    # 選択状態の同期
+    current_index = 0
+    if st.session_state.selected_yj in yj_opts:
+        current_index = yj_opts.index(st.session_state.selected_yj)
+
+    selected_yj = st.selectbox(
+        "詳細を見たい成分を選択してください（[全成分を表示] ですべて表示）", 
+        options=yj_opts, 
+        index=current_index,
+        format_func=lambda x: yj_display_map.get(x, x)
+    )
+
+    # --- 第二階層用のフィルタ構築 ---
+    role_filter = "" if is_admin else "login_email = @login_email"
+    scope_where = scope.where_clause()
+    yj_filter = ""
+    drill_params = dict(scope.params or {})
+    if not is_admin: drill_params["login_email"] = login_email
+
+    if selected_yj != "全成分を表示":
+        yj_filter = "yj_code = @target_yj"
+        drill_params["target_yj"] = selected_yj
+
+    final_where = _compose_where(role_filter, scope_where, yj_filter)
+    sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
+
+    # --- 1. 得意先別内訳 ---
+    st.markdown("#### 🧾 得意先別内訳（前年差額）")
+    sql_cust = f"""
+        SELECT 
+          customer_name AS `得意先名`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year) FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `今期売上`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year)-1 FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `前期売上` 
+        FROM `{VIEW_UNIFIED}` 
+        {final_where} 
+        GROUP BY 1 
+        HAVING `今期売上`!=0 OR `前期売上`!=0 
+        ORDER BY (`今期売上`-`前期売上`) {sort_order} LIMIT 50
+    """
+    df_cust = query_df_safe(client, sql_cust, drill_params)
+    if not df_cust.empty:
+        df_cust["前年差額"] = df_cust["今期売上"] - df_cust["前期売上"]
+        st.dataframe(df_cust.style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
+
+    # --- 2. JAN・商品別（包装単位あり） ---
+    st.markdown("#### 🧪 原因追及：JAN・商品別（前年差額寄与）")
+    sql_jan = f"""
+        SELECT 
+          jan_code AS `JAN`, 
+          product_name AS `代表商品名`, 
+          package_unit AS `包装`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year) FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `今期売上`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year)-1 FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `前期売上` 
+        FROM `{VIEW_UNIFIED}` 
+        {final_where} 
+        GROUP BY 1,2,3 
+        ORDER BY (`今期売上`-`前期売上`) {sort_order}
+    """
+    df_jan = query_df_safe(client, sql_jan, drill_params)
+    if not df_jan.empty:
+        df_jan["前年差額"] = df_jan["今期売上"] - df_jan["前期売上"]
+        st.dataframe(df_jan.style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
+
+    # --- 3. 月次推移 ---
+    st.markdown("#### 📅 原因追及：月次推移（前年差額）")
+    sql_month = f"""
+        SELECT 
+          FORMAT_DATE('%Y-%m', sales_date) AS `年月`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year) FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `今期売上`, 
+          SUM(CASE WHEN fiscal_year = (SELECT MAX(fiscal_year)-1 FROM `{VIEW_UNIFIED}`) THEN sales_amount ELSE 0 END) AS `前期売上` 
+        FROM `{VIEW_UNIFIED}` 
+        {final_where} 
+        GROUP BY 1 
+        ORDER BY 1
+    """
+    df_month = query_df_safe(client, sql_month, drill_params)
+    if not df_month.empty:
+        df_month["前年差額"] = df_month["今期売上"] - df_month["前期売上"]
+        st.dataframe(df_month.style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
 
     if st.session_state.yoy_mode == "ワースト":
         df_disp = df_disp.sort_values("前年比差額", ascending=True).reset_index(drop=True)
