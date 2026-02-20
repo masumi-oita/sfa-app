@@ -8,6 +8,7 @@ SFA｜戦略ダッシュボード - OS v1.4.8 (Safety & Full Feature Update)
 - 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
 - 新機能：順位アイコンの追加と、不要なYJコード列の非表示
 - 修正：WHERE二重エラー解消 ＆ 選択状態の消失バグ解消 ＆ 表示順序の最適化
+- ★修正：Reco（VIEW_RECOMMEND）の customer_code が INT64 のため、STRINGキー（VIEW_UNIFIED）と照合できるよう CAST 対応
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.8｜実態解明モード（YJ=0はJANキーで追跡）")
+    st.caption("OS v1.4.8｜実態解明モード（YJ=0/nullはJANキーで追跡）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -238,15 +239,6 @@ def get_customer_group_column_profiles(_client: bigquery.Client) -> pd.DataFrame
     return query_df_safe(_client, sql, label="Customer Group Column Profile")
 
 
-def resolve_customer_group_column(_client: bigquery.Client) -> Optional[str]:
-    profiles = get_customer_group_column_profiles(_client)
-    if not profiles.empty and "column_name" in profiles.columns:
-        return str(profiles.iloc[0]["column_name"])
-
-    available_cols = get_available_customer_group_columns(_client)
-    return available_cols[0] if available_cols else None
-
-
 def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[str], Optional[str]]:
     cols = get_unified_columns(_client)
 
@@ -415,6 +407,10 @@ def render_summary_metrics(row: pd.Series) -> None:
 
 def render_fytd_org_section(client: bigquery.Client) -> None:
     st.subheader("🏢 年度累計（FYTD）｜全社サマリー")
+
+    if "org_data_loaded" not in st.session_state:
+        st.session_state.org_data_loaded = False
+
     if st.button("全社データを読み込む", key="btn_org_load"):
         st.session_state.org_data_loaded = True
 
@@ -488,18 +484,14 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         st.info("グループ分析に利用できる列が見つかりません（VIEW_UNIFIEDにグループ列がありません）。")
         return
 
-    # ★修正：フィルタの構築（WHEREが二重にならないように配慮）
     role_filter = "" if role.role_admin_view else "login_email = @login_email"
     scope_filter_clause = scope.where_clause()
-    
-    # 親表用のフィルタ（"WHERE ..." という1つの文字列になる）
     filter_sql = _compose_where(role_filter, scope_filter_clause)
 
     params: Dict[str, Any] = dict(scope.params or {})
     if not role.role_admin_view:
         params["login_email"] = role.login_email
 
-    # --- 親表のSQL構築 ---
     if perf_view == "グループ別":
         sql_parent = f"""
             WITH fy AS (
@@ -560,14 +552,20 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
 
     def get_parent_rank_icon(rank: int, mode: str) -> str:
         if mode == "ベスト":
-            if rank == 1: return "🥇 1位"
-            if rank == 2: return "🥈 2位"
-            if rank == 3: return "🥉 3位"
+            if rank == 1:
+                return "🥇 1位"
+            if rank == 2:
+                return "🥈 2位"
+            if rank == 3:
+                return "🥉 3位"
             return f"🌟 {rank}位"
         else:
-            if rank == 1: return "🚨 1位"
-            if rank == 2: return "⚠️ 2位"
-            if rank == 3: return "⚡ 3位"
+            if rank == 1:
+                return "🚨 1位"
+            if rank == 2:
+                return "⚠️ 2位"
+            if rank == 3:
+                return "⚡ 3位"
             return f"📉 {rank}位"
 
     df_parent.insert(0, "順位", [get_parent_rank_icon(i + 1, perf_mode) for i in range(len(df_parent))])
@@ -591,7 +589,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         hide_index=True,
         selection_mode="single-row",
         on_select="rerun",
-        key=f"grid_parent_{perf_view}_{perf_mode}"
+        key=f"grid_parent_{perf_view}_{perf_mode}",
     )
 
     selected_parent_id = None
@@ -617,18 +615,16 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
 
     if selected_parent_id:
         st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件一覧）")
-        
+
         drill_params = dict(params)
-        
-        # ★修正：WHEREエラー防止。個別の条件を直接 _compose_where に渡す。
+
         if perf_view == "グループ別":
             drill_filter_sql = _compose_where(role_filter, scope_filter_clause, f"{group_expr} = @parent_id")
         else:
             drill_filter_sql = _compose_where(role_filter, scope_filter_clause, "customer_code = @parent_id")
-        
+
         drill_params["parent_id"] = selected_parent_id
 
-        # ★修正：LIMITを外して全件表示
         sql_drill = f"""
             WITH fy AS (
               SELECT (
@@ -700,9 +696,6 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
 def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
     st.subheader("📊 年間 YoY ランキング（成分・YJ優先｜YJ=0/nullはJANキーで追跡）")
 
-    # -----------------------------
-    # State
-    # -----------------------------
     if "yoy_mode" not in st.session_state:
         st.session_state.yoy_mode = "ワースト"  # ワースト / ベスト / 新規
     if "yoy_df" not in st.session_state:
@@ -712,9 +705,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
     c1, c2, c3 = st.columns(3)
 
-    # -----------------------------
-    # Loader (first layer)
-    # -----------------------------
     def load_yoy(mode_name: str) -> None:
         st.session_state.yoy_mode = mode_name
 
@@ -793,9 +783,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         st.info("ランキングを読み込むにはボタンを押してください。")
         return
 
-    # -----------------------------
-    # First layer view (click select)
-    # -----------------------------
     df_rank = st.session_state.yoy_df.copy()
     df_rank["product_name"] = df_rank["product_name"].apply(normalize_product_display_name)
 
@@ -825,9 +812,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
     st.divider()
 
-    # -----------------------------
-    # Second layer (detail)
-    # -----------------------------
     st.header("🔍 第二階層：詳細分析（スコープ内）")
 
     key_opts = ["全成分を表示"] + list(df_rank["yj_key"].astype(str).unique())
@@ -870,7 +854,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     where_sql = _compose_where(role_filter, scope_where, key_filter)
     sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
 
-    # 1) 得意先別内訳
     st.markdown("#### 🧾 得意先別内訳（前年差額）")
     sql_cust = f"""
       WITH fy AS (
@@ -910,7 +893,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     else:
         st.info("得意先別内訳がありません。")
 
-    # 2) JAN・商品別（包装あり）
     st.markdown("#### 🧪 原因追及：JAN・商品別（前年差額寄与）")
     sql_jan = f"""
       WITH fy AS (
@@ -953,7 +935,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     else:
         st.info("JAN別内訳がありません。")
 
-    # 3) 月次推移
     st.markdown("#### 📅 原因追及：月次推移（前年差額）")
     sql_month = f"""
       WITH fy AS (
@@ -1163,17 +1144,33 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("##### 💡 AI 推奨提案商品（Reco）")
+
+    # ★重要：VIEW_RECOMMEND.customer_code は INT64、VIEW_UNIFIED.customer_code は STRING
+    # → 照合は CAST(customer_code AS STRING) = @c で安全に統一
     sql_rec = f"""
-        SELECT *
+        SELECT
+          customer_name,
+          strong_category,
+          priority_rank,
+          recommend_jan,
+          recommend_product,
+          manufacturer,
+          market_scale
         FROM `{VIEW_RECOMMEND}`
-        WHERE customer_code = @c
+        WHERE CAST(customer_code AS STRING) = @c
         ORDER BY priority_rank ASC
         LIMIT 10
     """
     df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
     if not df_rec.empty:
-        df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer"]].rename(
-            columns={"priority_rank": "順位", "recommend_product": "推奨商品", "manufacturer": "メーカー"}
+        df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer", "strong_category", "market_scale"]].rename(
+            columns={
+                "priority_rank": "順位",
+                "recommend_product": "推奨商品",
+                "manufacturer": "メーカー",
+                "strong_category": "強み分類",
+                "market_scale": "市場規模",
+            }
         )
         st.dataframe(df_disp, use_container_width=True, hide_index=True)
     else:
@@ -1222,15 +1219,15 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
-    # ★表示順序の修正：サマリーを最上部に
+    # ★表示順序：サマリーを最上部に
     if role.role_admin_view:
         render_fytd_org_section(client)
     else:
         render_fytd_me_section(client, role.login_email)
-    
+
     st.divider()
 
-    # ★表示順序の修正：その下にスコープ設定
+    # ★表示順序：その下にスコープ設定
     scope = render_scope_filters(client, role)
     st.divider()
 
