@@ -1,21 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.8 (Safety & Full Feature Update)
+SFA｜戦略ダッシュボード - OS v1.4.9 (True "踏襲＋追加" / Backward Compatible)
+
+【踏襲（v1.4.8の既存機能は維持）】
 - YoY：VIEW_UNIFIED から動的集計に統一（YJ同一で商品名が2行問題を抑止）
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
 - スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定
 - Group Display: official先頭 + raw併記
-- 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
-- 新機能：順位アイコンの追加と、不要なYJコード列の非表示
-- 修正：WHERE二重エラー解消 ＆ 選択状態の消失バグ解消 ＆ 表示順序の最適化
-- ★修正：Reco（VIEW_RECOMMEND）の customer_code が INT64 のため、STRINGキー（VIEW_UNIFIED）と照合できるよう CAST 対応
+- 得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
+- 順位アイコン、不要YJ列の非表示、WHERE二重対策、選択消失バグ対策、表示順序最適化
+- ★Reco（VIEW_RECOMMEND）の customer_code が INT64 のため CAST対応（v1.4.8踏襲）
+
+【追加（今回の必須要件）】
+- ★fact列名の自動解決（jan/pack/yj 等）を「VIEW_UNIFIEDだけでなく」関連VIEWにも拡張
+  → 実働アプリを壊さないため「後方互換（旧列名優先 + 候補吸収 + 自動フォールバック）」で実装
+- ★管理者スコープ必須（フルスキャンは明示許可＋上限bytes設定＋推定必須の段階UI）
+- ★全件表示の段階UI（推定コスト表示＋maximumBytesBilled設定）
+  → 推定（Dry Run）→ 同意/上限設定 → 実行 の順で統制
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
@@ -45,6 +53,11 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
     "sales_group_name",
 )
 
+# コスト推定の参考値（BigQueryオンデマンド：概ね $5 / TB が目安。運用で変えるならUIで変更可能）
+DEFAULT_USD_PER_TB = 5.0
+DEFAULT_USDJPY = 150.0  # 目安（実運用はUIで調整）
+BYTES_PER_TB = 1024 ** 4
+
 
 # -----------------------------
 # 2. Helpers (表示用)
@@ -52,7 +65,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.8｜実態解明モード（YJ=0/nullはJANキーで追跡）")
+    st.caption("OS v1.4.9｜実働維持 + 列名差異吸収 + 管理者フルスキャン統制（推定→同意→実行）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -82,6 +95,16 @@ def normalize_product_display_name(name: Any) -> str:
     text = str(name).strip()
     text = re.sub(r"[/／].*$", "", text)
     return text.strip()
+
+
+def bq_ident(name: str) -> str:
+    """BigQuery識別子（列名）をバッククォートで囲む。"""
+    s = str(name).strip()
+    if not s:
+        raise ValueError("Empty identifier")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s):
+        raise ValueError(f"Unsafe identifier: {s}")
+    return f"`{s}`"
 
 
 # -----------------------------
@@ -129,6 +152,7 @@ def query_df_safe(
     params: Optional[Dict[str, Any]] = None,
     label: str = "",
     timeout_sec: int = 60,
+    maximum_bytes_billed: Optional[int] = None,
 ) -> pd.DataFrame:
     use_bqstorage = st.session_state.get("use_bqstorage", True)
     try:
@@ -140,12 +164,55 @@ def query_df_safe(
                 query_params.append(bigquery.ScalarQueryParameter(key, p_type, p_value))
             job_config.query_parameters = query_params
 
+        if maximum_bytes_billed is not None:
+            job_config.maximum_bytes_billed = int(maximum_bytes_billed)
+
         job = client.query(sql, job_config=job_config)
         job.result(timeout=timeout_sec)
         return job.to_dataframe(create_bqstorage_client=use_bqstorage)
     except Exception as e:
         st.error(f"クエリエラー ({label}):\n{e}")
         return pd.DataFrame()
+
+
+def estimate_query_bytes(
+    client: bigquery.Client,
+    sql: str,
+    params: Optional[Dict[str, Any]] = None,
+    label: str = "Estimate",
+) -> Optional[int]:
+    """DryRunで処理バイト数推定（失敗時はNone）。"""
+    try:
+        job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        if params:
+            query_params = []
+            for key, raw_value in params.items():
+                p_type, p_value = _normalize_param(raw_value)
+                query_params.append(bigquery.ScalarQueryParameter(key, p_type, p_value))
+            job_config.query_parameters = query_params
+
+        job = client.query(sql, job_config=job_config)
+        return int(job.total_bytes_processed or 0)
+    except Exception as e:
+        st.warning(f"推定に失敗しました（{label}）: {e}")
+        return None
+
+
+def bytes_to_human(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    units = ["KB", "MB", "GB", "TB", "PB"]
+    v = float(n)
+    for u in units:
+        v /= 1024.0
+        if v < 1024.0:
+            return f"{v:.2f} {u}"
+    return f"{v:.2f} EB"
+
+
+def estimate_cost_jpy(bytes_processed: int, usd_per_tb: float, usd_jpy: float) -> float:
+    tb = bytes_processed / BYTES_PER_TB
+    return tb * float(usd_per_tb) * float(usd_jpy)
 
 
 @dataclass(frozen=True)
@@ -168,6 +235,17 @@ class ScopeFilter:
             return ""
         return " AND ".join(self.predicates)
 
+    def is_empty(self) -> bool:
+        return not self.predicates
+
+
+@dataclass(frozen=True)
+class AdminScanPolicy:
+    require_scope: bool = True
+    allow_full_scan: bool = False
+    max_bytes_billed: int = 0  # 0 means "no limit" (not recommended)
+    must_estimate_before_run: bool = True
+
 
 def _compose_where(*parts: str) -> str:
     clauses = [p.strip() for p in parts if p and p.strip()]
@@ -181,6 +259,108 @@ def _split_table_fqn(table_fqn: str) -> Tuple[str, str, str]:
     if len(parts) != 3:
         raise ValueError(f"Invalid table FQN: {table_fqn}")
     return parts[0], parts[1], parts[2]
+
+
+# -----------------------------
+# 3.1 Schema utilities (列名差異吸収の基盤)
+# -----------------------------
+@st.cache_data(ttl=3600)
+def get_table_columns_lower(_client: bigquery.Client, table_fqn: str) -> set[str]:
+    project_id, dataset_id, table_name = _split_table_fqn(table_fqn)
+    sql = f"""
+        SELECT column_name
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = @table_name
+    """
+    df = query_df_safe(_client, sql, {"table_name": table_name}, f"Schema Check: {table_name}")
+    if df.empty or "column_name" not in df.columns:
+        return set()
+    return {str(c).lower() for c in df["column_name"].dropna().tolist()}
+
+
+def resolve_col(table_fqn: str, cols_lower: set[str], candidates: List[str], required: bool = True) -> Optional[str]:
+    """
+    candidatesの先頭から順に存在確認し、最初に見つかった実列名（候補文字列そのまま）を返す。
+    ※後方互換のため「旧列名を先頭」に置く。
+    """
+    for c in candidates:
+        if c.lower() in cols_lower:
+            return c
+    if required:
+        return None
+    return None
+
+
+@st.cache_data(ttl=3600)
+def resolve_view_columns_map(_client: bigquery.Client) -> Dict[str, Dict[str, str]]:
+    """
+    主要VIEWについて、必要列の“実列名”を自動解決して返す。
+    ここが「事前に吸収できるバグ」を潰す中核。
+    """
+    m: Dict[str, Dict[str, str]] = {}
+
+    # --- VIEW_UNIFIED（fact）
+    cols_u = get_table_columns_lower(_client, VIEW_UNIFIED)
+    unified = {}
+
+    # 後方互換優先：今までの実働で使ってた列名を先頭に置く
+    unified["customer_code"] = resolve_col(VIEW_UNIFIED, cols_u, ["customer_code", "customer_cd", "cust_code"], True) or ""
+    unified["customer_name"] = resolve_col(VIEW_UNIFIED, cols_u, ["customer_name", "customer_nm", "cust_name"], True) or ""
+    unified["login_email"] = resolve_col(VIEW_UNIFIED, cols_u, ["login_email", "email", "user_email"], True) or ""
+    unified["staff_name"] = resolve_col(VIEW_UNIFIED, cols_u, ["staff_name", "担当社員名", "担当者名", "sales_name"], False) or "staff_name"
+
+    # 重要キー（差異吸収の必須）
+    unified["yj_code"] = resolve_col(VIEW_UNIFIED, cols_u, ["yj_code", "yj", "YJCode", "YJ_CODE"], False) or "yj_code"
+    unified["jan_code"] = resolve_col(VIEW_UNIFIED, cols_u, ["jan_code", "jan", "JAN", "JAN_CODE"], False) or "jan_code"
+    unified["product_name"] = resolve_col(VIEW_UNIFIED, cols_u, ["product_name", "item_name", "商品名称", "item_nm"], True) or ""
+    unified["package_unit"] = resolve_col(VIEW_UNIFIED, cols_u, ["package_unit", "pack_unit", "pack", "包装単位", "packaging"], False) or "package_unit"
+
+    unified["sales_date"] = resolve_col(VIEW_UNIFIED, cols_u, ["sales_date", "date", "販売日"], True) or ""
+    unified["fiscal_year"] = resolve_col(VIEW_UNIFIED, cols_u, ["fiscal_year", "FY", "会計年度"], True) or ""
+    unified["sales_amount"] = resolve_col(VIEW_UNIFIED, cols_u, ["sales_amount", "sales", "売上", "合計価格"], True) or ""
+    unified["gross_profit"] = resolve_col(VIEW_UNIFIED, cols_u, ["gross_profit", "gp", "粗利"], True) or ""
+
+    m["unified"] = unified
+
+    # --- VIEW_NEW_DELIVERY（新規納品）
+    cols_nd = get_table_columns_lower(_client, VIEW_NEW_DELIVERY)
+    nd = {}
+    nd["first_sales_date"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["first_sales_date", "first_sale_date", "first_date"], True) or ""
+    nd["customer_code"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["customer_code", "customer_cd"], True) or ""
+    nd["jan_code"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["jan_code", "jan", "JAN"], True) or ""
+    nd["sales_amount"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["sales_amount", "sales", "売上"], True) or ""
+    nd["gross_profit"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["gross_profit", "gp", "粗利"], True) or ""
+    nd["login_email"] = resolve_col(VIEW_NEW_DELIVERY, cols_nd, ["login_email", "email", "user_email"], False)  # 無いVIEWもある
+    m["new_delivery"] = nd
+
+    # --- VIEW_ADOPTION（採用・失注アラート）
+    cols_ad = get_table_columns_lower(_client, VIEW_ADOPTION)
+    ad = {}
+    ad["login_email"] = resolve_col(VIEW_ADOPTION, cols_ad, ["login_email", "email", "user_email"], False)
+    ad["staff_name"] = resolve_col(VIEW_ADOPTION, cols_ad, ["staff_name", "担当者名"], False)
+    ad["customer_code"] = resolve_col(VIEW_ADOPTION, cols_ad, ["customer_code", "customer_cd"], True) or ""
+    ad["customer_name"] = resolve_col(VIEW_ADOPTION, cols_ad, ["customer_name", "customer_nm"], True) or ""
+    ad["product_name"] = resolve_col(VIEW_ADOPTION, cols_ad, ["product_name", "item_name", "商品名"], True) or ""
+    ad["last_purchase_date"] = resolve_col(VIEW_ADOPTION, cols_ad, ["last_purchase_date", "last_date", "最終購入日"], True) or ""
+    ad["adoption_status"] = resolve_col(VIEW_ADOPTION, cols_ad, ["adoption_status", "status", "ステータス"], True) or ""
+    ad["current_fy_sales"] = resolve_col(VIEW_ADOPTION, cols_ad, ["current_fy_sales", "cur_sales", "今期売上"], True) or ""
+    ad["previous_fy_sales"] = resolve_col(VIEW_ADOPTION, cols_ad, ["previous_fy_sales", "py_sales", "前期売上"], True) or ""
+    m["adoption"] = ad
+
+    # --- VIEW_RECOMMEND（Reco）
+    cols_rc = get_table_columns_lower(_client, VIEW_RECOMMEND)
+    rc = {}
+    rc["customer_code"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["customer_code", "customer_cd"], True) or ""
+    rc["customer_name"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["customer_name", "customer_nm"], False)
+    rc["strong_category"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["strong_category", "category", "強み分類"], False)
+    rc["priority_rank"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["priority_rank", "rank", "順位"], True) or ""
+    rc["recommend_jan"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["recommend_jan", "jan", "JAN"], False)
+    rc["recommend_product"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["recommend_product", "product_name", "推奨商品"], True) or ""
+    rc["manufacturer"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["manufacturer", "maker", "メーカー"], False)
+    rc["market_scale"] = resolve_col(VIEW_RECOMMEND, cols_rc, ["market_scale", "scale", "市場規模"], False)
+    m["recommend"] = rc
+
+    return m
 
 
 @st.cache_data(ttl=3600)
@@ -197,18 +377,13 @@ def role_table_has_login_code(_client: bigquery.Client) -> bool:
     return not df.empty
 
 
+# -----------------------------
+# 3.2 Customer Group resolution (踏襲)
+# -----------------------------
 @st.cache_data(ttl=3600)
 def get_unified_columns(_client: bigquery.Client) -> set[str]:
-    project_id, dataset_id, table_name = _split_table_fqn(VIEW_UNIFIED)
-    sql = f"""
-        SELECT column_name
-        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS`
-        WHERE table_name = @table_name
-    """
-    df = query_df_safe(_client, sql, {"table_name": table_name}, "Unified Schema Check")
-    if df.empty or "column_name" not in df.columns:
-        return set()
-    return {str(c).lower() for c in df["column_name"].dropna().tolist()}
+    cols_u = get_table_columns_lower(_client, VIEW_UNIFIED)
+    return cols_u
 
 
 def get_available_customer_group_columns(_client: bigquery.Client) -> list[str]:
@@ -229,8 +404,8 @@ def get_customer_group_column_profiles(_client: bigquery.Client) -> pd.DataFrame
             SELECT
               '{col}' AS column_name,
               COUNT(*) AS total_rows,
-              COUNTIF(COALESCE(NULLIF(CAST({col} AS STRING), ''), '') != '') AS non_null_rows,
-              COUNT(DISTINCT NULLIF(CAST({col} AS STRING), '')) AS distinct_groups
+              COUNTIF(COALESCE(NULLIF(CAST({bq_ident(col)} AS STRING), ''), '') != '') AS non_null_rows,
+              COUNT(DISTINCT NULLIF(CAST({bq_ident(col)} AS STRING), '')) AS distinct_groups
             FROM `{VIEW_UNIFIED}`
             """
         )
@@ -283,6 +458,146 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
     return None, None
 
 
+# -----------------------------
+# 3.3 Admin full scan policy (段階UI)
+# -----------------------------
+def get_admin_scan_policy(role: RoleInfo) -> AdminScanPolicy:
+    """
+    管理者のフルスキャン統制。
+    - 通常：scope必須
+    - 例外：明示許可（チェック）＋ maxBytes設定 ＋（推定→実行の順）
+    """
+    if not role.role_admin_view:
+        return AdminScanPolicy(require_scope=False, allow_full_scan=False, max_bytes_billed=0, must_estimate_before_run=False)
+
+    # UIで設定可能にする（ただしデフォルトは安全寄り）
+    with st.sidebar.expander("🛡️ 管理者フルスキャン統制（必読）", expanded=False):
+        st.caption("スコープ未指定＝全社フルスキャンです。実働保護のため推定→上限→実行の順で統制します。")
+        allow_full_scan = st.checkbox("スコープ未指定のフルスキャンを許可する（例外）", value=False, key="admin_allow_full_scan")
+        must_estimate = st.checkbox("フルスキャン時は推定（DryRun）を必須にする", value=True, key="admin_must_estimate")
+
+        usd_per_tb = st.number_input("推定単価（USD / TB）", min_value=0.0, max_value=50.0, value=float(st.session_state.get("usd_per_tb", DEFAULT_USD_PER_TB)), step=0.5)
+        usd_jpy = st.number_input("為替レート（USDJPY）", min_value=50.0, max_value=300.0, value=float(st.session_state.get("usd_jpy", DEFAULT_USDJPY)), step=1.0)
+        st.session_state["usd_per_tb"] = float(usd_per_tb)
+        st.session_state["usd_jpy"] = float(usd_jpy)
+
+        max_gb = st.number_input("maximumBytesBilled 上限（GB）", min_value=0, max_value=5000, value=int(st.session_state.get("admin_max_gb", 200)), step=50)
+        st.session_state["admin_max_gb"] = int(max_gb)
+
+        if max_gb == 0:
+            st.warning("上限0GB＝上限なし（非推奨）。実働保護の観点では上限設定を推奨。")
+
+    max_bytes = int(st.session_state.get("admin_max_gb", 200)) * (1024 ** 3)
+    if int(st.session_state.get("admin_max_gb", 200)) == 0:
+        max_bytes = 0
+
+    return AdminScanPolicy(
+        require_scope=True,
+        allow_full_scan=bool(st.session_state.get("admin_allow_full_scan", False)),
+        max_bytes_billed=max_bytes,
+        must_estimate_before_run=bool(st.session_state.get("admin_must_estimate", True)),
+    )
+
+
+def guard_and_run_query_ui(
+    client: bigquery.Client,
+    role: RoleInfo,
+    scope: ScopeFilter,
+    sql: str,
+    params: Optional[Dict[str, Any]],
+    label: str,
+    *,
+    risky_if_no_scope: bool = True,
+    force_estimate: bool = False,
+    timeout_sec: int = 120,
+) -> pd.DataFrame:
+    """
+    段階UI：
+    - 推定（DryRun）
+    - max bytes billed 設定（管理者フルスキャン時）
+    - 実行
+    """
+    policy = get_admin_scan_policy(role)
+
+    is_admin = role.role_admin_view
+    scope_empty = scope.is_empty()
+
+    # 管理者スコープ必須（デフォルト）
+    if is_admin and policy.require_scope and scope_empty and risky_if_no_scope and (not policy.allow_full_scan):
+        st.warning("⚠️ 管理者はスコープ必須です。スコープを指定するか、サイドバーで『フルスキャン例外許可』をONにしてください。")
+        return pd.DataFrame()
+
+    # max bytes billed（管理者のみ）
+    max_bytes = None
+    if is_admin and scope_empty and policy.allow_full_scan and risky_if_no_scope:
+        if policy.max_bytes_billed and policy.max_bytes_billed > 0:
+            max_bytes = policy.max_bytes_billed
+        else:
+            max_bytes = None  # 上限なし（非推奨）
+
+    # 推定は「危険条件」または「強制」で出す
+    need_estimate = force_estimate or (is_admin and scope_empty and policy.allow_full_scan and risky_if_no_scope)
+    if need_estimate:
+        st.markdown("##### 🧮 推定（Dry Run）")
+        colA, colB, colC = st.columns([1, 1, 2])
+
+        estimate_key = f"estimate_bytes::{label}"
+        ran_key = f"estimate_ran::{label}"
+
+        if colA.button("推定する（DryRun）", key=f"btn_est_{label}", use_container_width=True):
+            b = estimate_query_bytes(client, sql, params, label=label)
+            st.session_state[estimate_key] = b if b is not None else 0
+            st.session_state[ran_key] = True
+
+        b_est = int(st.session_state.get(estimate_key, 0) or 0)
+        ran = bool(st.session_state.get(ran_key, False))
+
+        if ran:
+            usd_per_tb = float(st.session_state.get("usd_per_tb", DEFAULT_USD_PER_TB))
+            usd_jpy = float(st.session_state.get("usd_jpy", DEFAULT_USDJPY))
+            jpy = estimate_cost_jpy(b_est, usd_per_tb, usd_jpy)
+
+            colB.metric("推定処理量", bytes_to_human(b_est))
+            colC.metric("推定コスト（目安）", f"¥{jpy:,.0f}")
+
+            if max_bytes is not None:
+                st.info(f"maximumBytesBilled: {bytes_to_human(max_bytes)}（管理者フルスキャン統制）")
+
+            # 推定必須ポリシー
+            if is_admin and scope_empty and policy.allow_full_scan and policy.must_estimate_before_run:
+                st.success("推定が完了しました。実行できます。")
+        else:
+            st.caption("フルスキャンや全件表示では、まず推定を実行してください。")
+
+        # 推定必須のときは、推定なしでは実行不可
+        if is_admin and scope_empty and policy.allow_full_scan and policy.must_estimate_before_run:
+            if not ran:
+                st.error("推定が必須です（未実行のため、実行ボタンは無効）。")
+                return pd.DataFrame()
+
+    st.markdown("##### ▶ 実行")
+    run_disabled = False
+    if is_admin and scope_empty and policy.allow_full_scan and policy.must_estimate_before_run and need_estimate:
+        ran = bool(st.session_state.get(f"estimate_ran::{label}", False))
+        if not ran:
+            run_disabled = True
+
+    if st.button(f"実行：{label}", key=f"btn_run_{label}", use_container_width=True, disabled=run_disabled):
+        return query_df_safe(
+            client,
+            sql,
+            params=params,
+            label=label,
+            timeout_sec=timeout_sec,
+            maximum_bytes_billed=max_bytes,
+        )
+
+    return pd.DataFrame()
+
+
+# -----------------------------
+# 3.4 Scope filters (踏襲＋安全補強)
+# -----------------------------
 def render_scope_filters(client: bigquery.Client, role: RoleInfo) -> ScopeFilter:
     st.markdown("### 🔍 分析スコープ設定")
     predicates: list[str] = []
@@ -355,7 +670,7 @@ def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> 
         return RoleInfo(login_email=login_email)
 
     row = df.iloc[0]
-    raw_role = str(row["role_tier"]).strip().upper()
+    raw_role = str(row.get("role_tier", "")).strip().upper()
     is_admin = any(x in raw_role for x in ["ADMIN", "MANAGER", "HQ"])
 
     return RoleInfo(
@@ -468,9 +783,6 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str) -> None:
 def render_group_underperformance_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
 
-    if "group_perf_mode" not in st.session_state:
-        st.session_state.group_perf_mode = "ワースト"
-
     c1, c2 = st.columns(2)
     view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True)
     mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True)
@@ -538,6 +850,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             LIMIT 50
         """
 
+    # 親ランキングは軽いので通常実行
     df_parent = query_df_safe(client, sql_parent, params, f"Parent Perf {perf_view}")
     if df_parent.empty:
         st.info("表示できるデータがありません。")
@@ -614,7 +927,7 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
         pass
 
     if selected_parent_id:
-        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件一覧）")
+        st.markdown(f"#### 🔍 要因分析（商品ベース {perf_mode}・全件一覧）")
 
         drill_params = dict(params)
 
@@ -667,12 +980,23 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
             WHERE ty_sales > 0 OR py_sales > 0
             ORDER BY sales_diff_yoy {sort_order}
         """
-        df_drill = query_df_safe(client, sql_drill, drill_params, "Parent Drilldown")
+
+        # ここは全件の可能性があるので、管理者フルスキャン統制を適用（スコープなしは危険）
+        df_drill = guard_and_run_query_ui(
+            client,
+            role,
+            scope,
+            sql_drill,
+            drill_params,
+            label=f"要因分析（{selected_parent_name}）",
+            risky_if_no_scope=True,
+            force_estimate=False,
+            timeout_sec=180,
+        )
 
         if not df_drill.empty:
             df_drill["product_name"] = df_drill["product_name"].apply(normalize_product_display_name)
             df_drill = df_drill.fillna(0)
-
             df_drill.insert(0, "要因順位", [get_parent_rank_icon(i + 1, perf_mode) for i in range(len(df_drill))])
 
             st.dataframe(
@@ -689,11 +1013,9 @@ def render_group_underperformance_section(client: bigquery.Client, role: RoleInf
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
-            st.info("要因データが見つかりません。")
 
 
-def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
+def render_yoy_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("📊 年間 YoY ランキング（成分・YJ優先｜YJ=0/nullはJANキーで追跡）")
 
     if "yoy_mode" not in st.session_state:
@@ -708,13 +1030,13 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     def load_yoy(mode_name: str) -> None:
         st.session_state.yoy_mode = mode_name
 
-        role_filter = "" if is_admin else "login_email = @login_email"
+        role_filter = "" if role.role_admin_view else "login_email = @login_email"
         scope_where = scope.where_clause()
         where_sql = _compose_where(role_filter, scope_where)
 
         params: Dict[str, Any] = dict(scope.params or {})
-        if not is_admin:
-            params["login_email"] = login_email
+        if not role.role_admin_view:
+            params["login_email"] = role.login_email
 
         if mode_name == "ワースト":
             diff_filter = "py_sales > 0 AND (ty_sales - py_sales) < 0"
@@ -767,6 +1089,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             ORDER BY {order_by}
             LIMIT 100
         """
+
+        # ランキングは100件固定で比較的軽量。ここは通常実行。
         st.session_state.yoy_df = query_df_safe(client, sql, params, f"YoY Load {mode_name}")
 
     with c1:
@@ -811,7 +1135,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         pass
 
     st.divider()
-
     st.header("🔍 第二階層：詳細分析（スコープ内）")
 
     key_opts = ["全成分を表示"] + list(df_rank["yj_key"].astype(str).unique())
@@ -832,12 +1155,18 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     )
     st.session_state.selected_yoy_key = selected_key
 
-    role_filter = "" if is_admin else "login_email = @login_email"
+    # 全件表示統制（段階UI）
+    st.markdown("##### 📌 全件表示（LIMITなし）オプション")
+    full1, full2 = st.columns([1, 2])
+    show_all = full1.checkbox("全件表示（LIMITなし）", value=False, key="yoy_show_all")
+    st.caption("※ 全件表示は重くなります。管理者でスコープ未指定の場合、推定→上限→実行を強制します。")
+
+    role_filter = "" if role.role_admin_view else "login_email = @login_email"
     scope_where = scope.where_clause()
 
     params: Dict[str, Any] = dict(scope.params or {})
-    if not is_admin:
-        params["login_email"] = login_email
+    if not role.role_admin_view:
+        params["login_email"] = role.login_email
 
     key_filter = ""
     if selected_key != "全成分を表示":
@@ -854,7 +1183,9 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     where_sql = _compose_where(role_filter, scope_where, key_filter)
     sort_order = "ASC" if st.session_state.yoy_mode == "ワースト" else "DESC"
 
+    # ---- 得意先別内訳
     st.markdown("#### 🧾 得意先別内訳（前年差額）")
+    limit_sql = "" if show_all else "LIMIT 50"
     sql_cust = f"""
       WITH fy AS (
         SELECT
@@ -879,9 +1210,20 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
       FROM base
       WHERE ty_sales != 0 OR py_sales != 0
       ORDER BY `前年差額` {sort_order}
-      LIMIT 50
+      {limit_sql}
     """
-    df_cust = query_df_safe(client, sql_cust, params, "YoY Detail Customers")
+
+    df_cust = guard_and_run_query_ui(
+        client,
+        role,
+        scope,
+        sql_cust,
+        params,
+        label="YoY 詳細：得意先別内訳",
+        risky_if_no_scope=True,
+        force_estimate=show_all,
+        timeout_sec=180,
+    )
     if not df_cust.empty:
         st.dataframe(
             df_cust.fillna(0).style.format(
@@ -890,9 +1232,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             use_container_width=True,
             hide_index=True,
         )
-    else:
-        st.info("得意先別内訳がありません。")
 
+    # ---- JAN・商品別
     st.markdown("#### 🧪 原因追及：JAN・商品別（前年差額寄与）")
     sql_jan = f"""
       WITH fy AS (
@@ -922,8 +1263,20 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
       FROM base
       WHERE ty_sales != 0 OR py_sales != 0
       ORDER BY `前年差額` {sort_order}
+      {"" if show_all else "LIMIT 500"}
     """
-    df_jan = query_df_safe(client, sql_jan, params, "YoY Detail JAN")
+
+    df_jan = guard_and_run_query_ui(
+        client,
+        role,
+        scope,
+        sql_jan,
+        params,
+        label="YoY 詳細：JAN・商品別",
+        risky_if_no_scope=True,
+        force_estimate=show_all,
+        timeout_sec=240,
+    )
     if not df_jan.empty:
         st.dataframe(
             df_jan.fillna(0).style.format(
@@ -932,9 +1285,8 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             use_container_width=True,
             hide_index=True,
         )
-    else:
-        st.info("JAN別内訳がありません。")
 
+    # ---- 月次推移
     st.markdown("#### 📅 原因追及：月次推移（前年差額）")
     sql_month = f"""
       WITH fy AS (
@@ -960,7 +1312,17 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
       FROM base
       ORDER BY `年月`
     """
-    df_month = query_df_safe(client, sql_month, params, "YoY Detail Month")
+    df_month = guard_and_run_query_ui(
+        client,
+        role,
+        scope,
+        sql_month,
+        params,
+        label="YoY 詳細：月次推移",
+        risky_if_no_scope=True,
+        force_estimate=False,
+        timeout_sec=180,
+    )
     if not df_month.empty:
         st.dataframe(
             df_month.fillna(0).style.format(
@@ -969,30 +1331,68 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
             use_container_width=True,
             hide_index=True,
         )
-    else:
-        st.info("月次推移がありません。")
 
 
-def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+def render_new_deliveries_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
+
+    cols = resolve_view_columns_map(client)["new_delivery"]
+    # 列名差異吸収：必須列が解決できない場合は「動かない」ので、ここで明示して落とす（実働破壊回避）
+    required = ["first_sales_date", "customer_code", "jan_code", "sales_amount", "gross_profit"]
+    if any(not cols.get(k) for k in required):
+        st.error("新規納品VIEWの列名が解決できません。VIEW_NEW_DELIVERYのスキーマを確認してください。")
+        st.code(str(cols))
+        return
+
+    fsd = cols["first_sales_date"]
+    cust = cols["customer_code"]
+    jan = cols["jan_code"]
+    sa = cols["sales_amount"]
+    gp = cols["gross_profit"]
+    le = cols.get("login_email")  # 無い場合あり
+
     if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
-        where_ext = "" if is_admin else "AND login_email = @login_email"
-        params = None if is_admin else {"login_email": login_email}
+        where_ext = ""
+        params = dict(scope.params or {})
+        scope_clause = scope.where_clause()
+        # scopeはVIEW_UNIFIED前提のため、NEW_DELIVERYに直接当てるのは危険（列が無い可能性）。
+        # ここでは「実働維持」を優先し、NEW_DELIVERYではスコープ（顧客名LIKE/グループ）を適用しない。
+        # 代わりに、担当者制限のみ（存在する場合のみ）を適用。
+        if not role.role_admin_view and le:
+            where_ext = f"AND {bq_ident(le)} = @login_email"
+            params["login_email"] = role.login_email
 
         sql = f"""
         WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
         SELECT
-          '① 昨日' AS `期間`, COUNT(DISTINCT customer_code) AS `得意先数`, COUNT(DISTINCT jan_code) AS `品目数`, SUM(sales_amount) AS `売上`, SUM(gross_profit) AS `粗利`
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
+          '① 昨日' AS `期間`,
+          COUNT(DISTINCT {bq_ident(cust)}) AS `得意先数`,
+          COUNT(DISTINCT {bq_ident(jan)}) AS `品目数`,
+          SUM({bq_ident(sa)}) AS `売上`,
+          SUM({bq_ident(gp)}) AS `粗利`
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE {bq_ident(fsd)} = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
         UNION ALL
-        SELECT '② 直近7日', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
+        SELECT
+          '② 直近7日',
+          COUNT(DISTINCT {bq_ident(cust)}),
+          COUNT(DISTINCT {bq_ident(jan)}),
+          SUM({bq_ident(sa)}),
+          SUM({bq_ident(gp)})
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE {bq_ident(fsd)} >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
         UNION ALL
-        SELECT '③ 当月', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE DATE_TRUNC(first_sales_date, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
+        SELECT
+          '③ 当月',
+          COUNT(DISTINCT {bq_ident(cust)}),
+          COUNT(DISTINCT {bq_ident(jan)}),
+          SUM({bq_ident(sa)}),
+          SUM({bq_ident(gp)})
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE DATE_TRUNC({bq_ident(fsd)}, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
         ORDER BY `期間`
         """
-        df_new = query_df_safe(client, sql, params, label="New Deliveries")
+        df_new = query_df_safe(client, sql, params if params else None, label="New Deliveries")
 
         if not df_new.empty:
             df_new[["売上", "粗利"]] = df_new[["売上", "粗利"]].fillna(0)
@@ -1005,31 +1405,65 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
             st.info("新規納品データがありません。")
 
 
-def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
+def render_adoption_alerts_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🚨 採用アイテム・失注アラート")
-    where_clause = "" if is_admin else "WHERE login_email = @login_email"
-    params = None if is_admin else {"login_email": login_email}
+
+    cols = resolve_view_columns_map(client)["adoption"]
+    required = ["customer_name", "product_name", "last_purchase_date", "adoption_status", "current_fy_sales", "previous_fy_sales"]
+    if any(not cols.get(k) for k in required):
+        st.error("採用アラートVIEWの列名が解決できません。VIEW_ADOPTIONのスキーマを確認してください。")
+        st.code(str(cols))
+        return
+
+    staff = cols.get("staff_name")
+    cust = cols["customer_name"]
+    prod = cols["product_name"]
+    lastd = cols["last_purchase_date"]
+    stat = cols["adoption_status"]
+    cur = cols["current_fy_sales"]
+    py = cols["previous_fy_sales"]
+    le = cols.get("login_email")
+
+    where_clause = ""
+    params = dict(scope.params or {})
+    # scopeはVIEW_UNIFIED前提。ADOPTIONに直接当てると壊れる可能性があるので「実働維持」優先で適用しない。
+    # 代わりに担当者制限のみ（存在する場合のみ）。
+    if (not role.role_admin_view) and le:
+        where_clause = f"WHERE {bq_ident(le)} = @login_email"
+        params["login_email"] = role.login_email
+
     sql = f"""
         SELECT
-            staff_name AS `担当者名`,
-            customer_name AS `得意先名`,
-            product_name AS `商品名`,
-            last_purchase_date AS `最終購入日`,
-            adoption_status AS `ステータス`,
-            current_fy_sales AS `今期売上`,
-            previous_fy_sales AS `前期売上`,
-            (current_fy_sales - previous_fy_sales) AS `売上差額`
+            {bq_ident(staff) if staff else "'未設定'"} AS `担当者名`,
+            {bq_ident(cust)} AS `得意先名`,
+            {bq_ident(prod)} AS `商品名`,
+            {bq_ident(lastd)} AS `最終購入日`,
+            {bq_ident(stat)} AS `ステータス`,
+            {bq_ident(cur)} AS `今期売上`,
+            {bq_ident(py)} AS `前期売上`,
+            ({bq_ident(cur)} - {bq_ident(py)}) AS `売上差額`
         FROM `{VIEW_ADOPTION}`
         {where_clause}
         ORDER BY
             CASE
-                WHEN adoption_status LIKE '%🔴%' THEN 1
-                WHEN adoption_status LIKE '%🟡%' THEN 2
+                WHEN CAST({bq_ident(stat)} AS STRING) LIKE '%🔴%' THEN 1
+                WHEN CAST({bq_ident(stat)} AS STRING) LIKE '%🟡%' THEN 2
                 ELSE 3
             END,
             `売上差額` ASC
     """
-    df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
+
+    df_alerts = guard_and_run_query_ui(
+        client,
+        role,
+        scope,
+        sql,
+        params if params else None,
+        label="採用・失注アラート",
+        risky_if_no_scope=True,
+        force_estimate=False,
+        timeout_sec=180,
+    )
     if df_alerts.empty:
         st.info("現在、アラート対象のアイテムはありません。")
         return
@@ -1040,7 +1474,7 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
         selected_status = st.multiselect(
             "🎯 ステータスで絞り込み",
             options=df_alerts["ステータス"].unique(),
-            default=[s for s in df_alerts["ステータス"].unique() if "🟡" in s or "🔴" in s],
+            default=[s for s in df_alerts["ステータス"].unique() if "🟡" in str(s) or "🔴" in str(s)],
         )
     with col2:
         all_staffs = sorted(df_alerts["担当者名"].unique().tolist())
@@ -1073,23 +1507,40 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
     )
 
 
-def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter) -> None:
+def render_customer_drilldown(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🎯 担当先ドリルダウン ＆ 提案（Reco）")
 
-    role_filter = "" if is_admin else "login_email = @login_email"
+    cols_map = resolve_view_columns_map(client)
+    u = cols_map["unified"]
+    r = cols_map["recommend"]
+    a = cols_map["adoption"]
+
+    # --- 得意先一覧（VIEW_UNIFIED：スコープ適用OK）
+    role_filter = "" if role.role_admin_view else f"{bq_ident(u['login_email'])} = @login_email"
     scope_filter = scope.where_clause()
-    customer_where = _compose_where(role_filter, scope_filter, "customer_name IS NOT NULL")
+    customer_where = _compose_where(role_filter, scope_filter, f"{bq_ident(u['customer_name'])} IS NOT NULL")
 
     customer_params: Dict[str, Any] = dict(scope.params or {})
-    if not is_admin:
-        customer_params["login_email"] = login_email
+    if not role.role_admin_view:
+        customer_params["login_email"] = role.login_email
 
     sql_cust = f"""
-        SELECT DISTINCT customer_code, customer_name
+        SELECT DISTINCT {bq_ident(u['customer_code'])} AS customer_code, {bq_ident(u['customer_name'])} AS customer_name
         FROM `{VIEW_UNIFIED}`
         {customer_where}
+        LIMIT 2000
     """
-    df_cust = query_df_safe(client, sql_cust, customer_params, "Scoped Customers")
+    df_cust = guard_and_run_query_ui(
+        client,
+        role,
+        scope,
+        sql_cust,
+        customer_params,
+        label="得意先一覧（スコープ内）",
+        risky_if_no_scope=True,
+        force_estimate=False,
+        timeout_sec=120,
+    )
     if df_cust.empty:
         st.info("表示できる得意先データがありません。")
         return
@@ -1107,61 +1558,71 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
 
     st.divider()
     st.markdown("##### 📦 現在の採用アイテム（稼働状況）")
-    sql_adopt = f"""
-        SELECT
-            product_name AS `商品名`,
-            adoption_status AS `ステータス`,
-            last_purchase_date AS `最終購入日`,
-            current_fy_sales AS `今期売上`,
-            previous_fy_sales AS `前期売上`
-        FROM `{VIEW_ADOPTION}`
-        WHERE customer_code = @c
-        ORDER BY
-            CASE
-                WHEN adoption_status LIKE '%🟢%' THEN 1
-                WHEN adoption_status LIKE '%🟡%' THEN 2
-                ELSE 3
-            END,
-            current_fy_sales DESC
-    """
-    df_adopt = query_df_safe(client, sql_adopt, {"c": sel}, "Customer Adoption")
-    if not df_adopt.empty:
-        for col in ["今期売上", "前期売上"]:
-            df_adopt[col] = pd.to_numeric(df_adopt[col], errors="coerce").fillna(0)
-        st.dataframe(
-            df_adopt.style.format(
-                {
-                    "今期売上": "¥{:,.0f}",
-                    "前期売上": "¥{:,.0f}",
-                    "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+
+    # --- 採用データ（VIEW_ADOPTION：customer_code列が必要）
+    if not a.get("customer_code"):
+        st.warning("採用VIEWに customer_code が見当たりません。採用内訳の表示をスキップします。")
     else:
-        st.info("この得意先の採用データはありません。")
+        sql_adopt = f"""
+            SELECT
+                {bq_ident(a['product_name'])} AS `商品名`,
+                {bq_ident(a['adoption_status'])} AS `ステータス`,
+                {bq_ident(a['last_purchase_date'])} AS `最終購入日`,
+                {bq_ident(a['current_fy_sales'])} AS `今期売上`,
+                {bq_ident(a['previous_fy_sales'])} AS `前期売上`
+            FROM `{VIEW_ADOPTION}`
+            WHERE CAST({bq_ident(a['customer_code'])} AS STRING) = @c
+            ORDER BY
+                CASE
+                    WHEN CAST({bq_ident(a['adoption_status'])} AS STRING) LIKE '%🟢%' THEN 1
+                    WHEN CAST({bq_ident(a['adoption_status'])} AS STRING) LIKE '%🟡%' THEN 2
+                    ELSE 3
+                END,
+                `今期売上` DESC
+        """
+        df_adopt = query_df_safe(client, sql_adopt, {"c": str(sel)}, "Customer Adoption")
+        if not df_adopt.empty:
+            for col in ["今期売上", "前期売上"]:
+                df_adopt[col] = pd.to_numeric(df_adopt[col], errors="coerce").fillna(0)
+            st.dataframe(
+                df_adopt.style.format(
+                    {
+                        "今期売上": "¥{:,.0f}",
+                        "前期売上": "¥{:,.0f}",
+                        "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("この得意先の採用データはありません。")
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("##### 💡 AI 推奨提案商品（Reco）")
 
     # ★重要：VIEW_RECOMMEND.customer_code は INT64、VIEW_UNIFIED.customer_code は STRING
-    # → 照合は CAST(customer_code AS STRING) = @c で安全に統一
+    # → 照合は CAST(customer_code AS STRING) = @c で安全に統一（踏襲）
+    if not r.get("customer_code") or not r.get("priority_rank") or not r.get("recommend_product"):
+        st.warning("Reco VIEWの必要列が解決できません。Recoの表示をスキップします。")
+        st.code(str(r))
+        return
+
     sql_rec = f"""
         SELECT
-          customer_name,
-          strong_category,
-          priority_rank,
-          recommend_jan,
-          recommend_product,
-          manufacturer,
-          market_scale
+          {bq_ident(r['customer_name']) if r.get('customer_name') else "NULL"} AS customer_name,
+          {bq_ident(r['strong_category']) if r.get('strong_category') else "NULL"} AS strong_category,
+          {bq_ident(r['priority_rank'])} AS priority_rank,
+          {bq_ident(r['recommend_jan']) if r.get('recommend_jan') else "NULL"} AS recommend_jan,
+          {bq_ident(r['recommend_product'])} AS recommend_product,
+          {bq_ident(r['manufacturer']) if r.get('manufacturer') else "NULL"} AS manufacturer,
+          {bq_ident(r['market_scale']) if r.get('market_scale') else "NULL"} AS market_scale
         FROM `{VIEW_RECOMMEND}`
-        WHERE CAST(customer_code AS STRING) = @c
+        WHERE CAST({bq_ident(r['customer_code'])} AS STRING) = @c
         ORDER BY priority_rank ASC
         LIMIT 10
     """
-    df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
+    df_rec = query_df_safe(client, sql_rec, {"c": str(sel)}, "Recommendation")
     if not df_rec.empty:
         df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer", "strong_category", "market_scale"]].rename(
             columns={
@@ -1212,6 +1673,13 @@ def main() -> None:
         st.error("❌ ログイン情報が正しくありません。")
         return
 
+    # ここで一度、列名差異吸収の解決を走らせておく（実働での突然死を防ぐ）
+    try:
+        _ = resolve_view_columns_map(client)
+    except Exception as e:
+        st.error(f"列名自動解決の初期化でエラー: {e}")
+        return
+
     st.success(f"🔓 ログイン中: {role.staff_name} さん")
     c1, c2, c3 = st.columns(3)
     c1.metric("👤 担当", role.staff_name)
@@ -1219,7 +1687,7 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
-    # ★表示順序：サマリーを最上部に
+    # ★表示順序：サマリーを最上部に（踏襲）
     if role.role_admin_view:
         render_fytd_org_section(client)
     else:
@@ -1227,28 +1695,34 @@ def main() -> None:
 
     st.divider()
 
-    # ★表示順序：その下にスコープ設定
+    # ★表示順序：その下にスコープ設定（踏襲）
     scope = render_scope_filters(client, role)
     st.divider()
 
+    # 管理者統制の説明（明示）
+    if role.role_admin_view and scope.is_empty():
+        st.warning("管理者スコープ未指定＝全社フルスキャンの可能性があります。必要に応じてサイドバーの統制設定を確認してください。")
+        st.caption("（推定→上限→実行の統制は、重い/全件系クエリで自動適用されます）")
+
+    # ---- sections（踏襲＋追加）
     if role.role_admin_view:
         render_group_underperformance_section(client, role, scope)
         st.divider()
-        render_yoy_section(client, role.login_email, is_admin=True, scope=scope)
+        render_yoy_section(client, role, scope)
         st.divider()
-        render_new_deliveries_section(client, role.login_email, is_admin=True)
+        render_new_deliveries_section(client, role, scope)
         st.divider()
-        render_adoption_alerts_section(client, role.login_email, is_admin=True)
+        render_adoption_alerts_section(client, role, scope)
         st.divider()
-        render_customer_drilldown(client, role.login_email, is_admin=True, scope=scope)
+        render_customer_drilldown(client, role, scope)
     else:
-        render_yoy_section(client, role.login_email, is_admin=False, scope=scope)
+        render_yoy_section(client, role, scope)
         st.divider()
-        render_new_deliveries_section(client, role.login_email, is_admin=False)
+        render_new_deliveries_section(client, role, scope)
         st.divider()
-        render_adoption_alerts_section(client, role.login_email, is_admin=False)
+        render_adoption_alerts_section(client, role, scope)
         st.divider()
-        render_customer_drilldown(client, role.login_email, is_admin=False, scope=scope)
+        render_customer_drilldown(client, role, scope)
 
 
 if __name__ == "__main__":
