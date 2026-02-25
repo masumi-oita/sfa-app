@@ -761,17 +761,13 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
             render_summary_metrics(df_me.iloc[0])
 
 
-def render_group_underperformance_section(
-    client: bigquery.Client,
-    role: RoleInfo,
-    scope: ScopeFilter,
-    colmap: Dict[str, Dict[str, str]],
-) -> None:
+def render_group_underperformance_section(client: bigquery.Client, role: RoleInfo, scope: ScopeFilter) -> None:
     st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
 
+    # --- UI（親：グループ/得意先、ベスト/ワースト） ---
     c1, c2 = st.columns(2)
-    view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True)
-    mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True)
+    view_choice = c1.radio("📊 分析の単位", ["🏢 グループ別", "🏥 得意先単体"], horizontal=True, key="grpperf_view_choice")
+    mode_choice = c2.radio("🏆 ランキング基準", ["📉 下落幅ワースト", "📈 上昇幅ベスト"], horizontal=True, key="grpperf_mode_choice")
 
     perf_view = "グループ別" if "グループ別" in view_choice else "得意先別"
     perf_mode = "ワースト" if "ワースト" in mode_choice else "ベスト"
@@ -782,16 +778,8 @@ def render_group_underperformance_section(
         st.info("グループ分析に利用できる列が見つかりません（VIEW_UNIFIEDにグループ列がありません）。")
         return
 
-    u = colmap["unified"]
-    login_col = bq_ident(u["login_email"])
-    customer_code = bq_ident(u["customer_code"])
-    customer_name = bq_ident(u["customer_name"])
-    sales_date = bq_ident(u["sales_date"])
-    fiscal_year = bq_ident(u["fiscal_year"])
-    sales_amount = bq_ident(u["sales_amount"])
-    gross_profit = bq_ident(u["gross_profit"])
-
-    role_filter = "" if role.role_admin_view else f"{login_col} = @login_email"
+    # --- フィルタ組立 ---
+    role_filter = "" if role.role_admin_view else "login_email = @login_email"
     scope_filter_clause = scope.where_clause()
     filter_sql = _compose_where(role_filter, scope_filter_clause)
 
@@ -799,6 +787,7 @@ def render_group_underperformance_section(
     if not role.role_admin_view:
         params["login_email"] = role.login_email
 
+    # --- 親ランキングSQL ---
     if perf_view == "グループ別":
         sql_parent = f"""
             WITH fy AS (
@@ -809,10 +798,10 @@ def render_group_underperformance_section(
             )
             SELECT
               {group_expr} AS `名称`,
-              SUM(CASE WHEN {fiscal_year} = current_fy THEN {sales_amount} ELSE 0 END) AS `今期売上`,
-              SUM(CASE WHEN {fiscal_year} = current_fy - 1 AND {sales_date} <= py_today THEN {sales_amount} ELSE 0 END) AS `前年同期売上`,
-              SUM(CASE WHEN {fiscal_year} = current_fy THEN {gross_profit} ELSE 0 END) AS `今期粗利`,
-              SUM(CASE WHEN {fiscal_year} = current_fy - 1 AND {sales_date} <= py_today THEN {gross_profit} ELSE 0 END) AS `前年同期粗利`
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS `前年同期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS `今期粗利`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS `前年同期粗利`
             FROM `{VIEW_UNIFIED}`
             CROSS JOIN fy
             {filter_sql}
@@ -830,12 +819,12 @@ def render_group_underperformance_section(
                 DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
             )
             SELECT
-              CAST({customer_code} AS STRING) AS `コード`,
-              ANY_VALUE(CAST({customer_name} AS STRING)) AS `名称`,
-              SUM(CASE WHEN {fiscal_year} = current_fy THEN {sales_amount} ELSE 0 END) AS `今期売上`,
-              SUM(CASE WHEN {fiscal_year} = current_fy - 1 AND {sales_date} <= py_today THEN {sales_amount} ELSE 0 END) AS `前年同期売上`,
-              SUM(CASE WHEN {fiscal_year} = current_fy THEN {gross_profit} ELSE 0 END) AS `今期粗利`,
-              SUM(CASE WHEN {fiscal_year} = current_fy - 1 AND {sales_date} <= py_today THEN {gross_profit} ELSE 0 END) AS `前年同期粗利`
+              customer_code AS `コード`,
+              ANY_VALUE(customer_name) AS `名称`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS `今期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS `前年同期売上`,
+              SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS `今期粗利`,
+              SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS `前年同期粗利`
             FROM `{VIEW_UNIFIED}`
             CROSS JOIN fy
             {filter_sql}
@@ -850,6 +839,7 @@ def render_group_underperformance_section(
         st.info("表示できるデータがありません。")
         return
 
+    # --- 表示用の派生列 ---
     df_parent["売上差額"] = df_parent["今期売上"] - df_parent["前年同期売上"]
     df_parent["売上成長率"] = df_parent.apply(
         lambda r: ((r["今期売上"] / r["前年同期売上"] - 1) * 100) if r["前年同期売上"] else 0,
@@ -880,6 +870,15 @@ def render_group_underperformance_section(
     if perf_view == "グループ別" and group_src:
         st.caption(f"抽出元グループ列: `{group_src}`")
 
+    # ★重要：選択状態を永続化（☑などでrerunしてもドリルダウンが消えない）
+    sel_state_key = f"grpperf_selected_id::{perf_view}::{perf_mode}"
+    sel_name_key = f"grpperf_selected_name::{perf_view}::{perf_mode}"
+
+    if st.button("選択解除（ドリルダウンを閉じる）", key=f"grpperf_clear::{perf_view}::{perf_mode}"):
+        st.session_state.pop(sel_state_key, None)
+        st.session_state.pop(sel_name_key, None)
+        st.rerun()
+
     event = st.dataframe(
         df_parent.style.format(
             {
@@ -896,11 +895,12 @@ def render_group_underperformance_section(
         hide_index=True,
         selection_mode="single-row",
         on_select="rerun",
-        key=f"grid_parent_{perf_view}_{perf_mode}",
+        key=f"grid_parent::{perf_view}::{perf_mode}",
     )
 
-    selected_parent_id = None
-    selected_parent_name = None
+    # --- 選択の取得（取れたら保存、取れないrerunでは保存値を使う） ---
+    selected_parent_id = st.session_state.get(sel_state_key)
+    selected_parent_name = st.session_state.get(sel_name_key)
 
     try:
         sel_rows = []
@@ -917,36 +917,26 @@ def render_group_underperformance_section(
             else:
                 selected_parent_id = str(df_parent.iloc[idx]["コード"])
                 selected_parent_name = str(df_parent.iloc[idx]["名称"])
+
+            st.session_state[sel_state_key] = selected_parent_id
+            st.session_state[sel_name_key] = selected_parent_name
     except Exception:
         pass
 
+    # --- ドリルダウン（要因＝品目） ---
     if not selected_parent_id:
+        st.info("上の表からグループ/得意先を1件クリックすると、品目要因（ドリルダウン）が表示されます。")
         return
 
-    st.markdown(f"#### 🔍 要因分析（商品ベース {perf_mode}・全件/段階UI対応）")
-
-    # 列名差異吸収（YJ/JAN/包装/商品名）
-    yj_col = bq_ident(u["yj_code"])
-    jan_col = bq_ident(u["jan_code"])
-    prod_col = bq_ident(u["product_name"])
-    pack_col = bq_ident(u["package_unit"])
-
-    # 全件（重い）になりやすいので段階UI + LIMIT可変
-    with st.expander("全件表示設定（重い場合は制限推奨）", expanded=False):
-        limit_mode = st.radio("表示件数", ["上位/下位のみ（推奨）", "全件（危険）"], horizontal=True, key=f"drill_limit_mode_{perf_view}_{perf_mode}")
-        if limit_mode == "上位/下位のみ（推奨）":
-            drill_limit = st.slider("取得件数（要因商品）", min_value=50, max_value=2000, value=300, step=50, key=f"drill_limit_{perf_view}_{perf_mode}")
-        else:
-            drill_limit = 0  # no limit
+    st.markdown(f"#### 🔍 要因分析（商品ベース {perf_mode}・全件一覧）")
 
     drill_params = dict(params)
+    drill_params["parent_id"] = selected_parent_id
+
     if perf_view == "グループ別":
         drill_filter_sql = _compose_where(role_filter, scope_filter_clause, f"{group_expr} = @parent_id")
     else:
-        drill_filter_sql = _compose_where(role_filter, scope_filter_clause, f"CAST({customer_code} AS STRING) = @parent_id")
-    drill_params["parent_id"] = selected_parent_id
-
-    limit_sql = f"LIMIT {int(drill_limit)}" if drill_limit and drill_limit > 0 else ""
+        drill_filter_sql = _compose_where(role_filter, scope_filter_clause, "customer_code = @parent_id")
 
     sql_drill = f"""
         WITH fy AS (
@@ -959,13 +949,13 @@ def render_group_underperformance_section(
         base_raw AS (
           SELECT
             COALESCE(
-              NULLIF(NULLIF(TRIM(CAST({yj_col} AS STRING)), ''), '0'),
-              NULLIF(NULLIF(TRIM(CAST({jan_col} AS STRING)), ''), '0'),
-              TRIM(CAST({prod_col} AS STRING))
+              NULLIF(NULLIF(TRIM(CAST(yj_code AS STRING)), ''), '0'),
+              NULLIF(NULLIF(TRIM(CAST(jan_code AS STRING)), ''), '0'),
+              TRIM(CAST(product_name AS STRING))
             ) AS yj_key,
-            REGEXP_REPLACE(CAST({prod_col} AS STRING), r"[/／].*$", "") AS product_base,
-            SUM(CASE WHEN {fiscal_year} = current_fy THEN {sales_amount} ELSE 0 END) AS ty_sales,
-            SUM(CASE WHEN {fiscal_year} = current_fy - 1 AND {sales_date} <= py_today THEN {sales_amount} ELSE 0 END) AS py_sales
+            REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "") AS product_base,
+            SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
+            SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS py_sales
           FROM `{VIEW_UNIFIED}`
           CROSS JOIN fy
           {drill_filter_sql}
@@ -989,28 +979,16 @@ def render_group_underperformance_section(
         FROM base
         WHERE ty_sales > 0 OR py_sales > 0
         ORDER BY sales_diff_yoy {sort_order}
-        {limit_sql}
     """
 
-    # drillは重い可能性があるので、管理者 & スコープ無しなら段階UI必須
-    df_drill = guard_and_run_query_ui(
-        client,
-        role,
-        scope,
-        sql_drill,
-        drill_params,
-        label=f"要因分析（{perf_view}/{perf_mode}）",
-        risky_if_no_scope=True,
-        force_estimate=(drill_limit == 0),  # 全件指定なら推定を促す
-        timeout_sec=180,
-    )
-
+    df_drill = query_df_safe(client, sql_drill, drill_params, "Parent Drilldown")
     if df_drill.empty:
         st.info("要因データが見つかりません。")
         return
 
     df_drill["product_name"] = df_drill["product_name"].apply(normalize_product_display_name)
     df_drill = df_drill.fillna(0)
+
     df_drill.insert(0, "要因順位", [get_parent_rank_icon(i + 1, perf_mode) for i in range(len(df_drill))])
 
     st.dataframe(
@@ -1021,9 +999,7 @@ def render_group_underperformance_section(
                 "py_sales_amount": "前年同期売上",
                 "sales_diff_yoy": "前年比差額",
             }
-        ).style.format(
-            {"今期売上": "¥{:,.0f}", "前年同期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}
-        ),
+        ).style.format({"今期売上": "¥{:,.0f}", "前年同期売上": "¥{:,.0f}", "前年比差額": "¥{:,.0f}"}),
         use_container_width=True,
         hide_index=True,
     )
