@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.9 (v1.4.8踏襲 + ColMap統合パッチ)
+SFA｜戦略ダッシュボード - OS v1.4.10 (v1.4.9踏襲 + 新規納品トレンド追加)
 
-【v1.4.8 踏襲】
+【v1.4.9 踏襲】
 - YoY：VIEW_UNIFIED から動的集計に統一（YJ同一で商品名が2行問題を抑止）
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
 - スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定
@@ -10,12 +10,16 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (v1.4.8踏襲 + ColMap統合パッ
 - 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
 - 新機能：順位アイコンの追加と、不要なYJコード列の非表示
 - 修正：WHERE二重エラー解消 ＆ 選択状態の消失バグ解消 ＆ 表示順序の最適化
-- ★修正：Reco（VIEW_RECOMMEND）の customer_code が INT64 のため、STRINGキー（VIEW_UNIFIED）と照合できるよう CAST 対応
+- 修正：Reco（VIEW_RECOMMEND）の customer_code が INT64 のため、STRINGキー（VIEW_UNIFIED）と照合できるよう CAST 対応
+- ColMap（列名吸収）導入：jan/jan_code、pack_unit/package_unit 等の差異を自動解決
+- 全SQLで colmap を貫通：列名揺れ起因の "Unrecognized name" を根絶
+- 必須列が見つからない場合は、起動直後に「不足列一覧」を明示して停止（沈黙しない）
 
-【v1.4.9 ★追加（今回の事故の根治）】
-- ★ ColMap（列名吸収）を導入：jan/jan_code、pack_unit/package_unit 等の差異を自動解決
-- ★ 全SQLで colmap を貫通：列名揺れ起因の "Unrecognized name" を根絶
-- ★ 必須列が見つからない場合は、起動直後に「不足列一覧」を明示して停止（沈黙しない）
+【v1.4.10 ★追加（今回）】
+- ★ 新規納品トレンド（得意先 / グループ / 商品）を追加
+  - 直近N日 vs その前N日の比較で「増えている」ランキングを表示
+  - 追加の増分テーブル・成長更新SQLは作らない（現行VIEW更新を最大活用）
+  - グループ切り口は VIEW_UNIFIED の group_expr を参照（無ければ非表示）
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜v1.4.8踏襲 + ColMap（列名吸収）統合")
+    st.caption("OS v1.4.10｜v1.4.9踏襲 + 新規納品トレンド（得意先/グループ/商品）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -333,7 +337,6 @@ def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
     required = ["customer_code", "customer_name", "sales_date", "fiscal_year", "sales_amount", "gross_profit", "product_name"]
     missing = [k for k in required if not colmap.get(k)]
     if missing:
-        # ここでは例外ではなく、呼び出し側で表示停止できるようにマーカーを入れる
         colmap["_missing_required"] = ",".join(missing)
 
     # opt merge
@@ -384,7 +387,6 @@ def render_scope_filters(client: bigquery.Client, role: RoleInfo) -> ScopeFilter
 
         keyword = c2.text_input("得意先名（部分一致）", placeholder="例：古賀病院")
         if keyword.strip():
-            # customer_name は VIEW_UNIFIED で揺れにくいが一応 colmap で吸収したいので main 側で where を組む
             predicates.append("customer_name LIKE @scope_customer_name")
             params["scope_customer_name"] = f"%{keyword.strip()}%"
 
@@ -703,7 +705,6 @@ def render_group_underperformance_section(
 
         drill_params["parent_id"] = selected_parent_id
 
-        # yj_key：YJ優先、無ければJAN、最後に商品名（成分）で追跡
         sql_drill = f"""
             WITH fy AS (
               SELECT (
@@ -1052,37 +1053,287 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         st.info("月次推移がありません。")
 
 
+# -----------------------------
+# ★ v1.4.10 新規納品トレンド（追加）
+# -----------------------------
+def _render_df_money(df: pd.DataFrame, money_cols: list[str]) -> None:
+    fmt = {}
+    for col in money_cols:
+        if col in df.columns:
+            fmt[col] = "¥{:,.0f}"
+    st.dataframe(df.fillna(0).style.format(fmt), use_container_width=True, hide_index=True)
+
+
 def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool, colmap: Dict[str, str]) -> None:
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
-    if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
-        # VIEW_NEW_DELIVERY 側は別VIEWなので列名は固定前提（必要ならここもcolmap化する）
-        where_ext = "" if is_admin else "AND login_email = @login_email"
-        params = None if is_admin else {"login_email": login_email}
 
-        sql = f"""
-        WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+    # ① 期間設定（UIは軽く、処理ルートは増やさない）
+    c1, c2, c3 = st.columns([1, 1, 2])
+    window_days = int(c1.selectbox("トレンド比較の窓（日数）", options=[7, 14, 30], index=1))
+    top_n = int(c2.selectbox("表示件数", options=[10, 20, 50], index=1))
+    c3.caption("直近N日 vs その前N日で「新規納品が増えた」対象を抽出（増分テーブルは作らない）")
+
+    if not st.button("新規納品（サマリー＋トレンド）を読み込む", key="btn_new_deliv"):
+        return
+
+    # VIEW_NEW_DELIVERY 側は固定列前提：customer_code, customer_name, jan_code, product_name, first_sales_date, sales_amount, gross_profit, login_email
+    where_ext = "" if is_admin else "AND login_email = @login_email"
+    params = None if is_admin else {"login_email": login_email}
+
+    # ② サマリー（既存踏襲）
+    sql_summary = f"""
+    WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+    SELECT
+      '① 昨日' AS `期間`, COUNT(DISTINCT customer_code) AS `得意先数`, COUNT(DISTINCT jan_code) AS `品目数`, SUM(sales_amount) AS `売上`, SUM(gross_profit) AS `粗利`
+    FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
+    UNION ALL
+    SELECT '② 直近7日', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
+    FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
+    UNION ALL
+    SELECT '③ 当月', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
+    FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE DATE_TRUNC(first_sales_date, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
+    ORDER BY `期間`
+    """
+    df_new = query_df_safe(client, sql_summary, params, label="New Deliveries Summary")
+    if not df_new.empty:
+        df_new[["売上", "粗利"]] = df_new[["売上", "粗利"]].fillna(0)
+        _render_df_money(df_new, ["売上", "粗利"])
+    else:
+        st.info("新規納品サマリーがありません。")
+
+    st.divider()
+
+    # ③ トレンド：得意先（新規納品が増えている得意先）
+    st.markdown("### 📈 得意先トレンド（新規納品が増えている得意先）")
+
+    sql_customer_trend = f"""
+    WITH td AS (
+      SELECT
+        CURRENT_DATE('Asia/Tokyo') AS today,
+        DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w DAY) AS w_start,
+        DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w*2 DAY) AS prev_start
+    ),
+    base AS (
+      SELECT
+        CAST(customer_code AS STRING) AS customer_code,
+        ANY_VALUE(customer_name) AS customer_name,
+        CASE
+          WHEN first_sales_date >= (SELECT w_start FROM td) THEN 'recent'
+          WHEN first_sales_date >= (SELECT prev_start FROM td) AND first_sales_date < (SELECT w_start FROM td) THEN 'prev'
+          ELSE 'other'
+        END AS bucket,
+        jan_code,
+        sales_amount,
+        gross_profit
+      FROM `{VIEW_NEW_DELIVERY}`
+      CROSS JOIN td
+      WHERE first_sales_date >= (SELECT prev_start FROM td)
+        {where_ext}
+    ),
+    agg AS (
+      SELECT
+        customer_code,
+        customer_name,
+        SUM(CASE WHEN bucket='recent' THEN 1 ELSE 0 END) AS recent_rows,
+        SUM(CASE WHEN bucket='prev' THEN 1 ELSE 0 END) AS prev_rows,
+        COUNT(DISTINCT CASE WHEN bucket='recent' THEN jan_code END) AS recent_items,
+        COUNT(DISTINCT CASE WHEN bucket='prev' THEN jan_code END) AS prev_items,
+        SUM(CASE WHEN bucket='recent' THEN sales_amount ELSE 0 END) AS recent_sales,
+        SUM(CASE WHEN bucket='prev' THEN sales_amount ELSE 0 END) AS prev_sales,
+        SUM(CASE WHEN bucket='recent' THEN gross_profit ELSE 0 END) AS recent_gp,
+        SUM(CASE WHEN bucket='prev' THEN gross_profit ELSE 0 END) AS prev_gp
+      FROM base
+      GROUP BY customer_code, customer_name
+    )
+    SELECT
+      customer_code AS `得意先CD`,
+      customer_name AS `得意先名`,
+      recent_items AS `直近{window_days}日_新規品目数`,
+      prev_items AS `前{window_days}日_新規品目数`,
+      (recent_items - prev_items) AS `増減_品目数`,
+      recent_sales AS `直近{window_days}日_売上`,
+      prev_sales AS `前{window_days}日_売上`,
+      (recent_sales - prev_sales) AS `増減_売上`,
+      recent_gp AS `直近{window_days}日_粗利`,
+      prev_gp AS `前{window_days}日_粗利`,
+      (recent_gp - prev_gp) AS `増減_粗利`
+    FROM agg
+    WHERE (recent_items - prev_items) > 0
+       OR (recent_sales - prev_sales) > 0
+    ORDER BY `増減_品目数` DESC, `増減_売上` DESC
+    LIMIT @topn
+    """
+    trend_params = {"w": window_days, "topn": top_n}
+    if not is_admin:
+        trend_params.update({"login_email": login_email})
+    df_ct = query_df_safe(client, sql_customer_trend, trend_params, "New Delivery Trend Customers")
+    if not df_ct.empty:
+        _render_df_money(df_ct, ["直近14日_売上", "前14日_売上", "増減_売上", "直近14日_粗利", "前14日_粗利", "増減_粗利"])
+        # 上の金額列名は window_days により変わるため、動的に当てる
+        money_cols = [c for c in df_ct.columns if any(k in c for k in ["売上", "粗利"]) and "品目" not in c]
+        _render_df_money(df_ct, money_cols)
+    else:
+        st.info("増加傾向の得意先がありません（または抽出期間にデータがありません）。")
+
+    st.divider()
+
+    # ④ トレンド：グループ（切り口）
+    st.markdown("### 🏢 グループトレンド（新規納品が増えているグループ）")
+    group_expr, group_src = resolve_customer_group_sql_expr(client)
+    if not group_expr:
+        st.info("グループ列が見つからないため、グループトレンドは表示できません。")
+    else:
+        if group_src:
+            st.caption(f"グループ抽出元: `{group_src}`（VIEW_UNIFIED）")
+
+        sql_group_trend = f"""
+        WITH td AS (
+          SELECT
+            CURRENT_DATE('Asia/Tokyo') AS today,
+            DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w DAY) AS w_start,
+            DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w*2 DAY) AS prev_start
+        ),
+        nd AS (
+          SELECT
+            CAST(customer_code AS STRING) AS customer_code,
+            jan_code,
+            sales_amount,
+            gross_profit,
+            CASE
+              WHEN first_sales_date >= (SELECT w_start FROM td) THEN 'recent'
+              WHEN first_sales_date >= (SELECT prev_start FROM td) AND first_sales_date < (SELECT w_start FROM td) THEN 'prev'
+              ELSE 'other'
+            END AS bucket
+          FROM `{VIEW_NEW_DELIVERY}`
+          CROSS JOIN td
+          WHERE first_sales_date >= (SELECT prev_start FROM td)
+            {where_ext}
+        ),
+        dim_group AS (
+          SELECT
+            CAST({c(colmap,'customer_code')} AS STRING) AS customer_code,
+            {group_expr} AS group_name
+          FROM `{VIEW_UNIFIED}`
+          GROUP BY customer_code, group_name
+        ),
+        base AS (
+          SELECT
+            COALESCE(dg.group_name, '未設定') AS group_name,
+            nd.bucket,
+            nd.jan_code,
+            nd.sales_amount,
+            nd.gross_profit
+          FROM nd
+          LEFT JOIN dim_group dg USING(customer_code)
+        ),
+        agg AS (
+          SELECT
+            group_name,
+            COUNT(DISTINCT CASE WHEN bucket='recent' THEN jan_code END) AS recent_items,
+            COUNT(DISTINCT CASE WHEN bucket='prev' THEN jan_code END) AS prev_items,
+            SUM(CASE WHEN bucket='recent' THEN sales_amount ELSE 0 END) AS recent_sales,
+            SUM(CASE WHEN bucket='prev' THEN sales_amount ELSE 0 END) AS prev_sales,
+            SUM(CASE WHEN bucket='recent' THEN gross_profit ELSE 0 END) AS recent_gp,
+            SUM(CASE WHEN bucket='prev' THEN gross_profit ELSE 0 END) AS prev_gp
+          FROM base
+          GROUP BY group_name
+        )
         SELECT
-          '① 昨日' AS `期間`, COUNT(DISTINCT customer_code) AS `得意先数`, COUNT(DISTINCT jan_code) AS `品目数`, SUM(sales_amount) AS `売上`, SUM(gross_profit) AS `粗利`
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
-        UNION ALL
-        SELECT '② 直近7日', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE first_sales_date >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
-        UNION ALL
-        SELECT '③ 当月', COUNT(DISTINCT customer_code), COUNT(DISTINCT jan_code), SUM(sales_amount), SUM(gross_profit)
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td WHERE DATE_TRUNC(first_sales_date, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
-        ORDER BY `期間`
+          group_name AS `グループ`,
+          recent_items AS `直近{window_days}日_新規品目数`,
+          prev_items AS `前{window_days}日_新規品目数`,
+          (recent_items - prev_items) AS `増減_品目数`,
+          recent_sales AS `直近{window_days}日_売上`,
+          prev_sales AS `前{window_days}日_売上`,
+          (recent_sales - prev_sales) AS `増減_売上`,
+          recent_gp AS `直近{window_days}日_粗利`,
+          prev_gp AS `前{window_days}日_粗利`,
+          (recent_gp - prev_gp) AS `増減_粗利`
+        FROM agg
+        WHERE (recent_items - prev_items) > 0
+           OR (recent_sales - prev_sales) > 0
+        ORDER BY `増減_品目数` DESC, `増減_売上` DESC
+        LIMIT @topn
         """
-        df_new = query_df_safe(client, sql, params, label="New Deliveries")
-
-        if not df_new.empty:
-            df_new[["売上", "粗利"]] = df_new[["売上", "粗利"]].fillna(0)
-            st.dataframe(
-                df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
+        gp_params = {"w": window_days, "topn": top_n}
+        if not is_admin:
+            gp_params.update({"login_email": login_email})
+        df_gt = query_df_safe(client, sql_group_trend, gp_params, "New Delivery Trend Groups")
+        if not df_gt.empty:
+            money_cols = [c for c in df_gt.columns if any(k in c for k in ["売上", "粗利"]) and "品目" not in c]
+            _render_df_money(df_gt, money_cols)
         else:
-            st.info("新規納品データがありません。")
+            st.info("増加傾向のグループがありません（または抽出期間にデータがありません）。")
+
+    st.divider()
+
+    # ⑤ トレンド：商品（新規納品が増えている商品）
+    st.markdown("### 💊 商品トレンド（新規納品が増えている商品）")
+
+    sql_product_trend = f"""
+    WITH td AS (
+      SELECT
+        CURRENT_DATE('Asia/Tokyo') AS today,
+        DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w DAY) AS w_start,
+        DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL @w*2 DAY) AS prev_start
+    ),
+    base AS (
+      SELECT
+        CAST(jan_code AS STRING) AS jan_code,
+        REGEXP_REPLACE(CAST(product_name AS STRING), r"[/／].*$", "") AS product_base,
+        CASE
+          WHEN first_sales_date >= (SELECT w_start FROM td) THEN 'recent'
+          WHEN first_sales_date >= (SELECT prev_start FROM td) AND first_sales_date < (SELECT w_start FROM td) THEN 'prev'
+          ELSE 'other'
+        END AS bucket,
+        sales_amount,
+        gross_profit,
+        customer_code
+      FROM `{VIEW_NEW_DELIVERY}`
+      CROSS JOIN td
+      WHERE first_sales_date >= (SELECT prev_start FROM td)
+        {where_ext}
+    ),
+    agg AS (
+      SELECT
+        jan_code,
+        product_base,
+        COUNT(DISTINCT CASE WHEN bucket='recent' THEN customer_code END) AS recent_customers,
+        COUNT(DISTINCT CASE WHEN bucket='prev' THEN customer_code END) AS prev_customers,
+        SUM(CASE WHEN bucket='recent' THEN sales_amount ELSE 0 END) AS recent_sales,
+        SUM(CASE WHEN bucket='prev' THEN sales_amount ELSE 0 END) AS prev_sales,
+        SUM(CASE WHEN bucket='recent' THEN gross_profit ELSE 0 END) AS recent_gp,
+        SUM(CASE WHEN bucket='prev' THEN gross_profit ELSE 0 END) AS prev_gp
+      FROM base
+      GROUP BY jan_code, product_base
+    )
+    SELECT
+      jan_code AS `JAN`,
+      product_base AS `代表商品名(成分)`,
+      recent_customers AS `直近{window_days}日_新規得意先数`,
+      prev_customers AS `前{window_days}日_新規得意先数`,
+      (recent_customers - prev_customers) AS `増減_得意先数`,
+      recent_sales AS `直近{window_days}日_売上`,
+      prev_sales AS `前{window_days}日_売上`,
+      (recent_sales - prev_sales) AS `増減_売上`,
+      recent_gp AS `直近{window_days}日_粗利`,
+      prev_gp AS `前{window_days}日_粗利`,
+      (recent_gp - prev_gp) AS `増減_粗利`
+    FROM agg
+    WHERE (recent_customers - prev_customers) > 0
+       OR (recent_sales - prev_sales) > 0
+    ORDER BY `増減_得意先数` DESC, `増減_売上` DESC
+    LIMIT @topn
+    """
+    pr_params = {"w": window_days, "topn": top_n}
+    if not is_admin:
+        pr_params.update({"login_email": login_email})
+    df_pt = query_df_safe(client, sql_product_trend, pr_params, "New Delivery Trend Products")
+    if not df_pt.empty:
+        money_cols = [c for c in df_pt.columns if any(k in c for k in ["売上", "粗利"]) and "得意先" not in c]
+        _render_df_money(df_pt, money_cols)
+    else:
+        st.info("増加傾向の新規納品商品がありません（または抽出期間にデータがありません）。")
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
@@ -1225,7 +1476,6 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("##### 💡 AI 推奨提案商品（Reco）")
 
-    # VIEW_RECOMMEND.customer_code は INT64 想定 → STRINGキーと照合するため CAST
     sql_rec = f"""
         SELECT
           customer_name,
@@ -1263,7 +1513,6 @@ def main() -> None:
     set_page()
     client = setup_bigquery_client()
 
-    # ★ ColMap 解決（起動直後に必須列不足を検出して停止）
     colmap = resolve_unified_colmap(client)
     missing = colmap.get("_missing_required")
     if missing:
@@ -1309,7 +1558,6 @@ def main() -> None:
     c3.metric("📞 電話", role.phone)
     st.divider()
 
-    # 表示順序：サマリー → スコープ → 本体
     if role.role_admin_view:
         render_fytd_org_section(client, colmap)
     else:
