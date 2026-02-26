@@ -1417,39 +1417,36 @@ def main() -> None:
     # ★ 完全踏襲監査（起動直後）
     self_audit()
 
-    with st.sidebar:
-        st.header("🔑 ログイン")
-        login_id = st.text_input("ログインID (メールアドレス)", key="login_id")
-        login_pw = st.text_input("パスコード (携帯下4桁)", type="password", key="login_pw")
+with st.sidebar:
+    st.header("🔑 ログイン")
+    login_id = st.text_input("ログインID (メールアドレス)")
+    login_pw = st.text_input("パスコード (携帯下4桁)", type="password")
 
-        st.divider()
-        st.session_state.use_bqstorage = st.checkbox("高速読込 (Storage API)", value=True, key="use_bqstorage")
+    st.divider()
 
-        if st.button("📡 通信ヘルスチェック", key="btn_health"):
-            try:
-                client.query("SELECT 1").result(timeout=10)
-                st.success("BigQuery 接続正常")
-            except Exception as e:
-                st.error(f"接続エラー: {e}")
+    # ✅ session_state を “widget前” に初期化
+    if "use_bqstorage" not in st.session_state:
+        st.session_state["use_bqstorage"] = True
 
-        if st.button("🧹 キャッシュクリア", key="btn_clear_cache"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
+    # ✅ 代入しない（widgetが session_state を管理する）
+    st.checkbox("高速読込 (Storage API)", key="use_bqstorage")
 
-        with st.expander("🔧 VIEW_UNIFIED 列マップ（自動解決結果）", expanded=False):
-            st.json(colmap)
+    if st.button("📡 通信ヘルスチェック"):
+        try:
+            client.query("SELECT 1").result(timeout=10)
+            st.success("BigQuery 接続正常")
+        except Exception as e:
+            st.error(f"接続エラー: {e}")
 
-        with st.expander("🔧 VIEW_NEW_DELIVERY 列マップ（自動解決結果）", expanded=False):
-            st.json(resolve_new_delivery_colmap(client))
+    if st.button("🧹 キャッシュクリア"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
 
-    if not login_id or not login_pw:
-        st.info("👈 サイドバーからログインしてください。")
-        return
+    with st.expander("🔧 VIEW_UNIFIED 列マップ（自動解決結果）", expanded=False):
+        st.json(colmap)
 
-    role = resolve_role(client, login_id.strip(), login_pw.strip())
-    if not role.is_authenticated:
-        st.error("❌ ログイン情報が正しくありません。")
-        return
+    with st.expander("🔧 VIEW_NEW_DELIVERY 列マップ（自動解決結果）", expanded=False):
+        st.json(resolve_new_delivery_colmap(client))
 
     st.success(f"🔓 ログイン中: {role.staff_name} さん")
     c1, c2, c3 = st.columns(3)
