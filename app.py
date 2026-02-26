@@ -1107,40 +1107,43 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         st.info("月次推移がありません。")
 
 
-# -----------------------------
-# ★ New Delivery Trend（得意先/商品）: 今回のエラー根治対象
-# -----------------------------
-def render_new_delivery_trends(client: bigquery.Client, login_email: str, is_admin: bool, nd_colmap: Dict[str, str]) -> None:
+def render_new_delivery_trends(
+    client: bigquery.Client,
+    login_email: str,
+    is_admin: bool,
+    nd_colmap: Dict[str, str],
+    unified_colmap: Dict[str, str],
+) -> None:
     st.markdown("##### 📈 新規納品トレンド（得意先 / 商品）")
 
-    # 表示上必要（無いなら止める：沈黙しない）
-    need_for_trend = []
-    if "customer_name" not in nd_colmap:
-        need_for_trend.append("customer_name")
-    if "product_name" not in nd_colmap:
-        need_for_trend.append("product_name")
-
-    if need_for_trend:
-        st.error("VIEW_NEW_DELIVERY のトレンド表示に必要な列が見つかりません。VIEW定義（列名）を確認してください。")
-        st.code(f"不足キー: {','.join(need_for_trend)}")
-        st.stop()
-
     days = st.slider("対象期間（日）", min_value=7, max_value=180, value=60, step=1)
-    where_ext = "" if is_admin else f"AND {c(nd_colmap,'login_email')} = @login_email"
+
+    # VIEW_NEW_DELIVERY はコード主体、名前は VIEW_UNIFIED から引く（堅牢）
+    where_ext = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
     params = None if is_admin else {"login_email": login_email}
 
-    # 得意先トレンド
+    # ▼ 名前辞書（customer_code -> customer_name, jan_code -> product_name）
+    # VIEW_UNIFIED 側は colmap 経由で列名揺れを吸収
     sql_cust = f"""
-      WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+      WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
+      cust_dim AS (
+        SELECT
+          CAST({c(unified_colmap,'customer_code')} AS STRING) AS customer_code,
+          ANY_VALUE(CAST({c(unified_colmap,'customer_name')} AS STRING)) AS customer_name
+        FROM `{VIEW_UNIFIED}`
+        GROUP BY customer_code
+      )
       SELECT
-        CAST({c(nd_colmap,'customer_code')} AS STRING) AS customer_code,
-        ANY_VALUE(CAST({c(nd_colmap,'customer_name')} AS STRING)) AS customer_name,
-        COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)) AS item_cnt,
-        SUM({c(nd_colmap,'sales_amount')}) AS sales_amount,
-        SUM({c(nd_colmap,'gross_profit')}) AS gross_profit
-      FROM `{VIEW_NEW_DELIVERY}`
+        CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) AS customer_code,
+        ANY_VALUE(cd.customer_name) AS customer_name,
+        COUNT(DISTINCT CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS item_cnt,
+        SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
+        SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
+      FROM `{VIEW_NEW_DELIVERY}` nd
       CROSS JOIN td
-      WHERE {c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
+      LEFT JOIN cust_dim cd
+        ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
+      WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
         {where_ext}
       GROUP BY customer_code
       ORDER BY sales_amount DESC
@@ -1148,18 +1151,26 @@ def render_new_delivery_trends(client: bigquery.Client, login_email: str, is_adm
     """
     df_cust = query_df_safe(client, sql_cust, params, label="New Delivery Trend Customers")
 
-    # 商品トレンド
     sql_prod = f"""
-      WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+      WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
+      item_dim AS (
+        SELECT
+          CAST({c(unified_colmap,'jan_code')} AS STRING) AS jan_code,
+          ANY_VALUE(REGEXP_REPLACE(CAST({c(unified_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name
+        FROM `{VIEW_UNIFIED}`
+        GROUP BY jan_code
+      )
       SELECT
-        CAST({c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-        ANY_VALUE(REGEXP_REPLACE(CAST({c(nd_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name,
-        COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)) AS customer_cnt,
-        SUM({c(nd_colmap,'sales_amount')}) AS sales_amount,
-        SUM({c(nd_colmap,'gross_profit')}) AS gross_profit
-      FROM `{VIEW_NEW_DELIVERY}`
+        CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
+        ANY_VALUE(id.product_name) AS product_name,
+        COUNT(DISTINCT CAST(nd.{c(nd_colmap,'customer_code')} AS STRING)) AS customer_cnt,
+        SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
+        SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
+      FROM `{VIEW_NEW_DELIVERY}` nd
       CROSS JOIN td
-      WHERE {c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
+      LEFT JOIN item_dim id
+        ON CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) = id.jan_code
+      WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
         {where_ext}
       GROUP BY jan_code
       ORDER BY sales_amount DESC
