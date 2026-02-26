@@ -858,30 +858,33 @@ def render_new_delivery_trends(
 ) -> None:
     st.markdown("##### 📈 新規納品トレンド（グループ / 得意先 / 商品）")
 
+    # --- 必須列チェック（NewDelivery）
     missing_required = nd_colmap.get("_missing_required")
     if missing_required:
         st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
         st.code(f"不足キー: {missing_required}")
         st.stop()
 
+    # 担当者スコープが必要なのにlogin_email列が取れない場合は止める（安全）
     if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
         st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
         st.stop()
 
+    # --- UI State
     if "nd_trend_days" not in st.session_state:
         st.session_state.nd_trend_days = 60
     if "nd_trend_mode" not in st.session_state:
         st.session_state.nd_trend_mode = "🏢 グループ"
 
     days = st.slider("対象期間（日）", 7, 180, st.session_state.nd_trend_days, 1, key="nd_trend_days")
-    mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品"], horizontal=True, key="nd_trend_mode")
+    mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品（YJ=成分規格）"], horizontal=True, key="nd_trend_mode")
 
-    where_ext = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
-    base_params = None if is_admin else {"login_email": login_email}
+    # --- 共通：担当者スコープ
+    where_staff = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
+    base_params = {} if is_admin else {"login_email": login_email}
 
+    # --- 共通：cust_dim（VIEW_UNIFIED起点で customer_name / group を補完）
     group_expr, _ = resolve_customer_group_sql_expr(client)
-
-    # cust_dim（VIEW_UNIFIED 起点）
     if group_expr:
         cust_dim_sql = f"""
           SELECT
@@ -901,36 +904,49 @@ def render_new_delivery_trends(
           GROUP BY customer_code
         """
 
-    # item_dim（VIEW_UNIFIED起点優先）
-    unified_has_jan = c(unified_colmap, "jan_code") != "jan_code"
-    nd_has_pname = c(nd_colmap, "product_name") != "product_name"
+    # --- 共通：item_dim（JAN → YJ / 成分規格名を補完）
+    # ※ 成分規格は product_name の "/" 以降（包装等）を落として代表名にする運用
+    # ※ VIEW_UNIFIED に jan_code/yj_code がない場合は JAN で継続（ただし商品モードは精度落ちる）
+    unified_has_jan = (c(unified_colmap, "jan_code") != "jan_code")
+    unified_has_yj = (c(unified_colmap, "yj_code") != "yj_code")
 
     if unified_has_jan:
+        # YJが無い場合でも left join して JANベースで fallback
+        yj_expr = f"CAST({c(unified_colmap,'yj_code')} AS STRING)" if unified_has_yj else "NULL"
         item_dim_sql = f"""
           SELECT
             CAST({c(unified_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(REGEXP_REPLACE(CAST({c(unified_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name
+            {yj_expr} AS yj_code,
+            ANY_VALUE(REGEXP_REPLACE(CAST({c(unified_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS ingredient_spec_name
           FROM `{VIEW_UNIFIED}`
-          GROUP BY jan_code
-        """
-    elif nd_has_pname:
-        item_dim_sql = f"""
-          SELECT
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(REGEXP_REPLACE(CAST(nd.{c(nd_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name
-          FROM `{VIEW_NEW_DELIVERY}` nd
-          GROUP BY jan_code
+          GROUP BY jan_code, yj_code
         """
     else:
-        item_dim_sql = f"""
-          SELECT
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            '不明' AS product_name
-          FROM `{VIEW_NEW_DELIVERY}` nd
-          GROUP BY jan_code
-        """
+        # 最低限：NewDelivery側に product_name があればそれで成分規格名を作る
+        if c(nd_colmap, "product_name") != "product_name":
+            item_dim_sql = f"""
+              SELECT
+                CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
+                NULL AS yj_code,
+                ANY_VALUE(REGEXP_REPLACE(CAST(nd.{c(nd_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS ingredient_spec_name
+              FROM `{VIEW_NEW_DELIVERY}` nd
+              GROUP BY jan_code
+            """
+        else:
+            item_dim_sql = f"""
+              SELECT
+                CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
+                NULL AS yj_code,
+                '不明' AS ingredient_spec_name
+              FROM `{VIEW_NEW_DELIVERY}` nd
+              GROUP BY jan_code
+            """
 
+    # ---------------------------
+    # ① 親（トレンド）クエリ
+    # ---------------------------
     if mode.startswith("🏢"):
+        # グループ
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -945,16 +961,17 @@ def render_new_delivery_trends(
           LEFT JOIN cust_dim cd
             ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
-            {where_ext}
+            {where_staff}
           GROUP BY group_name
           ORDER BY sales_amount DESC
-          LIMIT 200
+          LIMIT 300
         """
         df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Groups")
         key_col = "group_name"
         title = "🏢 グループトレンド（新規納品）"
 
     elif mode.startswith("🏥"):
+        # 得意先
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -970,23 +987,26 @@ def render_new_delivery_trends(
           LEFT JOIN cust_dim cd
             ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
-            {where_ext}
+            {where_staff}
           GROUP BY customer_code
           ORDER BY sales_amount DESC
-          LIMIT 200
+          LIMIT 300
         """
         df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Customers")
         key_col = "customer_code"
         title = "🏥 得意先トレンド（新規納品）"
 
     else:
+        # 商品（YJ=成分規格）で集約
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           item_dim AS ({item_dim_sql})
           SELECT
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(id.product_name) AS product_name,
+            -- YJが取れない場合は JAN にフォールバック（ただし精度は落ちる）
+            COALESCE(NULLIF(id.yj_code, ''), CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS yj_key,
+            ANY_VALUE(id.ingredient_spec_name) AS ingredient_spec_name,
             COUNT(DISTINCT CAST(nd.{c(nd_colmap,'customer_code')} AS STRING)) AS customer_cnt,
+            COUNT(DISTINCT CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS jan_cnt,
             SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
@@ -994,46 +1014,87 @@ def render_new_delivery_trends(
           LEFT JOIN item_dim id
             ON CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) = id.jan_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
-            {where_ext}
-          GROUP BY jan_code
+            {where_staff}
+          GROUP BY yj_key
           ORDER BY sales_amount DESC
-          LIMIT 200
+          LIMIT 500
         """
-        df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Products")
-        key_col = "jan_code"
-        title = "💊 商品トレンド（新規納品）"
+        df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Items(YJ)")
+        key_col = "yj_key"
+        title = "💊 商品トレンド（YJ=成分規格集約）"
 
     st.markdown(f"**{title}**")
     if df_parent.empty:
         st.info("該当期間のトレンドがありません。")
         return
 
-    df_show = df_parent.copy()
-    df_show.insert(0, "☑", False)
+    # ---------------------------
+    # ② 親テーブル表示（☑選択）
+    #    ★重要：fillna("") を全体に掛けない（☑型崩れ防止）
+    # ---------------------------
+    df_parent = df_parent.copy()
+    df_parent.insert(0, "☑", False)
 
     if key_col == "group_name":
-        df_show = df_show.rename(columns={"group_name": "グループ", "customer_cnt": "得意先数", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
+        df_parent = df_parent.rename(
+            columns={
+                "group_name": "グループ",
+                "customer_cnt": "得意先数",
+                "item_cnt": "品目数",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
         display_cols = ["☑", "グループ", "得意先数", "品目数", "売上", "粗利"]
         pick_col = "グループ"
+
     elif key_col == "customer_code":
-        df_show = df_show.rename(columns={"customer_code": "得意先コード", "customer_name": "得意先名", "group_name": "グループ", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
+        df_parent = df_parent.rename(
+            columns={
+                "customer_code": "得意先コード",
+                "customer_name": "得意先名",
+                "group_name": "グループ",
+                "item_cnt": "品目数",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
         display_cols = ["☑", "得意先コード", "得意先名", "グループ", "品目数", "売上", "粗利"]
         pick_col = "得意先コード"
+
     else:
-        df_show = df_show.rename(columns={"jan_code": "JAN", "product_name": "代表商品名", "customer_cnt": "得意先数", "sales_amount": "売上", "gross_profit": "粗利"})
-        display_cols = ["☑", "JAN", "代表商品名", "得意先数", "売上", "粗利"]
-        pick_col = "JAN"
+        df_parent = df_parent.rename(
+            columns={
+                "yj_key": "YJキー",
+                "ingredient_spec_name": "成分規格（代表）",
+                "customer_cnt": "得意先数",
+                "jan_cnt": "JAN数",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
+        display_cols = ["☑", "YJキー", "成分規格（代表）", "得意先数", "JAN数", "売上", "粗利"]
+        pick_col = "YJキー"
+
+    # ☑以外のみ欠損を埋める（☑列は bool のまま固定）
+    df_view = df_parent[display_cols].copy()
+    for colx in df_view.columns:
+        if colx != "☑":
+            df_view[colx] = df_view[colx].fillna("")
 
     edited = st.data_editor(
-        df_show[display_cols].fillna(""),
+        df_view,
         use_container_width=True,
         hide_index=True,
         disabled=[c_ for c_ in display_cols if c_ != "☑"],
-        column_config={"☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）")},
-        key=f"nd_trend_editor_{key_col}",
+        column_config={
+            "☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）"),
+        },
+        key=f"nd_trend_editor_{key_col}_v2",
     )
 
-    sel_df = edited[edited["☑"] == True]
+    # ★確実に bool として評価する
+    sel_df = edited[edited["☑"].astype(bool) == True]
     if sel_df.empty:
         st.caption("☑にチェックすると下に明細が出ます（複数選択可）。")
         return
@@ -1041,13 +1102,15 @@ def render_new_delivery_trends(
     selected_keys = sel_df[pick_col].astype(str).tolist()
 
     st.divider()
-    st.markdown("#### 🧾 明細（新規納品 Realized）")
+    st.markdown("#### 🧾 明細（ドリルダウン）")
 
-    base_where = f"nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY) {where_ext}"
-
+    # ---------------------------
+    # ③ 明細（ドリルダウン）
+    # ---------------------------
     if key_col == "group_name":
-        params2 = {} if is_admin else {"login_email": login_email}
+        params2 = dict(base_params)
         params2["group_keys"] = selected_keys
+
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
@@ -1057,8 +1120,8 @@ def render_new_delivery_trends(
             COALESCE(cd.group_name, '未設定') AS group_name,
             CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) AS customer_code,
             ANY_VALUE(cd.customer_name) AS customer_name,
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(id.product_name) AS product_name,
+            COALESCE(NULLIF(id.yj_code, ''), CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS yj_key,
+            ANY_VALUE(id.ingredient_spec_name) AS ingredient_spec_name,
             SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
@@ -1067,17 +1130,32 @@ def render_new_delivery_trends(
             ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           LEFT JOIN item_dim id
             ON CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) = id.jan_code
-          WHERE {base_where}
+          WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
+            {where_staff}
             AND COALESCE(cd.group_name, '未設定') IN UNNEST(@group_keys)
-          GROUP BY first_sales_date, group_name, customer_code, jan_code
+          GROUP BY first_sales_date, group_name, customer_code, yj_key
           ORDER BY first_sales_date DESC, sales_amount DESC
-          LIMIT 2000
+          LIMIT 5000
         """
-        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Trend Group Details")
+        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Group Details")
+
+        df_detail = df_detail.rename(
+            columns={
+                "first_sales_date": "初回納品日",
+                "group_name": "グループ",
+                "customer_code": "得意先コード",
+                "customer_name": "得意先名",
+                "yj_key": "YJキー",
+                "ingredient_spec_name": "成分規格（代表）",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
 
     elif key_col == "customer_code":
-        params2 = {} if is_admin else {"login_email": login_email}
+        params2 = dict(base_params)
         params2["customer_keys"] = selected_keys
+
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
@@ -1087,8 +1165,8 @@ def render_new_delivery_trends(
             COALESCE(cd.group_name, '未設定') AS group_name,
             CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) AS customer_code,
             ANY_VALUE(cd.customer_name) AS customer_name,
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(id.product_name) AS product_name,
+            COALESCE(NULLIF(id.yj_code, ''), CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS yj_key,
+            ANY_VALUE(id.ingredient_spec_name) AS ingredient_spec_name,
             SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
@@ -1097,28 +1175,44 @@ def render_new_delivery_trends(
             ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           LEFT JOIN item_dim id
             ON CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) = id.jan_code
-          WHERE {base_where}
+          WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
+            {where_staff}
             AND CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) IN UNNEST(@customer_keys)
-          GROUP BY first_sales_date, group_name, customer_code, jan_code
+          GROUP BY first_sales_date, group_name, customer_code, yj_key
           ORDER BY first_sales_date DESC, sales_amount DESC
-          LIMIT 2000
+          LIMIT 5000
         """
-        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Trend Customer Details")
+        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Customer Details")
+
+        df_detail = df_detail.rename(
+            columns={
+                "first_sales_date": "初回納品日",
+                "group_name": "グループ",
+                "customer_code": "得意先コード",
+                "customer_name": "得意先名",
+                "yj_key": "YJキー",
+                "ingredient_spec_name": "成分規格（代表）",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
 
     else:
-        params2 = {} if is_admin else {"login_email": login_email}
-        params2["jan_keys"] = selected_keys
+        # 商品（YJ=成分規格） → 得意先ドリルダウン
+        params2 = dict(base_params)
+        params2["yj_keys"] = selected_keys
+
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
           item_dim AS ({item_dim_sql})
           SELECT
-            CAST(nd.{c(nd_colmap,'first_sales_date')} AS DATE) AS first_sales_date,
-            COALESCE(cd.group_name, '未設定') AS group_name,
+            COALESCE(NULLIF(id.yj_code, ''), CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) AS yj_key,
+            ANY_VALUE(id.ingredient_spec_name) AS ingredient_spec_name,
             CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) AS customer_code,
             ANY_VALUE(cd.customer_name) AS customer_name,
-            CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
-            ANY_VALUE(id.product_name) AS product_name,
+            ANY_VALUE(COALESCE(cd.group_name, '未設定')) AS group_name,
+            MIN(CAST(nd.{c(nd_colmap,'first_sales_date')} AS DATE)) AS first_sales_date_min,
             SUM(nd.{c(nd_colmap,'sales_amount')}) AS sales_amount,
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
@@ -1127,30 +1221,31 @@ def render_new_delivery_trends(
             ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           LEFT JOIN item_dim id
             ON CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) = id.jan_code
-          WHERE {base_where}
-            AND CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) IN UNNEST(@jan_keys)
-          GROUP BY first_sales_date, group_name, customer_code, jan_code
-          ORDER BY first_sales_date DESC, sales_amount DESC
-          LIMIT 2000
+          WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
+            {where_staff}
+            AND COALESCE(NULLIF(id.yj_code, ''), CAST(nd.{c(nd_colmap,'jan_code')} AS STRING)) IN UNNEST(@yj_keys)
+          GROUP BY yj_key, customer_code
+          ORDER BY sales_amount DESC
+          LIMIT 5000
         """
-        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Trend Product Details")
+        df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Item(YJ) -> Customers")
+
+        df_detail = df_detail.rename(
+            columns={
+                "yj_key": "YJキー",
+                "ingredient_spec_name": "成分規格（代表）",
+                "customer_code": "得意先コード",
+                "customer_name": "得意先名",
+                "group_name": "グループ",
+                "first_sales_date_min": "初回納品日（最小）",
+                "sales_amount": "売上",
+                "gross_profit": "粗利",
+            }
+        )
 
     if df_detail.empty:
         st.info("明細がありません。")
         return
-
-    df_detail = df_detail.rename(
-        columns={
-            "first_sales_date": "初回納品日",
-            "group_name": "グループ",
-            "customer_code": "得意先コード",
-            "customer_name": "得意先名",
-            "jan_code": "JAN",
-            "product_name": "商品名",
-            "sales_amount": "売上",
-            "gross_profit": "粗利",
-        }
-    )
 
     st.dataframe(
         df_detail.fillna("").style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
