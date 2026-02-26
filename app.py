@@ -1277,7 +1277,7 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
 
         st.divider()
         # ★ トレンド（今回のエラー箇所を根治）
-        render_new_delivery_trends(client, login_email, is_admin, nd_colmap)
+        render_new_delivery_trends(client, login_email, is_admin, nd_colmap, colmap)
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
