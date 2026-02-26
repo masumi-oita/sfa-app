@@ -1114,16 +1114,6 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
 
 def render_new_delivery_trends(
-    # 表示に必要（欠けたらトレンドの品名/得意先名が出せない）
-need_for_display = []
-for k in ("customer_name", "product_name"):
-    if k not in nd_colmap:
-        need_for_display.append(k)
-
-if need_for_display:
-    st.error("VIEW_NEW_DELIVERY に表示用の列が不足しています。")
-    st.code("不足キー: " + ", ".join(need_for_display))
-    st.stop()
     client: bigquery.Client,
     login_email: str,
     is_admin: bool,
@@ -1132,19 +1122,50 @@ if need_for_display:
 ) -> None:
     st.markdown("##### 📈 新規納品トレンド（グループ / 得意先 / 商品）")
 
-    days = st.slider("対象期間（日）", min_value=7, max_value=180, value=60, step=1)
+    # --------------------------
+    # 0) 事前バリデーション（沈黙しない）
+    # --------------------------
+    # 必須（集計が成立する最低限）
+    missing_required = nd_colmap.get("_missing_required")
+    if missing_required:
+        st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
+        st.code(f"不足キー: {missing_required}")
+        st.stop()
 
+    # 非管理者は login_email が必須（担当者絞り込み）
+    if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
+        st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
+        st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、resolve_new_delivery_colmap の mapping に実列名を追加してください。")
+        st.stop()
+
+    # 表示用（無いと「得意先名/商品名」が表示不能）
+    need_display: list[str] = []
+    if c(nd_colmap, "customer_name") == "customer_name":
+        need_display.append("customer_name")
+    if c(nd_colmap, "product_name") == "product_name":
+        need_display.append("product_name")
+
+    if need_display:
+        st.error("VIEW_NEW_DELIVERY に表示用の列が不足しています（トレンド表示ができません）。")
+        st.code("不足キー: " + ", ".join(need_display))
+        st.stop()
+
+    # --------------------------
+    # 1) UI
+    # --------------------------
+    days = st.slider("対象期間（日）", min_value=7, max_value=180, value=60, step=1)
     mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品"], horizontal=True)
 
     # VIEW_NEW_DELIVERY の権限制御（login_emailで絞る）
     where_ext = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
-    params = None if is_admin else {"login_email": login_email}
+    base_params = None if is_admin else {"login_email": login_email}
 
     # グループ列のSQL式（VIEW_UNIFIED由来）
     group_expr, _ = resolve_customer_group_sql_expr(client)
 
-    # customer_code -> customer_name, group_name
-    # group_expr があればそれを group_name にする
+    # --------------------------
+    # 2) DIM（cust / item）— VIEW_UNIFIED から作る（表示安定）
+    # --------------------------
     if group_expr:
         cust_dim_sql = f"""
           SELECT
@@ -1164,18 +1185,20 @@ if need_for_display:
           GROUP BY customer_code
         """
 
-    # jan_code -> product_name
+    # 商品名は VIEW_NEW_DELIVERY 自身の product_name を優先（最も自然）
+    # ただし表記ゆれ除去（/以降カット）はここで統一する
     item_dim_sql = f"""
       SELECT
-        CAST({c(unified_colmap,'jan_code')} AS STRING) AS jan_code,
-        ANY_VALUE(REGEXP_REPLACE(CAST({c(unified_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name
-      FROM `{VIEW_UNIFIED}`
+        CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
+        ANY_VALUE(REGEXP_REPLACE(CAST(nd.{c(nd_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS product_name
+      FROM `{VIEW_NEW_DELIVERY}` nd
       GROUP BY jan_code
     """
 
-    # ---------- Parent (Trend) ----------
+    # --------------------------
+    # 3) Parent（トレンド）
+    # --------------------------
     if mode.startswith("🏢"):
-        # ★ここが修正点：ANY_VALUEを使わず、group_nameをそのままGROUP BYする
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -1193,9 +1216,9 @@ if need_for_display:
             {where_ext}
           GROUP BY group_name
           ORDER BY sales_amount DESC
-          LIMIT 100
+          LIMIT 200
         """
-        df_parent = query_df_safe(client, sql_parent, params, label="New Delivery Trend Groups")
+        df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Groups")
         key_col = "group_name"
         title = "🏢 グループトレンド（新規納品）"
 
@@ -1218,9 +1241,9 @@ if need_for_display:
             {where_ext}
           GROUP BY customer_code
           ORDER BY sales_amount DESC
-          LIMIT 100
+          LIMIT 200
         """
-        df_parent = query_df_safe(client, sql_parent, params, label="New Delivery Trend Customers")
+        df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Customers")
         key_col = "customer_code"
         title = "🏥 得意先トレンド（新規納品）"
 
@@ -1242,9 +1265,9 @@ if need_for_display:
             {where_ext}
           GROUP BY jan_code
           ORDER BY sales_amount DESC
-          LIMIT 100
+          LIMIT 200
         """
-        df_parent = query_df_safe(client, sql_parent, params, label="New Delivery Trend Products")
+        df_parent = query_df_safe(client, sql_parent, base_params, label="New Delivery Trend Products")
         key_col = "jan_code"
         title = "💊 商品トレンド（新規納品）"
 
@@ -1253,7 +1276,9 @@ if need_for_display:
         st.info("該当期間のトレンドがありません。")
         return
 
-    # ---------- ☑ 選択UI ----------
+    # --------------------------
+    # 4) ☑選択UI（複数可）
+    # --------------------------
     df_show = df_parent.copy()
     df_show.insert(0, "☑", False)
 
@@ -1296,7 +1321,7 @@ if need_for_display:
         df_show[display_cols].fillna(""),
         use_container_width=True,
         hide_index=True,
-        disabled=[c for c in display_cols if c != "☑"],
+        disabled=[c_ for c_ in display_cols if c_ != "☑"],
         column_config={"☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）")},
     )
 
@@ -1320,9 +1345,12 @@ if need_for_display:
     st.divider()
     st.markdown("#### 🧾 明細（新規納品 Realized）")
 
+    # --------------------------
+    # 5) Detail（明細）
+    #    ※ UNNEST(@keys) を使うので query_df_safe は ArrayQueryParameter 対応が必須
+    # --------------------------
     base_where = f"nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY) {where_ext}"
 
-    # ★ここも修正：groupフィルタは ANY_VALUE ではなく cd.group_name を素直に使う
     if key_col == "group_name":
         params2 = {} if is_admin else {"login_email": login_email}
         params2["group_keys"] = selected_keys
