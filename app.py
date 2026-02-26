@@ -704,63 +704,29 @@ def render_group_underperformance_section(
     if perf_view == "グループ別" and group_src:
         st.caption(f"抽出元グループ列: `{group_src}`")
 
-    event = st.dataframe(
-        df_parent.style.format(
-            {
-                "今期売上": "¥{:,.0f}",
-                "前年同期売上": "¥{:,.0f}",
-                "今期粗利": "¥{:,.0f}",
-                "前年同期粗利": "¥{:,.0f}",
-                "売上差額": "¥{:,.0f}",
-                "売上成長率": "{:.1f}%",
-                "粗利差額": "¥{:,.0f}",
-            }
-        ),
+       # --- 型安全に欠損処理（db_dtypes対策）
+    df_detail = df_detail.copy()
+
+    # 数値は0
+    for coln in ["売上", "粗利"]:
+        if coln in df_detail.columns:
+            df_detail[coln] = pd.to_numeric(df_detail[coln], errors="coerce").fillna(0)
+
+    # 日付は触らない（NaTのまま表示）
+    # 文字列だけ "" 埋め（数値・日付以外）
+    for coln in df_detail.columns:
+        if coln in ["売上", "粗利"]:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(df_detail[coln]) or str(df_detail[coln].dtype).startswith("dbdate"):
+            continue
+        if df_detail[coln].dtype == object or pd.api.types.is_string_dtype(df_detail[coln]):
+            df_detail[coln] = df_detail[coln].fillna("")
+
+    st.dataframe(
+        df_detail.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
         use_container_width=True,
         hide_index=True,
-        selection_mode="single-row",
-        on_select="rerun",
-        key=f"grid_parent_{perf_view}_{perf_mode}",
     )
-
-    selected_parent_id = None
-    selected_parent_name = None
-
-    try:
-        sel_rows = []
-        if hasattr(event, "selection") and hasattr(event.selection, "rows"):
-            sel_rows = event.selection.rows
-        elif isinstance(event, dict) and "selection" in event:
-            sel_rows = event["selection"].get("rows", [])
-
-        if sel_rows:
-            idx = sel_rows[0]
-            if perf_view == "グループ別":
-                selected_parent_id = str(df_parent.iloc[idx]["名称"])
-                selected_parent_name = selected_parent_id
-            else:
-                selected_parent_id = str(df_parent.iloc[idx]["コード"])
-                selected_parent_name = str(df_parent.iloc[idx]["名称"])
-    except Exception:
-        pass
-
-    if selected_parent_id:
-        st.markdown(f"#### 🔍 【{selected_parent_name}】要因分析（商品ベース {perf_mode}・全件一覧）")
-
-        drill_params = dict(params)
-
-        if perf_view == "グループ別":
-            drill_filter_sql = _compose_where(
-                role_filter,
-                scope_filter_clause,
-                f"{group_expr} = @parent_id",
-            )
-        else:
-            drill_filter_sql = _compose_where(
-                role_filter,
-                scope_filter_clause,
-                f"{c(colmap,'customer_code')} = @parent_id",
-            )
 
         drill_params["parent_id"] = selected_parent_id
 
