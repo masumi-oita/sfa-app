@@ -853,29 +853,33 @@ def render_new_delivery_trends(
 ) -> None:
     st.markdown("##### 📈 新規納品トレンド（グループ / 得意先 / 商品）")
 
-    # 0) 必須列（集計成立の最低限）だけ止める
+    # 必須列だけ止める
     missing_required = nd_colmap.get("_missing_required")
     if missing_required:
         st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
         st.code(f"不足キー: {missing_required}")
         st.stop()
 
-    # 非管理者は login_email が必要（担当者絞り込み）
+    # 非管理者は login_email が必要
     if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
         st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
-        st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、resolve_new_delivery_colmap の mapping に実列名を追加してください。")
         st.stop()
 
-    # 1) UI
-    days = st.slider("対象期間（日）", min_value=7, max_value=180, value=60, step=1)
-    mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品"], horizontal=True)
+    # --- ★ UI state keys（rerunでも保持）
+    if "nd_trend_days" not in st.session_state:
+        st.session_state.nd_trend_days = 60
+    if "nd_trend_mode" not in st.session_state:
+        st.session_state.nd_trend_mode = "🏢 グループ"
+
+    days = st.slider("対象期間（日）", 7, 180, st.session_state.nd_trend_days, 1, key="nd_trend_days")
+    mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品"], horizontal=True, key="nd_trend_mode")
 
     where_ext = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
     base_params = None if is_admin else {"login_email": login_email}
 
     group_expr, _ = resolve_customer_group_sql_expr(client)
 
-    # 2) cust_dim（VIEW_UNIFIED 起点：得意先名を必ず安定供給）
+    # cust_dim（VIEW_UNIFIED 起点）
     if group_expr:
         cust_dim_sql = f"""
           SELECT
@@ -895,8 +899,7 @@ def render_new_delivery_trends(
           GROUP BY customer_code
         """
 
-    # 3) item_dim（★根治：VIEW_UNIFIED 起点で商品名を供給）
-    #    unified に jan_code が無い場合は、NEW_DELIVERY の product_name がある時だけそこを使う。
+    # item_dim（VIEW_UNIFIED起点優先）
     unified_has_jan = c(unified_colmap, "jan_code") != "jan_code"
     nd_has_pname = c(nd_colmap, "product_name") != "product_name"
 
@@ -917,7 +920,6 @@ def render_new_delivery_trends(
           GROUP BY jan_code
         """
     else:
-        # 最終手段：JANしか出せない（止めない）
         item_dim_sql = f"""
           SELECT
             CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
@@ -926,7 +928,7 @@ def render_new_delivery_trends(
           GROUP BY jan_code
         """
 
-    # 4) Parent（トレンド）
+    # --- ★ modeごとの集計
     if mode.startswith("🏢"):
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
@@ -1005,44 +1007,22 @@ def render_new_delivery_trends(
         st.info("該当期間のトレンドがありません。")
         return
 
-    # 5) ☑選択UI（複数可）
+    # --- ★ data_editor の key を固定（modeごとに別key）
     df_show = df_parent.copy()
     df_show.insert(0, "☑", False)
 
     if key_col == "group_name":
-        df_show = df_show.rename(
-            columns={
-                "group_name": "グループ",
-                "customer_cnt": "得意先数",
-                "item_cnt": "品目数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_show = df_show.rename(columns={"group_name": "グループ", "customer_cnt": "得意先数", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "グループ", "得意先数", "品目数", "売上", "粗利"]
+        pick_col = "グループ"
     elif key_col == "customer_code":
-        df_show = df_show.rename(
-            columns={
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "group_name": "グループ",
-                "item_cnt": "品目数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_show = df_show.rename(columns={"customer_code": "得意先コード", "customer_name": "得意先名", "group_name": "グループ", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "得意先コード", "得意先名", "グループ", "品目数", "売上", "粗利"]
+        pick_col = "得意先コード"
     else:
-        df_show = df_show.rename(
-            columns={
-                "jan_code": "JAN",
-                "product_name": "代表商品名",
-                "customer_cnt": "得意先数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_show = df_show.rename(columns={"jan_code": "JAN", "product_name": "代表商品名", "customer_cnt": "得意先数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "JAN", "代表商品名", "得意先数", "売上", "粗利"]
+        pick_col = "JAN"
 
     edited = st.data_editor(
         df_show[display_cols].fillna(""),
@@ -1050,25 +1030,17 @@ def render_new_delivery_trends(
         hide_index=True,
         disabled=[c_ for c_ in display_cols if c_ != "☑"],
         column_config={"☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）")},
+        key=f"nd_trend_editor_{key_col}",  # ★固定
     )
 
-    selected_keys: list[str] = []
-    try:
-        sel_df = edited[edited["☑"] == True]
-        if not sel_df.empty:
-            if key_col == "group_name":
-                selected_keys = sel_df["グループ"].astype(str).tolist()
-            elif key_col == "customer_code":
-                selected_keys = sel_df["得意先コード"].astype(str).tolist()
-            else:
-                selected_keys = sel_df["JAN"].astype(str).tolist()
-    except Exception:
-        selected_keys = []
-
-    if not selected_keys:
+    sel_df = edited[edited["☑"] == True]
+    if sel_df.empty:
         st.caption("☑にチェックすると下に明細が出ます（複数選択可）。")
         return
 
+    selected_keys = sel_df[pick_col].astype(str).tolist()
+
+    # --- 明細（既存ロジックのまま）
     st.divider()
     st.markdown("#### 🧾 明細（新規納品 Realized）")
 
@@ -1077,7 +1049,6 @@ def render_new_delivery_trends(
     if key_col == "group_name":
         params2 = {} if is_admin else {"login_email": login_email}
         params2["group_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
@@ -1108,7 +1079,6 @@ def render_new_delivery_trends(
     elif key_col == "customer_code":
         params2 = {} if is_admin else {"login_email": login_email}
         params2["customer_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
@@ -1139,7 +1109,6 @@ def render_new_delivery_trends(
     else:
         params2 = {} if is_admin else {"login_email": login_email}
         params2["jan_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql}),
@@ -1190,7 +1159,6 @@ def render_new_delivery_trends(
         hide_index=True,
     )
 
-
 def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool, colmap: Dict[str, str]) -> None:
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
 
@@ -1207,6 +1175,13 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
         st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
         st.stop()
 
+    # --- ★ セッション状態（巻き戻り防止）
+    if "nd_summary_loaded" not in st.session_state:
+        st.session_state.nd_summary_loaded = False
+    if "nd_summary_df" not in st.session_state:
+        st.session_state.nd_summary_df = pd.DataFrame()
+
+    # 読込ボタン（トリガーだけ）
     if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
         where_ext = "" if is_admin else f"AND {c(nd_colmap,'login_email')} = @login_email"
         params = None if is_admin else {"login_email": login_email}
@@ -1241,20 +1216,34 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
         WHERE DATE_TRUNC({c(nd_colmap,'first_sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
         ORDER BY `期間`
         """
+
         df_new = query_df_safe(client, sql, params, label="New Deliveries")
+        st.session_state.nd_summary_df = df_new.copy()
+        st.session_state.nd_summary_loaded = True
 
-        if not df_new.empty:
-            df_new[["売上", "粗利"]] = df_new[["売上", "粗利"]].fillna(0)
-            st.dataframe(
-                df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info("新規納品データがありません。")
+    # --- ★ ここから下は「読み込み済みなら常に表示」＝巻き戻らない
+    if not st.session_state.nd_summary_loaded:
+        st.info("上のボタンで新規納品実績を読み込みます。")
+        return
 
-        st.divider()
-        render_new_delivery_trends(client, login_email, is_admin, nd_colmap, colmap)
+    df_new = st.session_state.nd_summary_df
+    if df_new is None or df_new.empty:
+        st.info("新規納品データがありません。")
+    else:
+        df_new = df_new.copy()
+        for coln in ["売上", "粗利"]:
+            if coln in df_new.columns:
+                df_new[coln] = df_new[coln].fillna(0)
+
+        st.dataframe(
+            df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    # ★ トレンドUIも常時描画
+    render_new_delivery_trends(client, login_email, is_admin, nd_colmap, colmap)
 
 
 # -----------------------------
