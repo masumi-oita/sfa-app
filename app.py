@@ -115,23 +115,33 @@ def setup_bigquery_client() -> bigquery.Client:
     )
 
 
-def _normalize_param(value: Any) -> Tuple[str, Optional[Any]]:
+def _build_query_parameter(key: str, value: Any) -> bigquery.QueryParameter:
+    # 明示タプル指定 (TYPE, VALUE)
     if isinstance(value, tuple) and len(value) == 2:
         p_type, p_value = value
-        return str(p_type).upper(), p_value
+        p_type = str(p_type).upper()
+        if p_type.startswith("ARRAY<") and isinstance(p_value, (list, tuple)):
+            # ARRAY<STRING> だけまず対応（必要なら増やす）
+            return bigquery.ArrayQueryParameter(key, "STRING", list(p_value))
+        return bigquery.ScalarQueryParameter(key, p_type, p_value)
 
+    # 配列は ARRAY<STRING> として渡す（今回の group_keys / customer_keys / jan_keys 用）
+    if isinstance(value, (list, tuple)):
+        return bigquery.ArrayQueryParameter(key, "STRING", [None if v is None else str(v) for v in value])
+
+    # スカラー
     if value is None:
-        return "STRING", None
+        return bigquery.ScalarQueryParameter(key, "STRING", None)
     if isinstance(value, bool):
-        return "BOOL", value
+        return bigquery.ScalarQueryParameter(key, "BOOL", value)
     if isinstance(value, int):
-        return "INT64", value
+        return bigquery.ScalarQueryParameter(key, "INT64", value)
     if isinstance(value, float):
-        return "FLOAT64", value
+        return bigquery.ScalarQueryParameter(key, "FLOAT64", value)
     if isinstance(value, pd.Timestamp):
-        return "TIMESTAMP", value.to_pydatetime()
+        return bigquery.ScalarQueryParameter(key, "TIMESTAMP", value.to_pydatetime())
 
-    return "STRING", str(value)
+    return bigquery.ScalarQueryParameter(key, "STRING", str(value))
 
 
 def query_df_safe(
@@ -145,11 +155,7 @@ def query_df_safe(
     try:
         job_config = bigquery.QueryJobConfig()
         if params:
-            query_params = []
-            for key, raw_value in params.items():
-                p_type, p_value = _normalize_param(raw_value)
-                query_params.append(bigquery.ScalarQueryParameter(key, p_type, p_value))
-            job_config.query_parameters = query_params
+            job_config.query_parameters = [_build_query_parameter(k, v) for k, v in params.items()]
 
         job = client.query(sql, job_config=job_config)
         job.result(timeout=timeout_sec)
@@ -1108,6 +1114,16 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
 
 
 def render_new_delivery_trends(
+    # 表示に必要（欠けたらトレンドの品名/得意先名が出せない）
+need_for_display = []
+for k in ("customer_name", "product_name"):
+    if k not in nd_colmap:
+        need_for_display.append(k)
+
+if need_for_display:
+    st.error("VIEW_NEW_DELIVERY に表示用の列が不足しています。")
+    st.code("不足キー: " + ", ".join(need_for_display))
+    st.stop()
     client: bigquery.Client,
     login_email: str,
     is_admin: bool,
@@ -1483,6 +1499,12 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
         st.divider()
         # ★ トレンド（今回のエラー箇所を根治）
         render_new_delivery_trends(client, login_email, is_admin, nd_colmap, colmap)
+
+# 非管理者は login_email 列が必須
+if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
+    st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
+    st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
+    st.stop()
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
