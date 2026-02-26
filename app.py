@@ -121,11 +121,11 @@ def _build_query_parameter(key: str, value: Any) -> bigquery.QueryParameter:
         p_type, p_value = value
         p_type = str(p_type).upper()
         if p_type.startswith("ARRAY<") and isinstance(p_value, (list, tuple)):
-            # ARRAY<STRING> だけまず対応（必要なら増やす）
+            # ARRAY<STRING> をまず対応（必要なら拡張）
             return bigquery.ArrayQueryParameter(key, "STRING", list(p_value))
         return bigquery.ScalarQueryParameter(key, p_type, p_value)
 
-    # 配列は ARRAY<STRING> として渡す（今回の group_keys / customer_keys / jan_keys 用）
+    # 配列は ARRAY<STRING> として渡す（group_keys / customer_keys / jan_keys 用）
     if isinstance(value, (list, tuple)):
         return bigquery.ArrayQueryParameter(key, "STRING", [None if v is None else str(v) for v in value])
 
@@ -232,9 +232,9 @@ def get_view_columns(_client: bigquery.Client, view_fqn: str) -> set[str]:
 
 
 def _pick_from(cols: set[str], *cands: str) -> Optional[str]:
-    for c in cands:
-        if c and c.lower() in cols:
-            return c.lower()
+    for c_ in cands:
+        if c_ and c_.lower() in cols:
+            return c_.lower()
     return None
 
 
@@ -393,10 +393,8 @@ def resolve_new_delivery_colmap(_client: bigquery.Client) -> Dict[str, str]:
         "login_email": ("login_email", "email", "担当者メール", "担当メール"),
         "staff_name": ("staff_name", "担当者名", "担当社員名", "担当"),
     }
-    # このVIEWで最低限必要なもの（トレンドと集計が成立する最小）
+    # 最低限の成立条件
     required = ("first_sales_date", "customer_code", "jan_code", "sales_amount", "gross_profit")
-    # customer_name/product_name はトレンドで表示に使うので「準必須」扱いにしたいが、
-    # 実列が無い可能性もあるため、ここでは required に入れず、呼び出し側で不足時に止める。
     return resolve_view_colmap(_client, VIEW_NEW_DELIVERY, mapping, required)
 
 
@@ -585,18 +583,12 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
             render_summary_metrics(df_me.iloc[0])
 
 
-# ※ 既存の render_group_underperformance_section / render_yoy_section / render_adoption_alerts_section / render_customer_drilldown は
-# あなたの提示コードを踏襲（変更なし）。長いのでここから下は「提示コードそのまま」を貼っています。
-# ただし、render_new_deliveries_section だけは今回修正しています。
-
-
 def render_group_underperformance_section(
     client: bigquery.Client,
     role: RoleInfo,
     scope: ScopeFilter,
     colmap: Dict[str, str],
 ) -> None:
-    # --- あなたの提示コードそのまま（省略なしで維持） ---
     st.subheader("🏢 得意先・グループ別パフォーマンス ＆ 要因分析")
 
     if "group_perf_mode" not in st.session_state:
@@ -832,8 +824,13 @@ def render_group_underperformance_section(
             st.info("要因データが見つかりません。")
 
 
-def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter, colmap: Dict[str, str]) -> None:
-    # --- あなたの提示コードそのまま（変更なし） ---
+def render_yoy_section(
+    client: bigquery.Client,
+    login_email: str,
+    is_admin: bool,
+    scope: ScopeFilter,
+    colmap: Dict[str, str],
+) -> None:
     st.subheader("📊 年間 YoY ランキング（成分・YJ優先｜YJ=0/nullはJANキーで追跡）")
 
     if "yoy_mode" not in st.session_state:
@@ -951,14 +948,13 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         pass
 
     st.divider()
-
     st.header("🔍 第二階層：詳細分析（スコープ内）")
 
     key_opts = ["全成分を表示"] + list(df_rank["yj_key"].astype(str).unique())
     display_map = {"全成分を表示": "🚩 スコープ内の全成分を合計して表示"}
     for _, r in df_rank.iterrows():
-        k = str(r["yj_key"])
-        display_map[k] = f"{normalize_product_display_name(r['product_name'])}（差額: ¥{r['sales_diff_yoy']:,.0f}）"
+        k_ = str(r["yj_key"])
+        display_map[k_] = f"{normalize_product_display_name(r['product_name'])}（差額: ¥{r['sales_diff_yoy']:,.0f}）"
 
     idx = 0
     if st.session_state.selected_yoy_key in key_opts:
@@ -1024,9 +1020,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     df_cust = query_df_safe(client, sql_cust, params, "YoY Detail Customers")
     if not df_cust.empty:
         st.dataframe(
-            df_cust.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
+            df_cust.fillna(0).style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}),
             use_container_width=True,
             hide_index=True,
         )
@@ -1066,9 +1060,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     df_jan = query_df_safe(client, sql_jan, params, "YoY Detail JAN")
     if not df_jan.empty:
         st.dataframe(
-            df_jan.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
+            df_jan.fillna(0).style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}),
             use_container_width=True,
             hide_index=True,
         )
@@ -1103,9 +1095,7 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
     df_month = query_df_safe(client, sql_month, params, "YoY Detail Month")
     if not df_month.empty:
         st.dataframe(
-            df_month.fillna(0).style.format(
-                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}
-            ),
+            df_month.fillna(0).style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "前年差額": "¥{:,.0f}"}),
             use_container_width=True,
             hide_index=True,
         )
@@ -1113,6 +1103,9 @@ def render_yoy_section(client: bigquery.Client, login_email: str, is_admin: bool
         st.info("月次推移がありません。")
 
 
+# -----------------------------
+# ★ v1.4.9 新規納品：トレンド（完全置換・☑明細対応）
+# -----------------------------
 def render_new_delivery_trends(
     client: bigquery.Client,
     login_email: str,
@@ -1122,10 +1115,7 @@ def render_new_delivery_trends(
 ) -> None:
     st.markdown("##### 📈 新規納品トレンド（グループ / 得意先 / 商品）")
 
-    # --------------------------
     # 0) 事前バリデーション（沈黙しない）
-    # --------------------------
-    # 必須（集計が成立する最低限）
     missing_required = nd_colmap.get("_missing_required")
     if missing_required:
         st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
@@ -1138,34 +1128,27 @@ def render_new_delivery_trends(
         st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、resolve_new_delivery_colmap の mapping に実列名を追加してください。")
         st.stop()
 
-    # 表示用（無いと「得意先名/商品名」が表示不能）
+    # 表示用（無いと「得意先名/商品名」が表示不能）→ 止める（あなたの要件）
     need_display: list[str] = []
     if c(nd_colmap, "customer_name") == "customer_name":
         need_display.append("customer_name")
     if c(nd_colmap, "product_name") == "product_name":
         need_display.append("product_name")
-
     if need_display:
         st.error("VIEW_NEW_DELIVERY に表示用の列が不足しています（トレンド表示ができません）。")
         st.code("不足キー: " + ", ".join(need_display))
         st.stop()
 
-    # --------------------------
     # 1) UI
-    # --------------------------
     days = st.slider("対象期間（日）", min_value=7, max_value=180, value=60, step=1)
     mode = st.radio("表示単位", ["🏢 グループ", "🏥 得意先", "💊 商品"], horizontal=True)
 
-    # VIEW_NEW_DELIVERY の権限制御（login_emailで絞る）
     where_ext = "" if is_admin else f"AND nd.{c(nd_colmap,'login_email')} = @login_email"
     base_params = None if is_admin else {"login_email": login_email}
 
-    # グループ列のSQL式（VIEW_UNIFIED由来）
     group_expr, _ = resolve_customer_group_sql_expr(client)
 
-    # --------------------------
-    # 2) DIM（cust / item）— VIEW_UNIFIED から作る（表示安定）
-    # --------------------------
+    # 2) DIM（cust / item）
     if group_expr:
         cust_dim_sql = f"""
           SELECT
@@ -1185,8 +1168,6 @@ def render_new_delivery_trends(
           GROUP BY customer_code
         """
 
-    # 商品名は VIEW_NEW_DELIVERY 自身の product_name を優先（最も自然）
-    # ただし表記ゆれ除去（/以降カット）はここで統一する
     item_dim_sql = f"""
       SELECT
         CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
@@ -1195,9 +1176,7 @@ def render_new_delivery_trends(
       GROUP BY jan_code
     """
 
-    # --------------------------
     # 3) Parent（トレンド）
-    # --------------------------
     if mode.startswith("🏢"):
         sql_parent = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
@@ -1276,21 +1255,13 @@ def render_new_delivery_trends(
         st.info("該当期間のトレンドがありません。")
         return
 
-    # --------------------------
     # 4) ☑選択UI（複数可）
-    # --------------------------
     df_show = df_parent.copy()
     df_show.insert(0, "☑", False)
 
     if key_col == "group_name":
         df_show = df_show.rename(
-            columns={
-                "group_name": "グループ",
-                "customer_cnt": "得意先数",
-                "item_cnt": "品目数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
+            columns={"group_name": "グループ", "customer_cnt": "得意先数", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"}
         )
         display_cols = ["☑", "グループ", "得意先数", "品目数", "売上", "粗利"]
     elif key_col == "customer_code":
@@ -1307,13 +1278,7 @@ def render_new_delivery_trends(
         display_cols = ["☑", "得意先コード", "得意先名", "グループ", "品目数", "売上", "粗利"]
     else:
         df_show = df_show.rename(
-            columns={
-                "jan_code": "JAN",
-                "product_name": "代表商品名",
-                "customer_cnt": "得意先数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
+            columns={"jan_code": "JAN", "product_name": "代表商品名", "customer_cnt": "得意先数", "sales_amount": "売上", "gross_profit": "粗利"}
         )
         display_cols = ["☑", "JAN", "代表商品名", "得意先数", "売上", "粗利"]
 
@@ -1345,10 +1310,6 @@ def render_new_delivery_trends(
     st.divider()
     st.markdown("#### 🧾 明細（新規納品 Realized）")
 
-    # --------------------------
-    # 5) Detail（明細）
-    #    ※ UNNEST(@keys) を使うので query_df_safe は ArrayQueryParameter 対応が必須
-    # --------------------------
     base_where = f"nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY) {where_ext}"
 
     if key_col == "group_name":
@@ -1467,7 +1428,13 @@ def render_new_delivery_trends(
         hide_index=True,
     )
 
-def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool, colmap: Dict[str, str]) -> None:
+
+def render_new_deliveries_section(
+    client: bigquery.Client,
+    login_email: str,
+    is_admin: bool,
+    colmap: Dict[str, str],
+) -> None:
     st.subheader("🎉 新規納品サマリー（Realized / 実績）")
 
     # ★ VIEW_NEW_DELIVERY 用ColMap（今回追加）
@@ -1476,6 +1443,12 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
     if missing:
         st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
         st.code(f"不足キー: {missing}")
+        st.stop()
+
+    # 非管理者は login_email 列が必須（ここは “関数内” に置く：SyntaxError防止）
+    if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
+        st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
+        st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
         st.stop()
 
     if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
@@ -1525,18 +1498,11 @@ def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_
             st.info("新規納品データがありません。")
 
         st.divider()
-        # ★ トレンド（今回のエラー箇所を根治）
+        # ★ トレンド（今回のエラー箇所を根治）※ unified_colmap として colmap を渡す
         render_new_delivery_trends(client, login_email, is_admin, nd_colmap, colmap)
-
-# 非管理者は login_email 列が必須
-if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
-    st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
-    st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
-    st.stop()
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
-    # --- あなたの提示コードそのまま（変更なし） ---
     st.subheader("🚨 採用アイテム・失注アラート")
     where_clause = "" if is_admin else "WHERE login_email = @login_email"
     params = None if is_admin else {"login_email": login_email}
@@ -1604,8 +1570,13 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
     )
 
 
-def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admin: bool, scope: ScopeFilter, colmap: Dict[str, str]) -> None:
-    # --- あなたの提示コードそのまま（変更なし） ---
+def render_customer_drilldown(
+    client: bigquery.Client,
+    login_email: str,
+    is_admin: bool,
+    scope: ScopeFilter,
+    colmap: Dict[str, str],
+) -> None:
     st.subheader("🎯 担当先ドリルダウン ＆ 提案（Reco）")
 
     role_filter = "" if is_admin else f"{c(colmap,'login_email')} = @login_email"
@@ -1662,11 +1633,7 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
             df_adopt[col] = pd.to_numeric(df_adopt[col], errors="coerce").fillna(0)
         st.dataframe(
             df_adopt.style.format(
-                {
-                    "今期売上": "¥{:,.0f}",
-                    "前期売上": "¥{:,.0f}",
-                    "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
-                }
+                {"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""}
             ),
             use_container_width=True,
             hide_index=True,
@@ -1694,13 +1661,7 @@ def render_customer_drilldown(client: bigquery.Client, login_email: str, is_admi
     df_rec = query_df_safe(client, sql_rec, {"c": sel}, "Recommendation")
     if not df_rec.empty:
         df_disp = df_rec[["priority_rank", "recommend_product", "manufacturer", "strong_category", "market_scale"]].rename(
-            columns={
-                "priority_rank": "順位",
-                "recommend_product": "推奨商品",
-                "manufacturer": "メーカー",
-                "strong_category": "強み分類",
-                "market_scale": "市場規模",
-            }
+            columns={"priority_rank": "順位", "recommend_product": "推奨商品", "manufacturer": "メーカー", "strong_category": "強み分類", "market_scale": "市場規模"}
         )
         st.dataframe(df_disp, use_container_width=True, hide_index=True)
     else:
@@ -1747,6 +1708,13 @@ def main() -> None:
         with st.expander("🔧 VIEW_NEW_DELIVERY 列マップ（自動解決結果）", expanded=False):
             st.json(resolve_new_delivery_colmap(client))
 
+        with st.expander("🔍 グループ列候補プロファイル（参考）", expanded=False):
+            prof = get_customer_group_column_profiles(client)
+            if prof.empty:
+                st.caption("グループ列候補なし / または情報取得不可")
+            else:
+                st.dataframe(prof, use_container_width=True, hide_index=True)
+
     if not login_id or not login_pw:
         st.info("👈 サイドバーからログインしてください。")
         return
@@ -1774,6 +1742,7 @@ def main() -> None:
     scope = render_scope_filters(client, role)
     st.divider()
 
+    # 本体
     if role.role_admin_view:
         render_group_underperformance_section(client, role, scope, colmap)
         st.divider()
