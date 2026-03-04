@@ -19,6 +19,9 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (Final Complete Edition)
 - VIEW_NEW_DELIVERY に customer_name/product_name が無くても VIEW_UNIFIED から補完
 - YoY等での年度判定を MAX(fiscal_year) ではなく CURRENT_DATE ベースに完全統一（未来データ混入対策）
 - YoY第二階層を「全成分を表示」デフォルト対応（ドリルダウンしやすく修正）
+
+【★最新追加機能】
+- サマリー（最上部）に「当月実績」および「前年同月差額」の表示を追加。
 """
 
 from __future__ import annotations
@@ -62,7 +65,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜Final Complete Edition (ColMap + 安全な年度判定 + 欠損列補完)")
+    st.caption("OS v1.4.9｜Final Complete Edition (ColMap + 安全な年度判定 + 欠損列補完 + 当月実績表示)")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -495,6 +498,7 @@ def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> 
 # 4. UI Sections
 # -----------------------------
 def render_summary_metrics(row: pd.Series) -> None:
+    # 累計データ
     s_cur = get_safe_float(row, "sales_amount_fytd")
     s_py_ytd = get_safe_float(row, "sales_amount_py_ytd")
     s_py_total = get_safe_float(row, "sales_amount_py_total")
@@ -505,26 +509,34 @@ def render_summary_metrics(row: pd.Series) -> None:
     gp_py_total = get_safe_float(row, "gross_profit_py_total")
     gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd > 0 else gp_cur
 
+    # 当月データ
+    s_cm = get_safe_float(row, "sales_amount_cm")
+    s_py_cm = get_safe_float(row, "sales_amount_py_cm")
+    gp_cm = get_safe_float(row, "gross_profit_cm")
+    gp_py_cm = get_safe_float(row, "gross_profit_py_cm")
+
     st.caption(
         "※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」"
         "による季節変動を加味した推移ペース（着地見込）です。"
     )
 
     st.markdown("##### ■ 売上")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("① 今期累計", f"¥{s_cur:,.0f}")
-    c2.metric("② 前年同期", f"¥{s_py_ytd:,.0f}", delta=f"{int(s_cur - s_py_ytd):,}" if s_py_ytd > 0 else None)
-    c3.metric("③ 昨年度着地", f"¥{s_py_total:,.0f}")
-    c4.metric("④ 今期予測", f"¥{s_fc:,.0f}")
-    c5.metric("⑤ 着地GAP", f"¥{s_fc - s_py_total:,.0f}", delta=f"{int(s_fc - s_py_total):,}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("⭐ 当月実績", f"¥{s_cm:,.0f}", delta=f"{int(s_cm - s_py_cm):,}" if s_py_cm > 0 else None)
+    c2.metric("① 今期累計", f"¥{s_cur:,.0f}")
+    c3.metric("② 前年同期", f"¥{s_py_ytd:,.0f}", delta=f"{int(s_cur - s_py_ytd):,}" if s_py_ytd > 0 else None)
+    c4.metric("③ 昨年度着地", f"¥{s_py_total:,.0f}")
+    c5.metric("④ 今期予測", f"¥{s_fc:,.0f}")
+    c6.metric("⑤ 着地GAP", f"¥{s_fc - s_py_total:,.0f}", delta=f"{int(s_fc - s_py_total):,}")
 
     st.markdown("##### ■ 粗利")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("① 今期累計", f"¥{gp_cur:,.0f}")
-    c2.metric("② 前年同期", f"¥{gp_py_ytd:,.0f}", delta=f"{int(gp_cur - gp_py_ytd):,}" if gp_py_ytd > 0 else None)
-    c3.metric("③ 昨年度着地", f"¥{gp_py_total:,.0f}")
-    c4.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
-    c5.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("⭐ 当月実績", f"¥{gp_cm:,.0f}", delta=f"{int(gp_cm - gp_py_cm):,}" if gp_py_cm > 0 else None)
+    c2.metric("① 今期累計", f"¥{gp_cur:,.0f}")
+    c3.metric("② 前年同期", f"¥{gp_py_ytd:,.0f}", delta=f"{int(gp_cur - gp_py_ytd):,}" if gp_py_ytd > 0 else None)
+    c4.metric("③ 昨年度着地", f"¥{gp_py_total:,.0f}")
+    c5.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
+    c6.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,}")
 
 
 def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> None:
@@ -546,6 +558,11 @@ def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> 
                     - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
             )
             SELECT
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
@@ -572,6 +589,11 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
                     - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
             )
             SELECT
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
               SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
