@@ -28,6 +28,7 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (True Final Edition - 完全根絶
 【★追加（今回）】
 - ★メーカー別パフォーマンス（前期/今期 売上・粗利）セクションを追加
 - ★VIEW_UNIFIED からメーカー列（manufacturer/maker/製造元/メーカー等）をColMapで吸収
+- ★サマリーに総薬価・加重平均を追加
 """
 
 from __future__ import annotations
@@ -356,8 +357,9 @@ def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
         "yj_code": ("yj_code", "yjcode", "yj", "YJCode"),
         "jan_code": ("jan_code", "jan", "JAN"),
         "package_unit": ("package_unit", "pack_unit", "包装単位", "包装"),
-        # ★追加：メーカー列（VIEW_UNIFIED内に存在する場合のみ採用）
-        "manufacturer": ("manufacturer", "maker", "メーカー", "製造元", "製造販売元", "manufacturer_name"),
+        # ★追加：メーカー列・薬価列（VIEW_UNIFIED内に存在する場合のみ採用）
+        "manufacturer": ("manufacturer", "maker_name", "maker", "メーカー", "製造元", "製造販売元", "manufacturer_name"),
+        "total_drug_price": ("total_drug_price", "総薬価", "薬価金額"),
     }
     optional = {
         "staff_name": ("staff_name", "担当者名", "担当社員名", "担当社員氏", "担当"),
@@ -509,6 +511,22 @@ def render_summary_metrics(row: pd.Series) -> None:
     gp_cm = get_safe_float(row, "gross_profit_cm")
     gp_py_cm = get_safe_float(row, "gross_profit_py_cm")
 
+    # ★追加：薬価
+    dp_cur = get_safe_float(row, "drug_price_fytd")
+    dp_py_ytd = get_safe_float(row, "drug_price_py_ytd")
+    dp_py_total = get_safe_float(row, "drug_price_py_total")
+    dp_fc = dp_cur * (dp_py_total / dp_py_ytd) if dp_py_ytd > 0 else dp_cur
+    dp_cm = get_safe_float(row, "drug_price_cm")
+    dp_py_cm = get_safe_float(row, "drug_price_py_cm")
+
+    # ★追加：加重平均 (納入価率) = (売上 / 総薬価) * 100
+    rate_cm = (s_cm / dp_cm * 100) if dp_cm > 0 else 0.0
+    rate_py_cm = (s_py_cm / dp_py_cm * 100) if dp_py_cm > 0 else 0.0
+    rate_cur = (s_cur / dp_cur * 100) if dp_cur > 0 else 0.0
+    rate_py_ytd = (s_py_ytd / dp_py_ytd * 100) if dp_py_ytd > 0 else 0.0
+    rate_py_total = (s_py_total / dp_py_total * 100) if dp_py_total > 0 else 0.0
+    rate_fc = (s_fc / dp_fc * 100) if dp_fc > 0 else 0.0
+
     st.caption(
         "※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」"
         "による季節変動を加味した推移ペース（着地見込）です。"
@@ -532,6 +550,25 @@ def render_summary_metrics(row: pd.Series) -> None:
     c5_.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
     c6_.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,}")
 
+    # ★追加セクション
+    st.markdown("##### ■ 総納入薬価")
+    c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
+    c1_.metric("⭐ 当月実績", f"¥{dp_cm:,.0f}", delta=f"{int(dp_cm - dp_py_cm):,}" if dp_py_cm > 0 else None)
+    c2_.metric("① 今期累計", f"¥{dp_cur:,.0f}")
+    c3_.metric("② 前年同期", f"¥{dp_py_ytd:,.0f}", delta=f"{int(dp_cur - dp_py_ytd):,}" if dp_py_ytd > 0 else None)
+    c4_.metric("③ 昨年度着地", f"¥{dp_py_total:,.0f}")
+    c5_.metric("④ 今期予測", f"¥{dp_fc:,.0f}")
+    c6_.metric("⑤ 着地GAP", f"¥{dp_fc - dp_py_total:,.0f}", delta=f"{int(dp_fc - dp_py_total):,}")
+
+    st.markdown("##### ■ 加重平均 (納入価率)")
+    c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
+    c1_.metric("⭐ 当月実績", f"{rate_cm:,.1f}%", delta=f"{rate_cm - rate_py_cm:,.1f}%" if dp_py_cm > 0 else None)
+    c2_.metric("① 今期累計", f"{rate_cur:,.1f}%")
+    c3_.metric("② 前年同期", f"{rate_py_ytd:,.1f}%", delta=f"{rate_cur - rate_py_ytd:,.1f}%" if dp_py_ytd > 0 else None)
+    c4_.metric("③ 昨年度着地", f"{rate_py_total:,.1f}%")
+    c5_.metric("④ 今期予測", f"{rate_fc:,.1f}%")
+    c6_.metric("⑤ 着地GAP", f"{rate_fc - rate_py_total:,.1f}%", delta=f"{rate_fc - rate_py_total:,.1f}%")
+
 
 def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> None:
     st.subheader("🏢 年度累計（FYTD）｜全社サマリー")
@@ -552,27 +589,25 @@ def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> 
                     - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
             )
             SELECT
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH)
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH)
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH)
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH)
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_cm,
+              
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_cm,
 
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_fytd,
+              
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_ytd,
+              
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_total
             FROM `{VIEW_UNIFIED}`
             CROSS JOIN today_info
         """
@@ -593,27 +628,25 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
                     - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
             )
             SELECT
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH)
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH)
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH)
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH)
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_cm,
+              
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
+              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_cm,
 
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1
-                       THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1
-                       THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_fytd,
+              
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_ytd,
+              
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total,
+              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_total
             FROM `{VIEW_UNIFIED}`
             CROSS JOIN today_info
             WHERE {c(colmap,'login_email')} = @login_email
@@ -632,14 +665,14 @@ def render_manufacturer_performance_section(
     scope: ScopeFilter,
     colmap: Dict[str, str],
 ) -> None:
-    st.subheader("🏭 メーカー別パフォーマンス（前期 / 今期：売上・粗利）")
+    st.subheader("🏭 メーカー別パフォーマンス（前期 / 今期：売上・粗利・加重平均）")
 
     manu_col = colmap.get("manufacturer")
-    if not manu_col:
-        st.info("VIEW_UNIFIED にメーカー列が見つからないため、このセクションは表示できません。（manufacturer/maker/メーカー等）")
+    dp_col = colmap.get("total_drug_price")
+    if not manu_col or not dp_col:
+        st.info("VIEW_UNIFIED にメーカー列または総薬価列が見つからないため、このセクションは表示できません。")
         return
 
-    # 管理者/非管理者スコープ
     role_filter = "" if role.role_admin_view else f"{c(colmap,'login_email')} = @login_email"
     scope_filter_clause = scope.where_clause()
     where_sql = _compose_where(role_filter, scope_filter_clause)
@@ -648,7 +681,6 @@ def render_manufacturer_performance_section(
     if not role.role_admin_view:
         params["login_email"] = role.login_email
 
-    # FY定義：CURRENT_DATEベース
     sql = f"""
       WITH fy AS (
         SELECT
@@ -661,13 +693,14 @@ def render_manufacturer_performance_section(
         SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS ty_sales,
         SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS py_sales,
         SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS ty_gp,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS py_gp
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS py_gp,
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {dp_col} ELSE 0 END) AS ty_dp
       FROM `{VIEW_UNIFIED}`
       CROSS JOIN fy
       {where_sql}
       GROUP BY manufacturer
-      HAVING ty_sales != 0 OR py_sales != 0 OR ty_gp != 0 OR py_gp != 0
-      ORDER BY (ty_sales - py_sales) ASC
+      HAVING ty_sales != 0 OR py_sales != 0
+      ORDER BY ty_sales DESC
       LIMIT 200
     """
     df = query_df_safe(client, sql, params, "Manufacturer Perf")
@@ -681,32 +714,25 @@ def render_manufacturer_performance_section(
     df["粗利差額"] = df["ty_gp"] - df["py_gp"]
     df["売上成長率"] = df.apply(lambda r: ((r["ty_sales"] / r["py_sales"] - 1) * 100) if r["py_sales"] else 0.0, axis=1)
     df["粗利成長率"] = df.apply(lambda r: ((r["ty_gp"] / r["py_gp"] - 1) * 100) if r["py_gp"] else 0.0, axis=1)
+    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_sales"] / r["ty_dp"] * 100) if r["ty_dp"] > 0 else 0.0, axis=1)
 
-    # 並び替えUI
     c1_, c2_, c3_ = st.columns(3)
     sort_key = c1_.selectbox(
         "並び替え",
-        ["売上差額（小→大）", "売上差額（大→小）", "粗利差額（小→大）", "粗利差額（大→小）", "売上成長率（小→大）", "売上成長率（大→小）"],
+        ["今期売上（大→小）", "売上差額（小→大）", "売上差額（大→小）", "粗利差額（小→大）", "粗利差額（大→小）"],
         index=0,
     )
     topn = c2_.slider("表示件数", 20, 200, 80, 10)
-    only_negative = c3_.checkbox("下落のみ（差額<0）", value=True)
+    only_negative = c3_.checkbox("下落のみ（売上差額<0）", value=False)
 
     if only_negative:
         df = df[df["売上差額"] < 0]
 
-    if sort_key == "売上差額（小→大）":
-        df = df.sort_values("売上差額", ascending=True)
-    elif sort_key == "売上差額（大→小）":
-        df = df.sort_values("売上差額", ascending=False)
-    elif sort_key == "粗利差額（小→大）":
-        df = df.sort_values("粗利差額", ascending=True)
-    elif sort_key == "粗利差額（大→小）":
-        df = df.sort_values("粗利差額", ascending=False)
-    elif sort_key == "売上成長率（小→大）":
-        df = df.sort_values("売上成長率", ascending=True)
-    else:
-        df = df.sort_values("売上成長率", ascending=False)
+    if sort_key == "売上差額（小→大）": df = df.sort_values("売上差額", ascending=True)
+    elif sort_key == "売上差額（大→小）": df = df.sort_values("売上差額", ascending=False)
+    elif sort_key == "粗利差額（小→大）": df = df.sort_values("粗利差額", ascending=True)
+    elif sort_key == "粗利差額（大→小）": df = df.sort_values("粗利差額", ascending=False)
+    else: df = df.sort_values("ty_sales", ascending=False)
 
     df = df.head(int(topn))
 
@@ -717,12 +743,13 @@ def render_manufacturer_performance_section(
             "py_sales": "前年同期売上",
             "ty_gp": "今期粗利",
             "py_gp": "前年同期粗利",
+            "ty_dp": "今期総薬価",
         }
     )
 
     st.dataframe(
         df_disp[
-            ["メーカー", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額", "粗利成長率"]
+            ["メーカー", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額", "今期総薬価", "納入価率(加重平均)"]
         ].style.format(
             {
                 "今期売上": "¥{:,.0f}",
@@ -732,7 +759,8 @@ def render_manufacturer_performance_section(
                 "今期粗利": "¥{:,.0f}",
                 "前年同期粗利": "¥{:,.0f}",
                 "粗利差額": "¥{:,.0f}",
-                "粗利成長率": "{:,.1f}%",
+                "今期総薬価": "¥{:,.0f}",
+                "納入価率(加重平均)": "{:,.1f}%",
             }
         ),
         use_container_width=True,
@@ -886,6 +914,8 @@ def render_group_underperformance_section(
     except Exception:
         selected_parent_id = str(df_parent.iloc[0][parent_key_col])
         selected_parent_name = str(df_parent.iloc[0]["名称"])
+
+    st.session_state.selected_parent_id = selected_parent_id
 
     st.divider()
     st.markdown(f"#### 🔎 【{selected_parent_name}】要因（商品）ドリルダウン（全件表示）")
@@ -1228,7 +1258,6 @@ def render_new_delivery_trends(
         st.code(f"不足キー: {missing_required}")
         st.stop()
 
-    # 非管理者は担当者スコープ絞り込みが必要
     if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
         st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
         st.stop()
@@ -1264,7 +1293,6 @@ def render_new_delivery_trends(
           GROUP BY customer_code
         """
 
-    # ★ 安全：新規納品側に product_name があるならそれを使う。無いなら「商品名不明（JAN）」としてJAN文字列。
     nd_prod_col = nd_colmap.get("product_name")
     if nd_prod_col:
         prod_expr = f"CAST(nd.{nd_prod_col} AS STRING)"
@@ -1388,7 +1416,8 @@ def render_new_delivery_trends(
                 "gross_profit": "粗利",
             }
         )
-        display_cols = ["☑", "商品名", "得意先数", "JAN数", "売上", "粗利"]
+        # ★修正：商品キーを必ず表示列に含める（これが無いとsel_df[pick_col]で落ちる）
+        display_cols = ["☑", "商品キー", "商品名", "得意先数", "JAN数", "売上", "粗利"]
         pick_col = "商品キー"
 
     df_view = df_parent[display_cols].copy()
@@ -1396,14 +1425,19 @@ def render_new_delivery_trends(
         if colx != "☑":
             df_view[colx] = df_view[colx].fillna("")
 
+    # ★商品キーは幅最小で邪魔にしない
+    column_config = {
+        "☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）"),
+    }
+    if "商品キー" in df_view.columns:
+        column_config["商品キー"] = st.column_config.TextColumn("商品キー", width="small", help="内部キー（選択連動用）")
+
     edited = st.data_editor(
         df_view,
         use_container_width=True,
         hide_index=True,
         disabled=[c_ for c_ in display_cols if c_ != "☑"],
-        column_config={
-            "☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）"),
-        },
+        column_config=column_config,
         key=f"nd_trend_editor_{key_col}_v2",
     )
 
@@ -1412,6 +1446,7 @@ def render_new_delivery_trends(
         st.caption("☑にチェックすると下に明細が出ます（複数選択可）。")
         return
 
+    # ★ここが落ちていた：商品モードでも必ず pick_col が存在する
     selected_keys = sel_df[pick_col].astype(str).tolist()
 
     st.divider()
@@ -1881,7 +1916,6 @@ def main() -> None:
     render_yoy_section(client, role.login_email, is_admin, scope, unified_colmap)
     st.divider()
 
-    # ★ ここが「引数不一致の根絶ポイント」：nd_colmap / unified_colmap を正しく渡す
     render_new_deliveries_section(client, role.login_email, is_admin, nd_colmap, unified_colmap)
     st.divider()
 
