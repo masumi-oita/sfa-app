@@ -22,6 +22,7 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (Final Complete Edition)
 
 【★最新追加機能】
 - サマリー（最上部）に「当月実績」および「前年同月差額」の表示を追加。
+- 「得意先・グループ別パフォーマンス」の冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化。
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜Final Complete Edition (ColMap + 安全な年度判定 + 欠損列補完 + 当月実績表示)")
+    st.caption("OS v1.4.9｜Final Complete Edition (UI洗練 + ColMap + 当月実績)")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -716,32 +717,15 @@ def render_group_underperformance_section(
     if perf_view == "グループ別" and group_src:
         st.caption(f"抽出元グループ列: `{group_src}`")
 
-    labels = []
-    key_values: List[str] = []
-    for _, r in df_parent.iterrows():
-        if perf_view == "グループ別":
-            k = str(r["名称"])
-            label = f"{r['順位']}｜{k}｜差額 ¥{int(r['売上差額']):,}"
-        else:
-            k = str(r["コード"])
-            label = f"{r['順位']}｜{k} {r['名称']}｜差額 ¥{int(r['売上差額']):,}"
-        labels.append(label)
-        key_values.append(k)
-
-    default_index = 0
-    if st.session_state.selected_parent_id in key_values:
-        default_index = key_values.index(st.session_state.selected_parent_id)
-
-    selected_label = st.radio("📌 要因分析する対象を選択（クリック）", labels, index=default_index, key="parent_pick_radio")
-    selected_parent_id = key_values[labels.index(selected_label)]
-    st.session_state.selected_parent_id = selected_parent_id
-
     show_cols = ["順位"]
     if perf_view != "グループ別":
         show_cols += ["コード"]
     show_cols += ["名称", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額"]
 
-    st.dataframe(
+    st.markdown("👇 **表の行をクリックすると、下の要因分析（商品ドリルダウン）が切り替わります**")
+
+    # ★ 冗長なラジオボタンを撤廃し、データフレームのクリックと連動させる
+    event = st.dataframe(
         df_parent[show_cols].style.format(
             {
                 "今期売上": "¥{:,.0f}",
@@ -756,10 +740,28 @@ def render_group_underperformance_section(
         use_container_width=True,
         hide_index=True,
         column_config=create_default_column_config(df_parent[show_cols]),
+        selection_mode="single-row",
+        on_select="rerun",
+        key=f"grid_parent_{perf_view}_{perf_mode}"
     )
 
+    try:
+        sel_rows = event.selection.rows if hasattr(event, "selection") else []
+        if sel_rows:
+            idx = sel_rows[0]
+            selected_parent_id = str(df_parent.iloc[idx][parent_key_col])
+            selected_parent_name = str(df_parent.iloc[idx]["名称"])
+        else:
+            selected_parent_id = str(df_parent.iloc[0][parent_key_col])
+            selected_parent_name = str(df_parent.iloc[0]["名称"])
+    except:
+        selected_parent_id = str(df_parent.iloc[0][parent_key_col])
+        selected_parent_name = str(df_parent.iloc[0]["名称"])
+
+    st.session_state.selected_parent_id = selected_parent_id
+
     st.divider()
-    st.markdown("#### 🔎 要因（商品）ドリルダウン（全件表示）")
+    st.markdown(f"#### 🔎 【{selected_parent_name}】要因（商品）ドリルダウン（全件表示）")
 
     drill_role_filter = "" if role.role_admin_view else f"{c(colmap,'login_email')} = @login_email"
     drill_scope_clause = scope.where_clause()
@@ -1404,88 +1406,6 @@ def render_new_delivery_trends(
         use_container_width=True,
         hide_index=True,
     )
-
-
-def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool, colmap: Dict[str, str]) -> None:
-    st.subheader("🎉 新規納品サマリー（Realized / 実績）")
-
-    nd_colmap = resolve_new_delivery_colmap(client)
-    missing = nd_colmap.get("_missing_required")
-    if missing:
-        st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
-        st.code(f"不足キー: {missing}")
-        st.stop()
-
-    if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
-        st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
-        st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
-        st.stop()
-
-    if "nd_summary_loaded" not in st.session_state:
-        st.session_state.nd_summary_loaded = False
-    if "nd_summary_df" not in st.session_state:
-        st.session_state.nd_summary_df = pd.DataFrame()
-
-    if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
-        where_ext = "" if is_admin else f"AND {c(nd_colmap,'login_email')} = @login_email"
-        params = None if is_admin else {"login_email": login_email}
-
-        sql = f"""
-        WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
-        SELECT
-          '① 昨日' AS `期間`,
-          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)) AS `得意先数`,
-          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)) AS `品目数`,
-          SUM({c(nd_colmap,'sales_amount')}) AS `売上`,
-          SUM({c(nd_colmap,'gross_profit')}) AS `粗利`
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
-        WHERE {c(nd_colmap,'first_sales_date')} = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
-        UNION ALL
-        SELECT
-          '② 直近7日',
-          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
-          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
-          SUM({c(nd_colmap,'sales_amount')}),
-          SUM({c(nd_colmap,'gross_profit')})
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
-        WHERE {c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
-        UNION ALL
-        SELECT
-          '③ 当月',
-          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
-          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
-          SUM({c(nd_colmap,'sales_amount')}),
-          SUM({c(nd_colmap,'gross_profit')})
-        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
-        WHERE DATE_TRUNC({c(nd_colmap,'first_sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
-        ORDER BY `期間`
-        """
-
-        df_new = query_df_safe(client, sql, params, label="New Deliveries")
-        st.session_state.nd_summary_df = df_new.copy()
-        st.session_state.nd_summary_loaded = True
-
-    if not st.session_state.nd_summary_loaded:
-        st.info("上のボタンで新規納品実績を読み込みます。")
-        return
-
-    df_new = st.session_state.nd_summary_df
-    if df_new is None or df_new.empty:
-        st.info("新規納品データがありません。")
-    else:
-        df_new = df_new.copy()
-        for coln in ["売上", "粗利"]:
-            if coln in df_new.columns:
-                df_new[coln] = df_new[coln].fillna(0)
-
-        st.dataframe(
-            df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.divider()
-    render_new_delivery_trends(client, login_email, is_admin, resolve_new_delivery_colmap(client), colmap)
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
