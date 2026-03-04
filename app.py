@@ -20,9 +20,11 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (Final Complete Edition)
 - YoY等での年度判定を MAX(fiscal_year) ではなく CURRENT_DATE ベースに完全統一（未来データ混入対策）
 - YoY第二階層を「全成分を表示」デフォルト対応（ドリルダウンしやすく修正）
 
-【★最新追加機能】
+【★最新追加機能・バグ修正】
 - サマリー（最上部）に「当月実績」および「前年同月差額」の表示を追加。
-- 「得意先・グループ別パフォーマンス」の冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化。
+- 冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化。
+- 成長率に「¥」がつきカンマが消えるフォーマット干渉バグ（column_configの過剰適用）を撤廃。
+- 体外診断薬等の名称が「/」で途切れてしまう旧ロジック（GC31CH等）を完全撤廃し、フルネーム表示を正常化。
 """
 
 from __future__ import annotations
@@ -66,20 +68,20 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜Final Complete Edition (UI洗練 + ColMap + 当月実績)")
+    st.caption("OS v1.4.9｜Final Complete Edition (フォーマット＆商品名表示バグ修正済)")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
     config: Dict[str, st.column_config.Column] = {}
     for col in df.columns:
-        if any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
-            config[col] = st.column_config.NumberColumn(col, format="¥%d")
-        elif any(k in col for k in ["率", "比", "ペース"]):
+        if any(k in col for k in ["率", "比", "ペース", "成長"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
+        elif any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
+            config[col] = st.column_config.NumberColumn(col)
         elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
             config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
         elif is_numeric_dtype(df[col]):
-            config[col] = st.column_config.NumberColumn(col, format="%d")
+            config[col] = st.column_config.NumberColumn(col)
         else:
             config[col] = st.column_config.TextColumn(col)
     return config
@@ -93,9 +95,8 @@ def get_safe_float(row: pd.Series, key: str) -> float:
 def normalize_product_display_name(name: Any) -> str:
     if pd.isna(name):
         return ""
-    text = str(name).strip()
-    text = re.sub(r"[/／].*$", "", text)
-    return text.strip()
+    # 以前の「/」以降切り捨て処理を撤廃し、マスタの正式名称をそのまま表示
+    return str(name).strip()
 
 
 # -----------------------------
@@ -725,6 +726,7 @@ def render_group_underperformance_section(
     st.markdown("👇 **表の行をクリックすると、下の要因分析（商品ドリルダウン）が切り替わります**")
 
     # ★ 冗長なラジオボタンを撤廃し、データフレームのクリックと連動させる
+    # style.format によりカンマ「,」や「%」が正しく適用されます
     event = st.dataframe(
         df_parent[show_cols].style.format(
             {
@@ -739,7 +741,6 @@ def render_group_underperformance_section(
         ),
         use_container_width=True,
         hide_index=True,
-        column_config=create_default_column_config(df_parent[show_cols]),
         selection_mode="single-row",
         on_select="rerun",
         key=f"grid_parent_{perf_view}_{perf_mode}"
@@ -796,7 +797,8 @@ def render_group_underperformance_section(
               NULLIF(NULLIF(TRIM(CAST({c(colmap,'jan_code')} AS STRING)), ''), '0'),
               TRIM(CAST({c(colmap,'product_name')} AS STRING))
             ) AS yj_key,
-            REGEXP_REPLACE(CAST({c(colmap,'product_name')} AS STRING), r"[/／].*$", "") AS product_base,
+            -- ★「/」以降の切り捨て処理を撤廃し、正しいフルネームを保持
+            CAST({c(colmap,'product_name')} AS STRING) AS product_base,
             SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS ty_sales,
             SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS py_sales
           FROM `{VIEW_UNIFIED}`
@@ -1089,7 +1091,7 @@ def render_new_delivery_trends(
           SELECT
             CAST({c(unified_colmap,'jan_code')} AS STRING) AS jan_code,
             {yj_expr} AS yj_code,
-            ANY_VALUE(REGEXP_REPLACE(CAST({c(unified_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS ingredient_spec_name
+            ANY_VALUE(CAST({c(unified_colmap,'product_name')} AS STRING)) AS ingredient_spec_name
           FROM `{VIEW_UNIFIED}`
           GROUP BY jan_code, yj_code
         """
@@ -1099,7 +1101,7 @@ def render_new_delivery_trends(
               SELECT
                 CAST(nd.{c(nd_colmap,'jan_code')} AS STRING) AS jan_code,
                 NULL AS yj_code,
-                ANY_VALUE(REGEXP_REPLACE(CAST(nd.{c(nd_colmap,'product_name')} AS STRING), r"[/／].*$", "")) AS ingredient_spec_name
+                ANY_VALUE(CAST(nd.{c(nd_colmap,'product_name')} AS STRING)) AS ingredient_spec_name
               FROM `{VIEW_NEW_DELIVERY}` nd
               GROUP BY jan_code
             """
@@ -1406,6 +1408,88 @@ def render_new_delivery_trends(
         use_container_width=True,
         hide_index=True,
     )
+
+
+def render_new_deliveries_section(client: bigquery.Client, login_email: str, is_admin: bool, colmap: Dict[str, str]) -> None:
+    st.subheader("🎉 新規納品サマリー（Realized / 実績）")
+
+    nd_colmap = resolve_new_delivery_colmap(client)
+    missing = nd_colmap.get("_missing_required")
+    if missing:
+        st.error("VIEW_NEW_DELIVERY の必須列が見つかりません。VIEW定義（列名）を確認してください。")
+        st.code(f"不足キー: {missing}")
+        st.stop()
+
+    if (not is_admin) and (c(nd_colmap, "login_email") == "login_email"):
+        st.error("VIEW_NEW_DELIVERY に login_email 列が無いため、担当者スコープ絞り込みができません。")
+        st.code("対処: VIEW_NEW_DELIVERY に login_email を追加するか、nd_colmap mapping に実列名を追加してください。")
+        st.stop()
+
+    if "nd_summary_loaded" not in st.session_state:
+        st.session_state.nd_summary_loaded = False
+    if "nd_summary_df" not in st.session_state:
+        st.session_state.nd_summary_df = pd.DataFrame()
+
+    if st.button("新規納品実績を読み込む", key="btn_new_deliv"):
+        where_ext = "" if is_admin else f"AND {c(nd_colmap,'login_email')} = @login_email"
+        params = None if is_admin else {"login_email": login_email}
+
+        sql = f"""
+        WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today)
+        SELECT
+          '① 昨日' AS `期間`,
+          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)) AS `得意先数`,
+          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)) AS `品目数`,
+          SUM({c(nd_colmap,'sales_amount')}) AS `売上`,
+          SUM({c(nd_colmap,'gross_profit')}) AS `粗利`
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE {c(nd_colmap,'first_sales_date')} = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
+        UNION ALL
+        SELECT
+          '② 直近7日',
+          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
+          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
+          SUM({c(nd_colmap,'sales_amount')}),
+          SUM({c(nd_colmap,'gross_profit')})
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE {c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
+        UNION ALL
+        SELECT
+          '③ 当月',
+          COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
+          COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
+          SUM({c(nd_colmap,'sales_amount')}),
+          SUM({c(nd_colmap,'gross_profit')})
+        FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
+        WHERE DATE_TRUNC({c(nd_colmap,'first_sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
+        ORDER BY `期間`
+        """
+
+        df_new = query_df_safe(client, sql, params, label="New Deliveries")
+        st.session_state.nd_summary_df = df_new.copy()
+        st.session_state.nd_summary_loaded = True
+
+    if not st.session_state.nd_summary_loaded:
+        st.info("上のボタンで新規納品実績を読み込みます。")
+        return
+
+    df_new = st.session_state.nd_summary_df
+    if df_new is None or df_new.empty:
+        st.info("新規納品データがありません。")
+    else:
+        df_new = df_new.copy()
+        for coln in ["売上", "粗利"]:
+            if coln in df_new.columns:
+                df_new[coln] = df_new[coln].fillna(0)
+
+        st.dataframe(
+            df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.divider()
+    render_new_delivery_trends(client, login_email, is_admin, resolve_new_delivery_colmap(client), colmap)
 
 
 def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is_admin: bool) -> None:
