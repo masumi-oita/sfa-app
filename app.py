@@ -24,6 +24,10 @@ SFA｜戦略ダッシュボード - OS v1.4.9 (True Final Edition - 完全根絶
 - ★体外診断薬等の名称が「/」で途切れる旧ロジック（Python側およびSQL側の REGEXP_REPLACE）を完全撤廃。
 - ★誤爆の完全根絶：指数表記化（4.98E+12等）した jan_code を JOIN キーに使うことで発生していた事故を根絶。
   → 名寄せキーは yj_code（無ければ product_name）を使用し、指数表記JANを名寄せキーに使わない。
+
+【★追加（今回）】
+- ★メーカー別パフォーマンス（前期/今期 売上・粗利）セクションを追加
+- ★VIEW_UNIFIED からメーカー列（manufacturer/maker/製造元/メーカー等）をColMapで吸収
 """
 
 from __future__ import annotations
@@ -96,6 +100,12 @@ def normalize_product_display_name(name: Any) -> str:
         return ""
     # 強制切り捨てを完全に廃止し、マスタの正式名称を100%尊重
     return str(name).strip()
+
+
+def normalize_text(v: Any) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+        return ""
+    return str(v).strip()
 
 
 # -----------------------------
@@ -346,8 +356,12 @@ def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
         "yj_code": ("yj_code", "yjcode", "yj", "YJCode"),
         "jan_code": ("jan_code", "jan", "JAN"),
         "package_unit": ("package_unit", "pack_unit", "包装単位", "包装"),
+        # ★追加：メーカー列（VIEW_UNIFIED内に存在する場合のみ採用）
+        "manufacturer": ("manufacturer", "maker", "メーカー", "製造元", "製造販売元", "manufacturer_name"),
     }
-    optional = {"staff_name": ("staff_name", "担当者名", "担当社員名", "担当社員氏", "担当")}
+    optional = {
+        "staff_name": ("staff_name", "担当者名", "担当社員名", "担当社員氏", "担当"),
+    }
     required = (
         "customer_code",
         "customer_name",
@@ -607,6 +621,123 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
         df_me = query_df_safe(client, sql, {"login_email": login_email}, "Me Summary")
         if not df_me.empty:
             render_summary_metrics(df_me.iloc[0])
+
+
+# -----------------------------
+# ★追加：メーカー別パフォーマンス（前期/今期 売上・粗利）
+# -----------------------------
+def render_manufacturer_performance_section(
+    client: bigquery.Client,
+    role: RoleInfo,
+    scope: ScopeFilter,
+    colmap: Dict[str, str],
+) -> None:
+    st.subheader("🏭 メーカー別パフォーマンス（前期 / 今期：売上・粗利）")
+
+    manu_col = colmap.get("manufacturer")
+    if not manu_col:
+        st.info("VIEW_UNIFIED にメーカー列が見つからないため、このセクションは表示できません。（manufacturer/maker/メーカー等）")
+        return
+
+    # 管理者/非管理者スコープ
+    role_filter = "" if role.role_admin_view else f"{c(colmap,'login_email')} = @login_email"
+    scope_filter_clause = scope.where_clause()
+    where_sql = _compose_where(role_filter, scope_filter_clause)
+
+    params: Dict[str, Any] = dict(scope.params or {})
+    if not role.role_admin_view:
+        params["login_email"] = role.login_email
+
+    # FY定義：CURRENT_DATEベース
+    sql = f"""
+      WITH fy AS (
+        SELECT
+          (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+            - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy,
+          DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
+      )
+      SELECT
+        COALESCE(NULLIF(TRIM(CAST({manu_col} AS STRING)), ''), '未設定') AS manufacturer,
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS ty_sales,
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS py_sales,
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS ty_gp,
+        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS py_gp
+      FROM `{VIEW_UNIFIED}`
+      CROSS JOIN fy
+      {where_sql}
+      GROUP BY manufacturer
+      HAVING ty_sales != 0 OR py_sales != 0 OR ty_gp != 0 OR py_gp != 0
+      ORDER BY (ty_sales - py_sales) ASC
+      LIMIT 200
+    """
+    df = query_df_safe(client, sql, params, "Manufacturer Perf")
+
+    if df.empty:
+        st.info("該当データがありません。")
+        return
+
+    df = df.copy()
+    df["売上差額"] = df["ty_sales"] - df["py_sales"]
+    df["粗利差額"] = df["ty_gp"] - df["py_gp"]
+    df["売上成長率"] = df.apply(lambda r: ((r["ty_sales"] / r["py_sales"] - 1) * 100) if r["py_sales"] else 0.0, axis=1)
+    df["粗利成長率"] = df.apply(lambda r: ((r["ty_gp"] / r["py_gp"] - 1) * 100) if r["py_gp"] else 0.0, axis=1)
+
+    # 並び替えUI
+    c1_, c2_, c3_ = st.columns(3)
+    sort_key = c1_.selectbox(
+        "並び替え",
+        ["売上差額（小→大）", "売上差額（大→小）", "粗利差額（小→大）", "粗利差額（大→小）", "売上成長率（小→大）", "売上成長率（大→小）"],
+        index=0,
+    )
+    topn = c2_.slider("表示件数", 20, 200, 80, 10)
+    only_negative = c3_.checkbox("下落のみ（差額<0）", value=True)
+
+    if only_negative:
+        df = df[df["売上差額"] < 0]
+
+    if sort_key == "売上差額（小→大）":
+        df = df.sort_values("売上差額", ascending=True)
+    elif sort_key == "売上差額（大→小）":
+        df = df.sort_values("売上差額", ascending=False)
+    elif sort_key == "粗利差額（小→大）":
+        df = df.sort_values("粗利差額", ascending=True)
+    elif sort_key == "粗利差額（大→小）":
+        df = df.sort_values("粗利差額", ascending=False)
+    elif sort_key == "売上成長率（小→大）":
+        df = df.sort_values("売上成長率", ascending=True)
+    else:
+        df = df.sort_values("売上成長率", ascending=False)
+
+    df = df.head(int(topn))
+
+    df_disp = df.rename(
+        columns={
+            "manufacturer": "メーカー",
+            "ty_sales": "今期売上",
+            "py_sales": "前年同期売上",
+            "ty_gp": "今期粗利",
+            "py_gp": "前年同期粗利",
+        }
+    )
+
+    st.dataframe(
+        df_disp[
+            ["メーカー", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額", "粗利成長率"]
+        ].style.format(
+            {
+                "今期売上": "¥{:,.0f}",
+                "前年同期売上": "¥{:,.0f}",
+                "売上差額": "¥{:,.0f}",
+                "売上成長率": "{:,.1f}%",
+                "今期粗利": "¥{:,.0f}",
+                "前年同期粗利": "¥{:,.0f}",
+                "粗利差額": "¥{:,.0f}",
+                "粗利成長率": "{:,.1f}%",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # -----------------------------
@@ -953,7 +1084,6 @@ def render_yoy_section(
         key=f"grid_yoy_{st.session_state.yoy_mode}",
     )
 
-    # 選択行があれば second tier の default をそれに寄せる
     selected_yj_default = "全成分を表示"
     try:
         sel_rows = event.selection.rows if hasattr(event, "selection") else []
@@ -1738,11 +1868,16 @@ def main() -> None:
     scope = render_scope_filters(client, role, unified_colmap)
     st.divider()
 
-    is_admin = role.role_admin_view
-    if is_admin:
+    # 管理者のみ：得意先・グループ要因分析
+    if role.role_admin_view:
         render_group_underperformance_section(client, role, scope, unified_colmap)
         st.divider()
 
+    # ★追加：メーカー別パフォーマンス（管理者/非管理者とも）
+    render_manufacturer_performance_section(client, role, scope, unified_colmap)
+    st.divider()
+
+    is_admin = role.role_admin_view
     render_yoy_section(client, role.login_email, is_admin, scope, unified_colmap)
     st.divider()
 
