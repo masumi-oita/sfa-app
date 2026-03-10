@@ -1,34 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.4.9 (True Final Edition - 完全根絶版)
+SFA｜戦略ダッシュボード - OS v1.5.0 (Stable Summary Fix Edition)
 
-【v1.4.8 踏襲機能】
+【v1.4.9 踏襲機能】
 - YoY：VIEW_UNIFIED から動的集計に統一
 - YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
 - スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定
 - Group Display: official先頭 + raw併記
-- 新機能：得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
-- 新機能：順位アイコンの追加と、不要なYJコード列の非表示
-- 修正：WHERE二重エラー解消 ＆ 選択状態の消失バグ解消 ＆ 表示順序の最適化
-- 修正：Reco（VIEW_RECOMMEND）の customer_code が INT64 のため CAST 対応
+- 得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
+- 順位アイコンの追加と、不要なYJコード列の非表示
+- ColMap（列名吸収）導入：jan/jan_code 等の差異を自動解決
+- VIEW_NEW_DELIVERY 必須列不足時の自動補完
+- YoY第二階層を「全成分を表示」デフォルト対応
+- 冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化
+- 成長率に「¥」がつくフォーマット干渉バグを撤廃
+- 包装（パッケージ）の表示を完全復活
+- 体外診断薬等の名称が「/」で途切れる旧ロジックを完全撤廃
+- 指数表記化したJANをJOINキーに使う事故を根絶（名寄せキーは yj_code / product_name）
+- メーカー別パフォーマンス（前期/今期 売上・粗利）セクション
+- サマリーに総薬価・加重平均を追加
 
-【v1.4.9 強化・修正機能（すべて統合済）】
-- ColMap（列名吸収）導入：jan/jan_code 等の差異を自動解決し "Unrecognized name" を根絶。
-- VIEW_NEW_DELIVERY 必須列不足時の自動補完。
-- YoY等の年度判定を CURRENT_DATE ベースに統一（未来データ混入対策）。
-- YoY第二階層を「全成分を表示」デフォルト対応。
-- サマリー（最上部）に「当月実績」および「前年同月差額」の表示を追加。
-- 冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化。
-- 成長率に「¥」がつくフォーマット干渉バグを撤廃し、カンマ区切りを正常化。
-- ★包装（パッケージ）の表示を完全復活。
-- ★体外診断薬等の名称が「/」で途切れる旧ロジック（Python側およびSQL側の REGEXP_REPLACE）を完全撤廃。
-- ★誤爆の完全根絶：指数表記化（4.98E+12等）した jan_code を JOIN キーに使うことで発生していた事故を根絶。
-  → 名寄せキーは yj_code（無ければ product_name）を使用し、指数表記JANを名寄せキーに使わない。
-
-【★追加（今回）】
-- ★メーカー別パフォーマンス（前期/今期 売上・粗利）セクションを追加
-- ★VIEW_UNIFIED からメーカー列（manufacturer/maker/製造元/メーカー等）をColMapで吸収
-- ★サマリーに総薬価・加重平均を追加
+【v1.5.0 今回の確定修正】
+- 当月実績を CURRENT_DATE のみで見に行く旧ロジックを修正
+- 当月データ未反映時に「0円」ではなく「— / 未反映」表示へ変更
+- FYTD前年同期の比較基準を CURRENT_DATE ではなく MAX(sales_date) 基準へ補正
+- 最新反映日 / 最新取込月 / 最新確定月 / 反映遅延日数を表示
+- 総薬価列が無い場合でも安全に動作するよう修正
 """
 
 from __future__ import annotations
@@ -71,7 +68,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.4.9｜True Final Edition (機能完全網羅・商品名切り捨て完全撤廃済)")
+    st.caption("OS v1.5.0｜Stable Summary Fix Edition（当月0円誤表示・比較軸ズレ修正済）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -80,7 +77,6 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
         if any(k in col for k in ["率", "比", "ペース", "成長"]):
             config[col] = st.column_config.NumberColumn(col, format="%.1f%%")
         elif any(k in col for k in ["売上", "粗利", "金額", "差額", "実績", "予測", "GAP"]):
-            # 金額系は style.format 側で制御するため、強引なフォーマットを当てない（¥干渉バグ防止）
             config[col] = st.column_config.NumberColumn(col)
         elif "日" in col or pd.api.types.is_datetime64_any_dtype(df[col]):
             config[col] = st.column_config.DateColumn(col, format="YYYY-MM-DD")
@@ -93,20 +89,121 @@ def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config
 
 def get_safe_float(row: pd.Series, key: str) -> float:
     val = row.get(key)
-    return float(val) if not pd.isna(val) else 0.0
+    return float(val) if val is not None and not pd.isna(val) else 0.0
+
+
+def get_nullable_float(row: pd.Series, key: str) -> Optional[float]:
+    val = row.get(key)
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    try:
+        return float(val)
+    except Exception:
+        return None
 
 
 def normalize_product_display_name(name: Any) -> str:
     if pd.isna(name):
         return ""
-    # 強制切り捨てを完全に廃止し、マスタの正式名称を100%尊重
     return str(name).strip()
 
 
 def normalize_text(v: Any) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+    if v is None:
         return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
     return str(v).strip()
+
+
+def fmt_yen_or_dash(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    return f"¥{v:,.0f}"
+
+
+def fmt_pct_or_dash(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    return f"{v:,.1f}%"
+
+
+def fmt_delta_yen(cur: Optional[float], prev: Optional[float]) -> Optional[str]:
+    if cur is None or prev is None:
+        return None
+    return f"{int(cur - prev):,}"
+
+
+def fmt_delta_pct(cur: Optional[float], prev: Optional[float]) -> Optional[str]:
+    if cur is None or prev is None:
+        return None
+    return f"{cur - prev:,.1f}%"
+
+
+def fmt_date_or_dash(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        if pd.isna(v):
+            return "—"
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(v).strftime("%Y-%m-%d")
+    except Exception:
+        return str(v)
+
+
+def fmt_month_or_dash(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        if pd.isna(v):
+            return "—"
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(v).strftime("%Y-%m")
+    except Exception:
+        return str(v)
+
+
+def project_value(cur: Optional[float], py_ytd: Optional[float], py_total: Optional[float]) -> Optional[float]:
+    if cur is None:
+        return None
+    if py_ytd is not None and py_total is not None and py_ytd > 0:
+        return cur * (py_total / py_ytd)
+    return cur
+
+
+def safe_rate(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0:
+        return None
+    return numerator / denominator * 100.0
+
+
+def sql_numeric_expr(colmap: Dict[str, str], key: str) -> str:
+    col = colmap.get(key)
+    if col:
+        return f"SAFE_CAST({col} AS FLOAT64)"
+    return "CAST(NULL AS FLOAT64)"
+
+
+def sql_int_expr(colmap: Dict[str, str], key: str) -> str:
+    col = colmap.get(key)
+    if col:
+        return f"SAFE_CAST({col} AS INT64)"
+    return "CAST(NULL AS INT64)"
 
 
 # -----------------------------
@@ -130,20 +227,16 @@ def setup_bigquery_client() -> bigquery.Client:
 
 
 def _build_query_parameter(key: str, value: Any) -> bigquery.QueryParameter:
-    # 明示型
     if isinstance(value, tuple) and len(value) == 2:
         p_type, p_value = value
         p_type = str(p_type).upper()
         if p_type.startswith("ARRAY<") and isinstance(p_value, (list, tuple)):
-            # 配列はSTRING固定（本アプリ用途）
             return bigquery.ArrayQueryParameter(key, "STRING", [None if v is None else str(v) for v in p_value])
         return bigquery.ScalarQueryParameter(key, p_type, p_value)
 
-    # 配列
     if isinstance(value, (list, tuple)):
         return bigquery.ArrayQueryParameter(key, "STRING", [None if v is None else str(v) for v in value])
 
-    # scalar
     if value is None:
         return bigquery.ScalarQueryParameter(key, "STRING", None)
     if isinstance(value, bool):
@@ -279,7 +372,6 @@ def resolve_view_colmap(
 
 
 def c(colmap: Dict[str, str], key: str) -> str:
-    """SQL内で使う列名解決。"""
     return colmap.get(key, key)
 
 
@@ -357,7 +449,6 @@ def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
         "yj_code": ("yj_code", "yjcode", "yj", "YJCode"),
         "jan_code": ("jan_code", "jan", "JAN"),
         "package_unit": ("package_unit", "pack_unit", "包装単位", "包装"),
-        # ★追加：メーカー列・薬価列（VIEW_UNIFIED内に存在する場合のみ採用）
         "manufacturer": ("manufacturer", "maker_name", "maker", "メーカー", "製造元", "製造販売元", "manufacturer_name"),
         "total_drug_price": ("total_drug_price", "総薬価", "薬価金額"),
     }
@@ -491,41 +582,207 @@ def resolve_role(client: bigquery.Client, login_email: str, login_code: str) -> 
 
 
 # -----------------------------
-# 4. UI Sections
+# 4. Summary Query Builder
+# -----------------------------
+def build_summary_sql(colmap: Dict[str, str], scoped_by_login: bool = False) -> str:
+    sales_date_col = c(colmap, "sales_date")
+    fiscal_year_expr = sql_int_expr(colmap, "fiscal_year")
+    sales_expr = sql_numeric_expr(colmap, "sales_amount")
+    gp_expr = sql_numeric_expr(colmap, "gross_profit")
+    dp_expr = sql_numeric_expr(colmap, "total_drug_price")
+    where_sql = f"WHERE {c(colmap,'login_email')} = @login_email" if scoped_by_login else ""
+
+    return f"""
+        WITH base AS (
+          SELECT
+            CAST({sales_date_col} AS DATE) AS sales_date,
+            {fiscal_year_expr} AS fiscal_year,
+            {sales_expr} AS sales_amount,
+            {gp_expr} AS gross_profit,
+            {dp_expr} AS drug_price
+          FROM `{VIEW_UNIFIED}`
+          {where_sql}
+        ),
+        meta AS (
+          SELECT
+            MAX(sales_date) AS max_sales_date,
+            DATE_TRUNC(MAX(sales_date), MONTH) AS latest_loaded_month,
+            DATE_TRUNC(CURRENT_DATE('Asia/Tokyo'), MONTH) AS calendar_month,
+            DATE_TRUNC(DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR), MONTH) AS py_calendar_month,
+            DATE_SUB(MAX(sales_date), INTERVAL 1 YEAR) AS py_same_day,
+            (
+              EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
+              - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END
+            ) AS current_fy,
+            CASE
+              WHEN MAX(sales_date) IS NULL THEN NULL
+              WHEN MAX(sales_date) = DATE_SUB(DATE_ADD(DATE_TRUNC(MAX(sales_date), MONTH), INTERVAL 1 MONTH), INTERVAL 1 DAY)
+                THEN DATE_TRUNC(MAX(sales_date), MONTH)
+              ELSE DATE_SUB(DATE_TRUNC(MAX(sales_date), MONTH), INTERVAL 1 MONTH)
+            END AS latest_closed_month
+          FROM base
+        ),
+        agg AS (
+          SELECT
+            COUNTIF(DATE_TRUNC(b.sales_date, MONTH) = m.calendar_month) AS calendar_month_rows,
+
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.calendar_month, b.sales_amount, NULL)) AS calendar_month_sales,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.calendar_month, b.gross_profit, NULL)) AS calendar_month_profit,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.calendar_month, b.drug_price, NULL)) AS calendar_month_drug_price,
+
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.py_calendar_month, b.sales_amount, NULL)) AS calendar_month_sales_py,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.py_calendar_month, b.gross_profit, NULL)) AS calendar_month_profit_py,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.py_calendar_month, b.drug_price, NULL)) AS calendar_month_drug_price_py,
+
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_loaded_month, b.sales_amount, NULL)) AS latest_loaded_month_sales,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_loaded_month, b.gross_profit, NULL)) AS latest_loaded_month_profit,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_loaded_month, b.drug_price, NULL)) AS latest_loaded_month_drug_price,
+
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_closed_month, b.sales_amount, NULL)) AS latest_closed_month_sales,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_closed_month, b.gross_profit, NULL)) AS latest_closed_month_profit,
+            SUM(IF(DATE_TRUNC(b.sales_date, MONTH) = m.latest_closed_month, b.drug_price, NULL)) AS latest_closed_month_drug_price,
+
+            SUM(IF(b.fiscal_year = m.current_fy, b.sales_amount, 0)) AS sales_amount_fytd,
+            SUM(IF(b.fiscal_year = m.current_fy, b.gross_profit, 0)) AS gross_profit_fytd,
+            SUM(IF(b.fiscal_year = m.current_fy, b.drug_price, 0)) AS drug_price_fytd,
+
+            SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.sales_amount, 0)) AS sales_amount_py_ytd,
+            SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.gross_profit, 0)) AS gross_profit_py_ytd,
+            SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.drug_price, 0)) AS drug_price_py_ytd,
+
+            SUM(IF(b.fiscal_year = m.current_fy - 1, b.sales_amount, 0)) AS sales_amount_py_total,
+            SUM(IF(b.fiscal_year = m.current_fy - 1, b.gross_profit, 0)) AS gross_profit_py_total,
+            SUM(IF(b.fiscal_year = m.current_fy - 1, b.drug_price, 0)) AS drug_price_py_total
+          FROM base b
+          CROSS JOIN meta m
+        )
+        SELECT
+          IFNULL(a.sales_amount_fytd, 0) AS sales_amount_fytd,
+          IFNULL(a.gross_profit_fytd, 0) AS gross_profit_fytd,
+          a.drug_price_fytd AS drug_price_fytd,
+
+          IFNULL(a.sales_amount_py_ytd, 0) AS sales_amount_py_ytd,
+          IFNULL(a.gross_profit_py_ytd, 0) AS gross_profit_py_ytd,
+          a.drug_price_py_ytd AS drug_price_py_ytd,
+
+          IFNULL(a.sales_amount_py_total, 0) AS sales_amount_py_total,
+          IFNULL(a.gross_profit_py_total, 0) AS gross_profit_py_total,
+          a.drug_price_py_total AS drug_price_py_total,
+
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_sales ELSE NULL END AS display_current_month_sales,
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_profit ELSE NULL END AS display_current_month_profit,
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_drug_price ELSE NULL END AS display_current_month_drug_price,
+
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_sales_py ELSE NULL END AS display_current_month_sales_py,
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_profit_py ELSE NULL END AS display_current_month_profit_py,
+          CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_drug_price_py ELSE NULL END AS display_current_month_drug_price_py,
+
+          a.latest_loaded_month_sales,
+          a.latest_loaded_month_profit,
+          a.latest_loaded_month_drug_price,
+
+          a.latest_closed_month_sales,
+          a.latest_closed_month_profit,
+          a.latest_closed_month_drug_price,
+
+          a.calendar_month_rows,
+          m.max_sales_date,
+          m.latest_loaded_month,
+          m.latest_closed_month,
+          m.calendar_month,
+          CASE
+            WHEN m.max_sales_date IS NULL THEN 'NO_DATA'
+            WHEN m.latest_loaded_month = m.calendar_month THEN 'CURRENT_MONTH_AVAILABLE'
+            ELSE 'CURRENT_MONTH_MISSING'
+          END AS refresh_status,
+          CASE
+            WHEN m.max_sales_date IS NULL THEN NULL
+            ELSE DATE_DIFF(CURRENT_DATE('Asia/Tokyo'), m.max_sales_date, DAY)
+          END AS lag_days
+        FROM meta m
+        CROSS JOIN agg a
+    """
+
+
+# -----------------------------
+# 5. UI Sections
 # -----------------------------
 def render_summary_metrics(row: pd.Series) -> None:
-    # 累計
+    # 累計系
     s_cur = get_safe_float(row, "sales_amount_fytd")
     s_py_ytd = get_safe_float(row, "sales_amount_py_ytd")
     s_py_total = get_safe_float(row, "sales_amount_py_total")
-    s_fc = s_cur * (s_py_total / s_py_ytd) if s_py_ytd > 0 else s_cur
+    s_fc = project_value(s_cur, s_py_ytd, s_py_total)
 
     gp_cur = get_safe_float(row, "gross_profit_fytd")
     gp_py_ytd = get_safe_float(row, "gross_profit_py_ytd")
     gp_py_total = get_safe_float(row, "gross_profit_py_total")
-    gp_fc = gp_cur * (gp_py_total / gp_py_ytd) if gp_py_ytd > 0 else gp_cur
+    gp_fc = project_value(gp_cur, gp_py_ytd, gp_py_total)
 
-    # 当月
-    s_cm = get_safe_float(row, "sales_amount_cm")
-    s_py_cm = get_safe_float(row, "sales_amount_py_cm")
-    gp_cm = get_safe_float(row, "gross_profit_cm")
-    gp_py_cm = get_safe_float(row, "gross_profit_py_cm")
+    dp_cur = get_nullable_float(row, "drug_price_fytd")
+    dp_py_ytd = get_nullable_float(row, "drug_price_py_ytd")
+    dp_py_total = get_nullable_float(row, "drug_price_py_total")
+    dp_fc = project_value(dp_cur, dp_py_ytd, dp_py_total)
 
-    # ★追加：薬価
-    dp_cur = get_safe_float(row, "drug_price_fytd")
-    dp_py_ytd = get_safe_float(row, "drug_price_py_ytd")
-    dp_py_total = get_safe_float(row, "drug_price_py_total")
-    dp_fc = dp_cur * (dp_py_total / dp_py_ytd) if dp_py_ytd > 0 else dp_cur
-    dp_cm = get_safe_float(row, "drug_price_cm")
-    dp_py_cm = get_safe_float(row, "drug_price_py_cm")
+    # 当月（未反映時は NULL を維持）
+    s_cm = get_nullable_float(row, "display_current_month_sales")
+    s_py_cm = get_nullable_float(row, "display_current_month_sales_py")
+    gp_cm = get_nullable_float(row, "display_current_month_profit")
+    gp_py_cm = get_nullable_float(row, "display_current_month_profit_py")
+    dp_cm = get_nullable_float(row, "display_current_month_drug_price")
+    dp_py_cm = get_nullable_float(row, "display_current_month_drug_price_py")
 
-    # ★追加：加重平均 (納入価率) = (売上 / 総薬価) * 100
-    rate_cm = (s_cm / dp_cm * 100) if dp_cm > 0 else 0.0
-    rate_py_cm = (s_py_cm / dp_py_cm * 100) if dp_py_cm > 0 else 0.0
-    rate_cur = (s_cur / dp_cur * 100) if dp_cur > 0 else 0.0
-    rate_py_ytd = (s_py_ytd / dp_py_ytd * 100) if dp_py_ytd > 0 else 0.0
-    rate_py_total = (s_py_total / dp_py_total * 100) if dp_py_total > 0 else 0.0
-    rate_fc = (s_fc / dp_fc * 100) if dp_fc > 0 else 0.0
+    # 参考情報
+    latest_loaded_month = row.get("latest_loaded_month")
+    latest_closed_month = row.get("latest_closed_month")
+    max_sales_date = row.get("max_sales_date")
+    refresh_status = normalize_text(row.get("refresh_status"))
+    lag_days_raw = row.get("lag_days")
+    lag_days: Optional[int] = None
+    if lag_days_raw is not None:
+        try:
+            if not pd.isna(lag_days_raw):
+                lag_days = int(lag_days_raw)
+        except Exception:
+            lag_days = None
+
+    latest_loaded_month_sales = get_nullable_float(row, "latest_loaded_month_sales")
+    latest_loaded_month_profit = get_nullable_float(row, "latest_loaded_month_profit")
+    latest_closed_month_sales = get_nullable_float(row, "latest_closed_month_sales")
+    latest_closed_month_profit = get_nullable_float(row, "latest_closed_month_profit")
+
+    # 率
+    rate_cm = safe_rate(s_cm, dp_cm)
+    rate_py_cm = safe_rate(s_py_cm, dp_py_cm)
+    rate_cur = safe_rate(s_cur, dp_cur)
+    rate_py_ytd = safe_rate(s_py_ytd, dp_py_ytd)
+    rate_py_total = safe_rate(s_py_total, dp_py_total)
+    rate_fc = safe_rate(s_fc, dp_fc)
+
+    current_month_label = "⭐ 当月実績"
+    if refresh_status == "CURRENT_MONTH_MISSING":
+        current_month_label = "⭐ 当月実績（未反映）"
+    elif refresh_status == "NO_DATA":
+        current_month_label = "⭐ 当月実績（データなし）"
+
+    st.markdown("##### ■ データ反映状況")
+    d1_, d2_, d3_, d4_ = st.columns(4)
+    d1_.metric("最新反映日", fmt_date_or_dash(max_sales_date))
+    d2_.metric("最新取込月", fmt_month_or_dash(latest_loaded_month))
+    d3_.metric("最新確定月", fmt_month_or_dash(latest_closed_month))
+    d4_.metric("反映遅延", f"{lag_days}日" if lag_days is not None else "—")
+
+    if refresh_status == "CURRENT_MONTH_MISSING":
+        st.warning("当月データは未反映です。当月実績は「—」表示とし、参考として最新取込月・最新確定月を併記しています。")
+    elif refresh_status == "NO_DATA":
+        st.warning("売上データが見つかりません。VIEW_UNIFIED の中身をご確認ください。")
+
+    st.markdown("##### ■ 参考（月次実績）")
+    r1_, r2_, r3_, r4_ = st.columns(4)
+    r1_.metric(f"最新取込月売上（{fmt_month_or_dash(latest_loaded_month)}）", fmt_yen_or_dash(latest_loaded_month_sales))
+    r2_.metric(f"最新取込月粗利（{fmt_month_or_dash(latest_loaded_month)}）", fmt_yen_or_dash(latest_loaded_month_profit))
+    r3_.metric(f"最新確定月売上（{fmt_month_or_dash(latest_closed_month)}）", fmt_yen_or_dash(latest_closed_month_sales))
+    r4_.metric(f"最新確定月粗利（{fmt_month_or_dash(latest_closed_month)}）", fmt_yen_or_dash(latest_closed_month_profit))
 
     st.caption(
         "※ 【今期予測】はAI予測ではなく、「今期実績 × (昨年度着地 ÷ 前年同期)」"
@@ -534,40 +791,46 @@ def render_summary_metrics(row: pd.Series) -> None:
 
     st.markdown("##### ■ 売上")
     c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
-    c1_.metric("⭐ 当月実績", f"¥{s_cm:,.0f}", delta=f"{int(s_cm - s_py_cm):,}" if s_py_cm > 0 else None)
-    c2_.metric("① 今期累計", f"¥{s_cur:,.0f}")
-    c3_.metric("② 前年同期", f"¥{s_py_ytd:,.0f}", delta=f"{int(s_cur - s_py_ytd):,}" if s_py_ytd > 0 else None)
-    c4_.metric("③ 昨年度着地", f"¥{s_py_total:,.0f}")
-    c5_.metric("④ 今期予測", f"¥{s_fc:,.0f}")
-    c6_.metric("⑤ 着地GAP", f"¥{s_fc - s_py_total:,.0f}", delta=f"{int(s_fc - s_py_total):,}")
+    c1_.metric(current_month_label, fmt_yen_or_dash(s_cm), delta=fmt_delta_yen(s_cm, s_py_cm))
+    c2_.metric("① 今期累計", fmt_yen_or_dash(s_cur))
+    c3_.metric("② 前年同期", fmt_yen_or_dash(s_py_ytd), delta=f"{int(s_cur - s_py_ytd):,}" if s_py_ytd > 0 else None)
+    c4_.metric("③ 昨年度着地", fmt_yen_or_dash(s_py_total))
+    c5_.metric("④ 今期予測", fmt_yen_or_dash(s_fc))
+    c6_.metric("⑤ 着地GAP", fmt_yen_or_dash((s_fc - s_py_total) if s_fc is not None else None),
+               delta=f"{int((s_fc - s_py_total)):,.0f}" if s_fc is not None else None)
 
     st.markdown("##### ■ 粗利")
     c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
-    c1_.metric("⭐ 当月実績", f"¥{gp_cm:,.0f}", delta=f"{int(gp_cm - gp_py_cm):,}" if gp_py_cm > 0 else None)
-    c2_.metric("① 今期累計", f"¥{gp_cur:,.0f}")
-    c3_.metric("② 前年同期", f"¥{gp_py_ytd:,.0f}", delta=f"{int(gp_cur - gp_py_ytd):,}" if gp_py_ytd > 0 else None)
-    c4_.metric("③ 昨年度着地", f"¥{gp_py_total:,.0f}")
-    c5_.metric("④ 今期予測", f"¥{gp_fc:,.0f}")
-    c6_.metric("⑤ 着地GAP", f"¥{gp_fc - gp_py_total:,.0f}", delta=f"{int(gp_fc - gp_py_total):,}")
+    c1_.metric(current_month_label, fmt_yen_or_dash(gp_cm), delta=fmt_delta_yen(gp_cm, gp_py_cm))
+    c2_.metric("① 今期累計", fmt_yen_or_dash(gp_cur))
+    c3_.metric("② 前年同期", fmt_yen_or_dash(gp_py_ytd), delta=f"{int(gp_cur - gp_py_ytd):,}" if gp_py_ytd > 0 else None)
+    c4_.metric("③ 昨年度着地", fmt_yen_or_dash(gp_py_total))
+    c5_.metric("④ 今期予測", fmt_yen_or_dash(gp_fc))
+    c6_.metric("⑤ 着地GAP", fmt_yen_or_dash((gp_fc - gp_py_total) if gp_fc is not None else None),
+               delta=f"{int((gp_fc - gp_py_total)):,.0f}" if gp_fc is not None else None)
 
-    # ★追加セクション
     st.markdown("##### ■ 総納入薬価")
     c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
-    c1_.metric("⭐ 当月実績", f"¥{dp_cm:,.0f}", delta=f"{int(dp_cm - dp_py_cm):,}" if dp_py_cm > 0 else None)
-    c2_.metric("① 今期累計", f"¥{dp_cur:,.0f}")
-    c3_.metric("② 前年同期", f"¥{dp_py_ytd:,.0f}", delta=f"{int(dp_cur - dp_py_ytd):,}" if dp_py_ytd > 0 else None)
-    c4_.metric("③ 昨年度着地", f"¥{dp_py_total:,.0f}")
-    c5_.metric("④ 今期予測", f"¥{dp_fc:,.0f}")
-    c6_.metric("⑤ 着地GAP", f"¥{dp_fc - dp_py_total:,.0f}", delta=f"{int(dp_fc - dp_py_total):,}")
+    c1_.metric(current_month_label, fmt_yen_or_dash(dp_cm), delta=fmt_delta_yen(dp_cm, dp_py_cm))
+    c2_.metric("① 今期累計", fmt_yen_or_dash(dp_cur))
+    c3_.metric("② 前年同期", fmt_yen_or_dash(dp_py_ytd), delta=fmt_delta_yen(dp_cur, dp_py_ytd))
+    c4_.metric("③ 昨年度着地", fmt_yen_or_dash(dp_py_total))
+    c5_.metric("④ 今期予測", fmt_yen_or_dash(dp_fc))
+    c6_.metric("⑤ 着地GAP", fmt_yen_or_dash((dp_fc - dp_py_total) if dp_fc is not None and dp_py_total is not None else None),
+               delta=fmt_delta_yen(dp_fc, dp_py_total))
 
     st.markdown("##### ■ 加重平均 (納入価率)")
     c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
-    c1_.metric("⭐ 当月実績", f"{rate_cm:,.1f}%", delta=f"{rate_cm - rate_py_cm:,.1f}%" if dp_py_cm > 0 else None)
-    c2_.metric("① 今期累計", f"{rate_cur:,.1f}%")
-    c3_.metric("② 前年同期", f"{rate_py_ytd:,.1f}%", delta=f"{rate_cur - rate_py_ytd:,.1f}%" if dp_py_ytd > 0 else None)
-    c4_.metric("③ 昨年度着地", f"{rate_py_total:,.1f}%")
-    c5_.metric("④ 今期予測", f"{rate_fc:,.1f}%")
-    c6_.metric("⑤ 着地GAP", f"{rate_fc - rate_py_total:,.1f}%", delta=f"{rate_fc - rate_py_total:,.1f}%")
+    c1_.metric(current_month_label, fmt_pct_or_dash(rate_cm), delta=fmt_delta_pct(rate_cm, rate_py_cm))
+    c2_.metric("① 今期累計", fmt_pct_or_dash(rate_cur))
+    c3_.metric("② 前年同期", fmt_pct_or_dash(rate_py_ytd), delta=fmt_delta_pct(rate_cur, rate_py_ytd))
+    c4_.metric("③ 昨年度着地", fmt_pct_or_dash(rate_py_total))
+    c5_.metric("④ 今期予測", fmt_pct_or_dash(rate_fc))
+    c6_.metric("⑤ 着地GAP", fmt_pct_or_dash((rate_fc - rate_py_total) if rate_fc is not None and rate_py_total is not None else None),
+               delta=fmt_delta_pct(rate_fc, rate_py_total))
+
+    if dp_cur is None:
+        st.caption("※ 総納入薬価列が VIEW_UNIFIED に存在しない、または数値化できないため、総納入薬価 / 納入価率は「—」表示です。")
 
 
 def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> None:
@@ -580,80 +843,23 @@ def render_fytd_org_section(client: bigquery.Client, colmap: Dict[str, str]) -> 
         st.session_state.org_data_loaded = True
 
     if st.session_state.get("org_data_loaded"):
-        sql = f"""
-            WITH today_info AS (
-              SELECT
-                CURRENT_DATE('Asia/Tokyo') AS today,
-                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
-                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-                    - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
-            )
-            SELECT
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_cm,
-              
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_cm,
-
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_fytd,
-              
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_ytd,
-              
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_total
-            FROM `{VIEW_UNIFIED}`
-            CROSS JOIN today_info
-        """
+        sql = build_summary_sql(colmap, scoped_by_login=False)
         df_org = query_df_safe(client, sql, None, "Org Summary")
         if not df_org.empty:
             render_summary_metrics(df_org.iloc[0])
+        else:
+            st.info("全社サマリーのデータが取得できませんでした。")
 
 
 def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Dict[str, str]) -> None:
     st.subheader("👤 年度累計（FYTD）｜個人サマリー")
     if st.button("自分の成績を読み込む", key="btn_me_load"):
-        sql = f"""
-            WITH today_info AS (
-              SELECT
-                CURRENT_DATE('Asia/Tokyo') AS today,
-                DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today,
-                (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
-                    - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
-            )
-            SELECT
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_cm,
-              
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_cm,
-              SUM(CASE WHEN DATE_TRUNC({c(colmap,'sales_date')}, MONTH) = DATE_TRUNC(py_today, MONTH) THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_cm,
-
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_fytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_fytd,
-              
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_ytd,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_ytd,
-              
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'sales_amount')} ELSE 0 END) AS sales_amount_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'gross_profit')} ELSE 0 END) AS gross_profit_py_total,
-              SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 THEN {c(colmap,'total_drug_price')} ELSE 0 END) AS drug_price_py_total
-            FROM `{VIEW_UNIFIED}`
-            CROSS JOIN today_info
-            WHERE {c(colmap,'login_email')} = @login_email
-        """
+        sql = build_summary_sql(colmap, scoped_by_login=True)
         df_me = query_df_safe(client, sql, {"login_email": login_email}, "Me Summary")
         if not df_me.empty:
             render_summary_metrics(df_me.iloc[0])
+        else:
+            st.info("個人サマリーのデータが取得できませんでした。")
 
 
 # -----------------------------
@@ -714,7 +920,7 @@ def render_manufacturer_performance_section(
     df["粗利差額"] = df["ty_gp"] - df["py_gp"]
     df["売上成長率"] = df.apply(lambda r: ((r["ty_sales"] / r["py_sales"] - 1) * 100) if r["py_sales"] else 0.0, axis=1)
     df["粗利成長率"] = df.apply(lambda r: ((r["ty_gp"] / r["py_gp"] - 1) * 100) if r["py_gp"] else 0.0, axis=1)
-    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_sales"] / r["ty_dp"] * 100) if r["ty_dp"] > 0 else 0.0, axis=1)
+    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_sales"] / r["ty_dp"] * 100) if r["ty_dp"] and r["ty_dp"] > 0 else 0.0, axis=1)
 
     c1_, c2_, c3_ = st.columns(3)
     sort_key = c1_.selectbox(
@@ -728,11 +934,16 @@ def render_manufacturer_performance_section(
     if only_negative:
         df = df[df["売上差額"] < 0]
 
-    if sort_key == "売上差額（小→大）": df = df.sort_values("売上差額", ascending=True)
-    elif sort_key == "売上差額（大→小）": df = df.sort_values("売上差額", ascending=False)
-    elif sort_key == "粗利差額（小→大）": df = df.sort_values("粗利差額", ascending=True)
-    elif sort_key == "粗利差額（大→小）": df = df.sort_values("粗利差額", ascending=False)
-    else: df = df.sort_values("ty_sales", ascending=False)
+    if sort_key == "売上差額（小→大）":
+        df = df.sort_values("売上差額", ascending=True)
+    elif sort_key == "売上差額（大→小）":
+        df = df.sort_values("売上差額", ascending=False)
+    elif sort_key == "粗利差額（小→大）":
+        df = df.sort_values("粗利差額", ascending=True)
+    elif sort_key == "粗利差額（大→小）":
+        df = df.sort_values("粗利差額", ascending=False)
+    else:
+        df = df.sort_values("ty_sales", ascending=False)
 
     df = df.head(int(topn))
 
@@ -938,7 +1149,6 @@ def render_group_underperformance_section(
         )
         drill_params["parent_id"] = selected_parent_id
 
-    # ★ 根絶対応：名寄せキーは yj_code（無ければ product_name）
     sql_drill = f"""
         WITH fy AS (
           SELECT (
@@ -1044,7 +1254,6 @@ def render_yoy_section(
             diff_filter = "py_sales = 0 AND ty_sales > 0"
             order_by = "ty_sales DESC"
 
-        # ★ 根絶対応：名寄せキーは yj_code（無ければ product_name）
         sql = f"""
             WITH fy AS (
               SELECT (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo')) - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy
@@ -1192,7 +1401,6 @@ def render_yoy_section(
             hide_index=True,
         )
 
-    # ★ 復活：包装の表示
     st.markdown("#### 🧪 原因追及：JAN・商品別（前年差額寄与）")
     sql_jan = f"""
         {fy_cte}
@@ -1416,7 +1624,6 @@ def render_new_delivery_trends(
                 "gross_profit": "粗利",
             }
         )
-        # ★修正：商品キーを必ず表示列に含める（これが無いとsel_df[pick_col]で落ちる）
         display_cols = ["☑", "商品キー", "商品名", "得意先数", "JAN数", "売上", "粗利"]
         pick_col = "商品キー"
 
@@ -1425,7 +1632,6 @@ def render_new_delivery_trends(
         if colx != "☑":
             df_view[colx] = df_view[colx].fillna("")
 
-    # ★商品キーは幅最小で邪魔にしない
     column_config = {
         "☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）"),
     }
@@ -1446,7 +1652,6 @@ def render_new_delivery_trends(
         st.caption("☑にチェックすると下に明細が出ます（複数選択可）。")
         return
 
-    # ★ここが落ちていた：商品モードでも必ず pick_col が存在する
     selected_keys = sel_df[pick_col].astype(str).tolist()
 
     st.divider()
@@ -1838,7 +2043,7 @@ def render_customer_drilldown(
 
 
 # -----------------------------
-# 5. Main Loop
+# 6. Main Loop
 # -----------------------------
 def main() -> None:
     set_page()
@@ -1848,7 +2053,6 @@ def main() -> None:
 
     client = setup_bigquery_client()
 
-    # ColMap 解決
     unified_colmap = resolve_unified_colmap(client)
     missing = unified_colmap.get("_missing_required")
     if missing:
@@ -1903,12 +2107,10 @@ def main() -> None:
     scope = render_scope_filters(client, role, unified_colmap)
     st.divider()
 
-    # 管理者のみ：得意先・グループ要因分析
     if role.role_admin_view:
         render_group_underperformance_section(client, role, scope, unified_colmap)
         st.divider()
 
-    # ★追加：メーカー別パフォーマンス（管理者/非管理者とも）
     render_manufacturer_performance_section(client, role, scope, unified_colmap)
     st.divider()
 
