@@ -1,31 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.5.0 (Stable Summary Fix Edition)
+SFA｜戦略ダッシュボード - OS v1.5.1 (Rate Fix Edition)
 
-【v1.4.9 踏襲機能】
-- YoY：VIEW_UNIFIED から動的集計に統一
-- YoY：第一階層を「クリック選択」対応（モード切替でも選択保持）
-- スコープ：得意先グループ列候補を VIEW_UNIFIED のスキーマから自動判定
-- Group Display: official先頭 + raw併記
-- 得意先グループ / 得意先単体の切替 ＆ 商品要因ドリルダウン（全件表示）
-- 順位アイコンの追加と、不要なYJコード列の非表示
-- ColMap（列名吸収）導入：jan/jan_code 等の差異を自動解決
-- VIEW_NEW_DELIVERY 必須列不足時の自動補完
-- YoY第二階層を「全成分を表示」デフォルト対応
-- 冗長なラジオボタンを撤廃し、データフレーム（表）のクリック連動にUIを洗練化
-- 成長率に「¥」がつくフォーマット干渉バグを撤廃
-- 包装（パッケージ）の表示を完全復活
-- 体外診断薬等の名称が「/」で途切れる旧ロジックを完全撤廃
-- 指数表記化したJANをJOINキーに使う事故を根絶（名寄せキーは yj_code / product_name）
-- メーカー別パフォーマンス（前期/今期 売上・粗利）セクション
-- サマリーに総薬価・加重平均を追加
-
-【v1.5.0 今回の確定修正】
+【v1.5.0 踏襲機能】
 - 当月実績を CURRENT_DATE のみで見に行く旧ロジックを修正
 - 当月データ未反映時に「0円」ではなく「— / 未反映」表示へ変更
 - FYTD前年同期の比較基準を CURRENT_DATE ではなく MAX(sales_date) 基準へ補正
 - 最新反映日 / 最新取込月 / 最新確定月 / 反映遅延日数を表示
 - 総薬価列が無い場合でも安全に動作するよう修正
+
+【v1.5.1 今回の修正】
+- 加重平均（納入価率）の計算式を修正: 売上÷薬価 → 薬価÷売上
+- v_sales_fact_unified の history_data で sales_qty=NULL→0 になる問題を
+  BigQuery側（sales_history_2year の 数量列を使用）で修正済み
 """
 
 from __future__ import annotations
@@ -68,7 +55,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.5.0｜Stable Summary Fix Edition（当月0円誤表示・比較軸ズレ修正済）")
+    st.caption("OS v1.5.1｜Rate Fix Edition（加重平均計算式修正・前年薬価修正済）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -433,7 +420,7 @@ def resolve_customer_group_sql_expr(_client: bigquery.Client) -> Tuple[Optional[
 
 
 # -----------------------------
-# ★ v1.4.9 ColMap（列名吸収）: VIEW_UNIFIED
+# ★ ColMap（列名吸収）: VIEW_UNIFIED
 # -----------------------------
 @st.cache_data(ttl=3600)
 def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
@@ -468,7 +455,7 @@ def resolve_unified_colmap(_client: bigquery.Client) -> Dict[str, str]:
 
 
 # -----------------------------
-# ★ v1.4.9 ColMap: VIEW_NEW_DELIVERY
+# ★ ColMap: VIEW_NEW_DELIVERY
 # -----------------------------
 @st.cache_data(ttl=3600)
 def resolve_new_delivery_colmap(_client: bigquery.Client) -> Dict[str, str]:
@@ -751,13 +738,13 @@ def render_summary_metrics(row: pd.Series) -> None:
     latest_closed_month_sales = get_nullable_float(row, "latest_closed_month_sales")
     latest_closed_month_profit = get_nullable_float(row, "latest_closed_month_profit")
 
-    # 率
-    rate_cm = safe_rate(s_cm, dp_cm)
-    rate_py_cm = safe_rate(s_py_cm, dp_py_cm)
-    rate_cur = safe_rate(s_cur, dp_cur)
-    rate_py_ytd = safe_rate(s_py_ytd, dp_py_ytd)
-    rate_py_total = safe_rate(s_py_total, dp_py_total)
-    rate_fc = safe_rate(s_fc, dp_fc)
+    # ★ v1.5.1修正: 加重平均（納入価率）= 総薬価 ÷ 売上 × 100
+    rate_cm = safe_rate(dp_cm, s_cm)
+    rate_py_cm = safe_rate(dp_py_cm, s_py_cm)
+    rate_cur = safe_rate(dp_cur, s_cur)
+    rate_py_ytd = safe_rate(dp_py_ytd, s_py_ytd)
+    rate_py_total = safe_rate(dp_py_total, s_py_total)
+    rate_fc = safe_rate(dp_fc, s_fc)
 
     current_month_label = "⭐ 当月実績"
     if refresh_status == "CURRENT_MONTH_MISSING":
@@ -863,7 +850,7 @@ def render_fytd_me_section(client: bigquery.Client, login_email: str, colmap: Di
 
 
 # -----------------------------
-# ★追加：メーカー別パフォーマンス（前期/今期 売上・粗利）
+# ★ メーカー別パフォーマンス
 # -----------------------------
 def render_manufacturer_performance_section(
     client: bigquery.Client,
@@ -920,7 +907,7 @@ def render_manufacturer_performance_section(
     df["粗利差額"] = df["ty_gp"] - df["py_gp"]
     df["売上成長率"] = df.apply(lambda r: ((r["ty_sales"] / r["py_sales"] - 1) * 100) if r["py_sales"] else 0.0, axis=1)
     df["粗利成長率"] = df.apply(lambda r: ((r["ty_gp"] / r["py_gp"] - 1) * 100) if r["py_gp"] else 0.0, axis=1)
-    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_sales"] / r["ty_dp"] * 100) if r["ty_dp"] and r["ty_dp"] > 0 else 0.0, axis=1)
+    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_dp"] / r["ty_sales"] * 100) if r["ty_sales"] and r["ty_sales"] > 0 else 0.0, axis=1)
 
     c1_, c2_, c3_ = st.columns(3)
     sort_key = c1_.selectbox(
@@ -980,7 +967,7 @@ def render_manufacturer_performance_section(
 
 
 # -----------------------------
-# 得意先・グループ別パフォーマンス & 要因分析（管理者向け）
+# 得意先・グループ別パフォーマンス & 要因分析
 # -----------------------------
 def render_group_underperformance_section(
     client: bigquery.Client,
@@ -1587,43 +1574,15 @@ def render_new_delivery_trends(
     df_parent.insert(0, "☑", False)
 
     if key_col == "group_name":
-        df_parent = df_parent.rename(
-            columns={
-                "group_name": "グループ",
-                "customer_cnt": "得意先数",
-                "item_cnt": "品目数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_parent = df_parent.rename(columns={"group_name": "グループ", "customer_cnt": "得意先数", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "グループ", "得意先数", "品目数", "売上", "粗利"]
         pick_col = "グループ"
-
     elif key_col == "customer_code":
-        df_parent = df_parent.rename(
-            columns={
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "group_name": "グループ",
-                "item_cnt": "品目数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_parent = df_parent.rename(columns={"customer_code": "得意先コード", "customer_name": "得意先名", "group_name": "グループ", "item_cnt": "品目数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "得意先コード", "得意先名", "グループ", "品目数", "売上", "粗利"]
         pick_col = "得意先コード"
-
     else:
-        df_parent = df_parent.rename(
-            columns={
-                "prod_key": "商品キー",
-                "product_name": "商品名",
-                "customer_cnt": "得意先数",
-                "jan_cnt": "JAN数",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_parent = df_parent.rename(columns={"prod_key": "商品キー", "product_name": "商品名", "customer_cnt": "得意先数", "jan_cnt": "JAN数", "sales_amount": "売上", "gross_profit": "粗利"})
         display_cols = ["☑", "商品キー", "商品名", "得意先数", "JAN数", "売上", "粗利"]
         pick_col = "商品キー"
 
@@ -1632,9 +1591,7 @@ def render_new_delivery_trends(
         if colx != "☑":
             df_view[colx] = df_view[colx].fillna("")
 
-    column_config = {
-        "☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）"),
-    }
+    column_config = {"☑": st.column_config.CheckboxColumn("選択", help="明細を表示したい行にチェック（複数可）")}
     if "商品キー" in df_view.columns:
         column_config["商品キー"] = st.column_config.TextColumn("商品キー", width="small", help="内部キー（選択連動用）")
 
@@ -1653,14 +1610,12 @@ def render_new_delivery_trends(
         return
 
     selected_keys = sel_df[pick_col].astype(str).tolist()
-
     st.divider()
     st.markdown("#### 🧾 明細（ドリルダウン）")
 
     if key_col == "group_name":
         params2 = dict(base_params)
         params2["group_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -1674,8 +1629,7 @@ def render_new_delivery_trends(
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
           CROSS JOIN td
-          LEFT JOIN cust_dim cd
-            ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
+          LEFT JOIN cust_dim cd ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
             {where_staff}
             AND COALESCE(cd.group_name, '未設定') IN UNNEST(@group_keys)
@@ -1684,22 +1638,10 @@ def render_new_delivery_trends(
           LIMIT 5000
         """
         df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Group Details")
-        df_detail = df_detail.rename(
-            columns={
-                "first_sales_date": "初回納品日",
-                "group_name": "グループ",
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "product_name": "商品名",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
-
+        df_detail = df_detail.rename(columns={"first_sales_date": "初回納品日", "group_name": "グループ", "customer_code": "得意先コード", "customer_name": "得意先名", "product_name": "商品名", "sales_amount": "売上", "gross_profit": "粗利"})
     elif key_col == "customer_code":
         params2 = dict(base_params)
         params2["customer_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -1713,8 +1655,7 @@ def render_new_delivery_trends(
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
           CROSS JOIN td
-          LEFT JOIN cust_dim cd
-            ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
+          LEFT JOIN cust_dim cd ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
             {where_staff}
             AND CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) IN UNNEST(@customer_keys)
@@ -1723,22 +1664,10 @@ def render_new_delivery_trends(
           LIMIT 5000
         """
         df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Customer Details")
-        df_detail = df_detail.rename(
-            columns={
-                "first_sales_date": "初回納品日",
-                "group_name": "グループ",
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "product_name": "商品名",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
-
+        df_detail = df_detail.rename(columns={"first_sales_date": "初回納品日", "group_name": "グループ", "customer_code": "得意先コード", "customer_name": "得意先名", "product_name": "商品名", "sales_amount": "売上", "gross_profit": "粗利"})
     else:
         params2 = dict(base_params)
         params2["prod_keys"] = selected_keys
-
         sql_detail = f"""
           WITH td AS (SELECT CURRENT_DATE('Asia/Tokyo') AS today),
           cust_dim AS ({cust_dim_sql})
@@ -1752,8 +1681,7 @@ def render_new_delivery_trends(
             SUM(nd.{c(nd_colmap,'gross_profit')}) AS gross_profit
           FROM `{VIEW_NEW_DELIVERY}` nd
           CROSS JOIN td
-          LEFT JOIN cust_dim cd
-            ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
+          LEFT JOIN cust_dim cd ON CAST(nd.{c(nd_colmap,'customer_code')} AS STRING) = cd.customer_code
           WHERE nd.{c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL {days} DAY)
             {where_staff}
             AND {prod_expr} IN UNNEST(@prod_keys)
@@ -1762,27 +1690,13 @@ def render_new_delivery_trends(
           LIMIT 5000
         """
         df_detail = query_df_safe(client, sql_detail, params2, label="New Delivery Item -> Customers")
-        df_detail = df_detail.rename(
-            columns={
-                "product_name": "商品名",
-                "customer_code": "得意先コード",
-                "customer_name": "得意先名",
-                "group_name": "グループ",
-                "first_sales_date_min": "初回納品日（最小）",
-                "sales_amount": "売上",
-                "gross_profit": "粗利",
-            }
-        )
+        df_detail = df_detail.rename(columns={"product_name": "商品名", "customer_code": "得意先コード", "customer_name": "得意先名", "group_name": "グループ", "first_sales_date_min": "初回納品日（最小）", "sales_amount": "売上", "gross_profit": "粗利"})
 
     if df_detail.empty:
         st.info("明細がありません。")
         return
 
-    st.dataframe(
-        df_detail.fillna("").style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df_detail.fillna("").style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
 
 
 def render_new_deliveries_section(
@@ -1825,8 +1739,7 @@ def render_new_deliveries_section(
         FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
         WHERE {c(nd_colmap,'first_sales_date')} = DATE_SUB(today, INTERVAL 1 DAY) {where_ext}
         UNION ALL
-        SELECT
-          '② 直近7日',
+        SELECT '② 直近7日',
           COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
           COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
           SUM({c(nd_colmap,'sales_amount')}),
@@ -1834,8 +1747,7 @@ def render_new_deliveries_section(
         FROM `{VIEW_NEW_DELIVERY}` CROSS JOIN td
         WHERE {c(nd_colmap,'first_sales_date')} >= DATE_SUB(today, INTERVAL 7 DAY) {where_ext}
         UNION ALL
-        SELECT
-          '③ 当月',
+        SELECT '③ 当月',
           COUNT(DISTINCT CAST({c(nd_colmap,'customer_code')} AS STRING)),
           COUNT(DISTINCT CAST({c(nd_colmap,'jan_code')} AS STRING)),
           SUM({c(nd_colmap,'sales_amount')}),
@@ -1844,7 +1756,6 @@ def render_new_deliveries_section(
         WHERE DATE_TRUNC({c(nd_colmap,'first_sales_date')}, MONTH) = DATE_TRUNC(today, MONTH) {where_ext}
         ORDER BY `期間`
         """
-
         df_new = query_df_safe(client, sql, params, label="New Deliveries")
         st.session_state.nd_summary_df = df_new.copy()
         st.session_state.nd_summary_loaded = True
@@ -1861,12 +1772,7 @@ def render_new_deliveries_section(
         for coln in ["売上", "粗利"]:
             if coln in df_new.columns:
                 df_new[coln] = pd.to_numeric(df_new[coln], errors="coerce").fillna(0)
-
-        st.dataframe(
-            df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(df_new.style.format({"売上": "¥{:,.0f}", "粗利": "¥{:,.0f}"}), use_container_width=True, hide_index=True)
 
     st.divider()
     render_new_delivery_trends(client, login_email, is_admin, nd_colmap, unified_colmap)
@@ -1892,11 +1798,7 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
         FROM `{VIEW_ADOPTION}`
         {where_clause}
         ORDER BY
-            CASE
-                WHEN adoption_status LIKE '%🔴%' THEN 1
-                WHEN adoption_status LIKE '%🟡%' THEN 2
-                ELSE 3
-            END,
+            CASE WHEN adoption_status LIKE '%🔴%' THEN 1 WHEN adoption_status LIKE '%🟡%' THEN 2 ELSE 3 END,
             `売上差額` ASC
     """
     df_alerts = query_df_safe(client, sql, params, "Adoption Alerts")
@@ -1907,11 +1809,7 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
     df_alerts["担当者名"] = df_alerts["担当者名"].fillna("未設定")
     col1, col2 = st.columns(2)
     with col1:
-        selected_status = st.multiselect(
-            "🎯 ステータスで絞り込み",
-            options=df_alerts["ステータス"].unique(),
-            default=[s for s in df_alerts["ステータス"].unique() if "🟡" in s or "🔴" in s],
-        )
+        selected_status = st.multiselect("🎯 ステータスで絞り込み", options=df_alerts["ステータス"].unique(), default=[s for s in df_alerts["ステータス"].unique() if "🟡" in s or "🔴" in s])
     with col2:
         all_staffs = sorted(df_alerts["担当者名"].unique().tolist())
         selected_staffs = st.multiselect("👤 担当者で絞り込み", options=all_staffs, default=[])
@@ -1930,14 +1828,7 @@ def render_adoption_alerts_section(client: bigquery.Client, login_email: str, is
         df_display[col] = pd.to_numeric(df_display[col], errors="coerce").fillna(0)
 
     st.dataframe(
-        df_display.style.format(
-            {
-                "今期売上": "¥{:,.0f}",
-                "前期売上": "¥{:,.0f}",
-                "売上差額": "¥{:,.0f}",
-                "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
-            }
-        ),
+        df_display.style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "売上差額": "¥{:,.0f}", "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""}),
         use_container_width=True,
         hide_index=True,
     )
@@ -1998,11 +1889,7 @@ def render_customer_drilldown(
         FROM `{VIEW_ADOPTION}`
         WHERE CAST(customer_code AS STRING) = @c
         ORDER BY
-            CASE
-                WHEN adoption_status LIKE '%🟢%' THEN 1
-                WHEN adoption_status LIKE '%🟡%' THEN 2
-                ELSE 3
-            END,
+            CASE WHEN adoption_status LIKE '%🟢%' THEN 1 WHEN adoption_status LIKE '%🟡%' THEN 2 ELSE 3 END,
             current_fy_sales DESC
     """
     df_adopt = query_df_safe(client, sql_adopt, {"c": sel}, "Customer Adoption")
@@ -2010,13 +1897,7 @@ def render_customer_drilldown(
         for col in ["今期売上", "前期売上"]:
             df_adopt[col] = pd.to_numeric(df_adopt[col], errors="coerce").fillna(0)
         st.dataframe(
-            df_adopt.style.format(
-                {
-                    "今期売上": "¥{:,.0f}",
-                    "前期売上": "¥{:,.0f}",
-                    "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else "",
-                }
-            ),
+            df_adopt.style.format({"今期売上": "¥{:,.0f}", "前期売上": "¥{:,.0f}", "最終購入日": lambda t: t.strftime("%Y-%m-%d") if pd.notnull(t) else ""}),
             use_container_width=True,
             hide_index=True,
         )
