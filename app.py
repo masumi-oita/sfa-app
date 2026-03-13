@@ -1,18 +1,72 @@
 # -*- coding: utf-8 -*-
 """
-SFA｜戦略ダッシュボード - OS v1.5.1 (Rate Fix Edition)
+SFA｜戦略ダッシュボード - OS v1.5.4
 
-【v1.5.0 踏襲機能】
+================================================================================
+【バージョン履歴】
+================================================================================
+
+【v1.5.0】
 - 当月実績を CURRENT_DATE のみで見に行く旧ロジックを修正
 - 当月データ未反映時に「0円」ではなく「— / 未反映」表示へ変更
 - FYTD前年同期の比較基準を CURRENT_DATE ではなく MAX(sales_date) 基準へ補正
 - 最新反映日 / 最新取込月 / 最新確定月 / 反映遅延日数を表示
 - 総薬価列が無い場合でも安全に動作するよう修正
 
-【v1.5.1 今回の修正】
+【v1.5.1】
 - 加重平均（納入価率）の計算式を修正: 売上÷薬価 → 薬価÷売上
-- v_sales_fact_unified の history_data で sales_qty=NULL→0 になる問題を
-  BigQuery側（sales_history_2year の 数量列を使用）で修正済み
+- BigQuery側: v_sales_fact_unified の history_data で sales_qty=NULL→0 になる問題を
+  sales_history_2year の「数量」列を使用することで修正
+- BigQuery側: sales_history_2year の JANコードが指数表記で精度喪失するため
+  JANコードをNULL扱いにし、商品コード（aプレフィックス→4987変換）でJOINするよう変更
+
+【v1.5.2】
+- 対薬価率（加重平均）の分母を「薬価あり商品の売上のみ」に変更
+  （薬価が存在しない商品の売上を分母に含めないことで正確な比率を算出）
+
+【v1.5.3】
+- セクション名「加重平均（納入価率）」→「対薬価率（薬価比）」に変更
+- 表示を 薬価比（売上÷総薬価×100）に統一（薬価の何%で納入できているかを示す）
+- パーセント表示を小数点第2位まで変更（.1f → .2f）
+
+【v1.5.4】
+- メーカー別パフォーマンスに仕入れルートマッピングを追加
+  導入品（製造元≠仕入先）をBigQueryマッピングテーブルで管理するよう変更
+
+================================================================================
+【メーカー仕入れルートマッピング】dim_maker_channel_map
+================================================================================
+
+導入品（製造元と仕入先が異なる商品）は、売上計上をメーカーではなく
+仕入れルート（販売元）に紐づけるため、BigQueryのマッピングテーブルで管理。
+
+▼ テーブル: salesdb-479915.sales_data.dim_maker_channel_map
+  列: original_maker  STRING  ← v_item_master_norm の maker_name の値
+  列: channel_maker   STRING  ← 表示したい仕入れルート名（販売元メーカー）
+
+▼ 現在の登録内容（2026-03時点）:
+  セルトリオン・ヘルスケア → 東和薬品
+  セルトリオン            → 東和薬品
+
+▼ 新しいマッピングを追加する場合:
+  BigQueryで以下のSQLを実行するだけ（Pythonの変更不要）:
+
+  INSERT INTO `salesdb-479915.sales_data.dim_maker_channel_map` VALUES
+    ('追加したいメーカー名', '仕入れルート名');
+
+  例）ファイザー導入品を東和薬品扱いにしたい場合:
+  INSERT INTO `salesdb-479915.sales_data.dim_maker_channel_map` VALUES
+    ('ファイザー', '東和薬品');
+
+▼ 登録内容を確認する場合:
+  SELECT * FROM `salesdb-479915.sales_data.dim_maker_channel_map`
+  ORDER BY channel_maker, original_maker;
+
+▼ マッピングを削除する場合:
+  DELETE FROM `salesdb-479915.sales_data.dim_maker_channel_map`
+  WHERE original_maker = '削除したいメーカー名';
+
+================================================================================
 """
 
 from __future__ import annotations
@@ -891,17 +945,37 @@ def render_manufacturer_performance_section(
           (EXTRACT(YEAR FROM CURRENT_DATE('Asia/Tokyo'))
             - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE('Asia/Tokyo')) < 4 THEN 1 ELSE 0 END) AS current_fy,
           DATE_SUB(CURRENT_DATE('Asia/Tokyo'), INTERVAL 1 YEAR) AS py_today
+      ),
+      channel_map AS (
+        SELECT original_maker, channel_maker
+        FROM `salesdb-479915.sales_data.dim_maker_channel_map`
+      ),
+      base AS (
+        SELECT
+          COALESCE(
+            cm.channel_maker,
+            NULLIF(TRIM(CAST({manu_col} AS STRING)), ''),
+            '未設定'
+          ) AS manufacturer,
+          {c(colmap,'fiscal_year')} AS fiscal_year,
+          {c(colmap,'sales_date')} AS sales_date,
+          {c(colmap,'sales_amount')} AS sales_amount,
+          {c(colmap,'gross_profit')} AS gross_profit,
+          {dp_col} AS drug_price
+        FROM `{VIEW_UNIFIED}`
+        LEFT JOIN channel_map cm
+          ON cm.original_maker = TRIM(CAST({manu_col} AS STRING))
+        {where_sql}
       )
       SELECT
-        COALESCE(NULLIF(TRIM(CAST({manu_col} AS STRING)), ''), '未設定') AS manufacturer,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'sales_amount')} ELSE 0 END) AS ty_sales,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'sales_amount')} ELSE 0 END) AS py_sales,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {c(colmap,'gross_profit')} ELSE 0 END) AS ty_gp,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy - 1 AND {c(colmap,'sales_date')} <= py_today THEN {c(colmap,'gross_profit')} ELSE 0 END) AS py_gp,
-        SUM(CASE WHEN {c(colmap,'fiscal_year')} = current_fy THEN {dp_col} ELSE 0 END) AS ty_dp
-      FROM `{VIEW_UNIFIED}`
+        manufacturer,
+        SUM(CASE WHEN fiscal_year = current_fy THEN sales_amount ELSE 0 END) AS ty_sales,
+        SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN sales_amount ELSE 0 END) AS py_sales,
+        SUM(CASE WHEN fiscal_year = current_fy THEN gross_profit ELSE 0 END) AS ty_gp,
+        SUM(CASE WHEN fiscal_year = current_fy - 1 AND sales_date <= py_today THEN gross_profit ELSE 0 END) AS py_gp,
+        SUM(CASE WHEN fiscal_year = current_fy THEN drug_price ELSE 0 END) AS ty_dp
+      FROM base
       CROSS JOIN fy
-      {where_sql}
       GROUP BY manufacturer
       HAVING ty_sales != 0 OR py_sales != 0
       ORDER BY ty_sales DESC
