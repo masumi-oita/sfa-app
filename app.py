@@ -55,7 +55,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.5.2｜Rate Fix Edition（加重平均：薬価あり商品のみの売上を分母に変更）")
+    st.caption("OS v1.5.3｜対薬価率 = 薬価あり売上 ÷ 総薬価 × 100（薬価比表示）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -120,7 +120,7 @@ def fmt_yen_or_dash(v: Optional[float]) -> str:
 def fmt_pct_or_dash(v: Optional[float]) -> str:
     if v is None:
         return "—"
-    return f"{v:,.1f}%"
+    return f"{v:,.2f}%"
 
 
 def fmt_delta_yen(cur: Optional[float], prev: Optional[float]) -> Optional[str]:
@@ -132,7 +132,7 @@ def fmt_delta_yen(cur: Optional[float], prev: Optional[float]) -> Optional[str]:
 def fmt_delta_pct(cur: Optional[float], prev: Optional[float]) -> Optional[str]:
     if cur is None or prev is None:
         return None
-    return f"{cur - prev:,.1f}%"
+    return f"{cur - prev:,.2f}%"
 
 
 def fmt_date_or_dash(v: Any) -> str:
@@ -744,18 +744,18 @@ def render_summary_metrics(row: pd.Series) -> None:
     latest_closed_month_sales = get_nullable_float(row, "latest_closed_month_sales")
     latest_closed_month_profit = get_nullable_float(row, "latest_closed_month_profit")
 
-    # ★ v1.5.2修正: 加重平均の分母を「薬価あり商品の売上のみ」に変更
-    s_with_dp_cur    = get_nullable_float(row, "sales_with_dp_fytd")
-    s_with_dp_py_ytd = get_nullable_float(row, "sales_with_dp_py_ytd")
+    # ★ v1.5.3修正: 対薬価率 = 薬価あり売上 ÷ 総薬価 × 100（薬価の何%で納入できているか）
+    s_with_dp_cur      = get_nullable_float(row, "sales_with_dp_fytd")
+    s_with_dp_py_ytd   = get_nullable_float(row, "sales_with_dp_py_ytd")
     s_with_dp_py_total = get_nullable_float(row, "sales_with_dp_py_total")
-    s_with_dp_fc     = project_value(s_with_dp_cur, s_with_dp_py_ytd, s_with_dp_py_total)
+    s_with_dp_fc       = project_value(s_with_dp_cur, s_with_dp_py_ytd, s_with_dp_py_total)
 
-    rate_cm      = safe_rate(dp_cm, s_cm)           # 当月は当月売上で割る（薬価なし分離困難）
-    rate_py_cm   = safe_rate(dp_py_cm, s_py_cm)
-    rate_cur     = safe_rate(dp_cur, s_with_dp_cur)
-    rate_py_ytd  = safe_rate(dp_py_ytd, s_with_dp_py_ytd)
-    rate_py_total = safe_rate(dp_py_total, s_with_dp_py_total)
-    rate_fc      = safe_rate(dp_fc, s_with_dp_fc)
+    rate_cm       = safe_rate(s_cm, dp_cm)                  # 当月: 売上÷薬価
+    rate_py_cm    = safe_rate(s_py_cm, dp_py_cm)
+    rate_cur      = safe_rate(s_with_dp_cur, dp_cur)        # 薬価あり売上÷総薬価
+    rate_py_ytd   = safe_rate(s_with_dp_py_ytd, dp_py_ytd)
+    rate_py_total = safe_rate(s_with_dp_py_total, dp_py_total)
+    rate_fc       = safe_rate(s_with_dp_fc, dp_fc)
 
     current_month_label = "⭐ 当月実績"
     if refresh_status == "CURRENT_MONTH_MISSING":
@@ -817,7 +817,7 @@ def render_summary_metrics(row: pd.Series) -> None:
     c6_.metric("⑤ 着地GAP", fmt_yen_or_dash((dp_fc - dp_py_total) if dp_fc is not None and dp_py_total is not None else None),
                delta=fmt_delta_yen(dp_fc, dp_py_total))
 
-    st.markdown("##### ■ 加重平均 (納入価率)")
+    st.markdown("##### ■ 対薬価率（薬価比）")
     c1_, c2_, c3_, c4_, c5_, c6_ = st.columns(6)
     c1_.metric(current_month_label, fmt_pct_or_dash(rate_cm), delta=fmt_delta_pct(rate_cm, rate_py_cm))
     c2_.metric("① 今期累計", fmt_pct_or_dash(rate_cur))
