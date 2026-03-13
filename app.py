@@ -992,7 +992,7 @@ def render_manufacturer_performance_section(
     df["粗利差額"] = df["ty_gp"] - df["py_gp"]
     df["売上成長率"] = df.apply(lambda r: ((r["ty_sales"] / r["py_sales"] - 1) * 100) if r["py_sales"] else 0.0, axis=1)
     df["粗利成長率"] = df.apply(lambda r: ((r["ty_gp"] / r["py_gp"] - 1) * 100) if r["py_gp"] else 0.0, axis=1)
-    df["納入価率(加重平均)"] = df.apply(lambda r: (r["ty_dp"] / r["ty_sales"] * 100) if r["ty_sales"] and r["ty_sales"] > 0 else 0.0, axis=1)
+    df["納入価率(対薬価率)"] = df.apply(lambda r: (r["ty_sales"] / r["ty_dp"] * 100) if r["ty_dp"] and r["ty_dp"] > 0 else None, axis=1)
 
     c1_, c2_, c3_ = st.columns(3)
     sort_key = c1_.selectbox(
@@ -1032,7 +1032,7 @@ def render_manufacturer_performance_section(
 
     st.dataframe(
         df_disp[
-            ["メーカー", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額", "今期総薬価", "納入価率(加重平均)"]
+            ["メーカー", "今期売上", "前年同期売上", "売上差額", "売上成長率", "今期粗利", "前年同期粗利", "粗利差額", "今期総薬価", "納入価率(対薬価率)"]
         ].style.format(
             {
                 "今期売上": "¥{:,.0f}",
@@ -1043,7 +1043,7 @@ def render_manufacturer_performance_section(
                 "前年同期粗利": "¥{:,.0f}",
                 "粗利差額": "¥{:,.0f}",
                 "今期総薬価": "¥{:,.0f}",
-                "納入価率(加重平均)": "{:,.1f}%",
+                "納入価率(対薬価率)": lambda v: f"{v:,.2f}%" if v is not None else "—",
             }
         ),
         use_container_width=True,
