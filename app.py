@@ -55,7 +55,7 @@ CUSTOMER_GROUP_COLUMN_CANDIDATES = (
 def set_page() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("OS v1.5.1｜Rate Fix Edition（加重平均計算式修正・前年薬価修正済）")
+    st.caption("OS v1.5.2｜Rate Fix Edition（加重平均：薬価あり商品のみの売上を分母に変更）")
 
 
 def create_default_column_config(df: pd.DataFrame) -> Dict[str, st.column_config.Column]:
@@ -632,14 +632,17 @@ def build_summary_sql(colmap: Dict[str, str], scoped_by_login: bool = False) -> 
             SUM(IF(b.fiscal_year = m.current_fy, b.sales_amount, 0)) AS sales_amount_fytd,
             SUM(IF(b.fiscal_year = m.current_fy, b.gross_profit, 0)) AS gross_profit_fytd,
             SUM(IF(b.fiscal_year = m.current_fy, b.drug_price, 0)) AS drug_price_fytd,
+            SUM(IF(b.fiscal_year = m.current_fy AND b.drug_price IS NOT NULL, b.sales_amount, NULL)) AS sales_with_dp_fytd,
 
             SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.sales_amount, 0)) AS sales_amount_py_ytd,
             SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.gross_profit, 0)) AS gross_profit_py_ytd,
             SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day, b.drug_price, 0)) AS drug_price_py_ytd,
+            SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.sales_date <= m.py_same_day AND b.drug_price IS NOT NULL, b.sales_amount, NULL)) AS sales_with_dp_py_ytd,
 
             SUM(IF(b.fiscal_year = m.current_fy - 1, b.sales_amount, 0)) AS sales_amount_py_total,
             SUM(IF(b.fiscal_year = m.current_fy - 1, b.gross_profit, 0)) AS gross_profit_py_total,
-            SUM(IF(b.fiscal_year = m.current_fy - 1, b.drug_price, 0)) AS drug_price_py_total
+            SUM(IF(b.fiscal_year = m.current_fy - 1, b.drug_price, 0)) AS drug_price_py_total,
+            SUM(IF(b.fiscal_year = m.current_fy - 1 AND b.drug_price IS NOT NULL, b.sales_amount, NULL)) AS sales_with_dp_py_total
           FROM base b
           CROSS JOIN meta m
         )
@@ -647,14 +650,17 @@ def build_summary_sql(colmap: Dict[str, str], scoped_by_login: bool = False) -> 
           IFNULL(a.sales_amount_fytd, 0) AS sales_amount_fytd,
           IFNULL(a.gross_profit_fytd, 0) AS gross_profit_fytd,
           a.drug_price_fytd AS drug_price_fytd,
+          a.sales_with_dp_fytd AS sales_with_dp_fytd,
 
           IFNULL(a.sales_amount_py_ytd, 0) AS sales_amount_py_ytd,
           IFNULL(a.gross_profit_py_ytd, 0) AS gross_profit_py_ytd,
           a.drug_price_py_ytd AS drug_price_py_ytd,
+          a.sales_with_dp_py_ytd AS sales_with_dp_py_ytd,
 
           IFNULL(a.sales_amount_py_total, 0) AS sales_amount_py_total,
           IFNULL(a.gross_profit_py_total, 0) AS gross_profit_py_total,
           a.drug_price_py_total AS drug_price_py_total,
+          a.sales_with_dp_py_total AS sales_with_dp_py_total,
 
           CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_sales ELSE NULL END AS display_current_month_sales,
           CASE WHEN a.calendar_month_rows > 0 THEN a.calendar_month_profit ELSE NULL END AS display_current_month_profit,
@@ -738,13 +744,18 @@ def render_summary_metrics(row: pd.Series) -> None:
     latest_closed_month_sales = get_nullable_float(row, "latest_closed_month_sales")
     latest_closed_month_profit = get_nullable_float(row, "latest_closed_month_profit")
 
-    # ★ v1.5.1修正: 加重平均（納入価率）= 総薬価 ÷ 売上 × 100
-    rate_cm = safe_rate(dp_cm, s_cm)
-    rate_py_cm = safe_rate(dp_py_cm, s_py_cm)
-    rate_cur = safe_rate(dp_cur, s_cur)
-    rate_py_ytd = safe_rate(dp_py_ytd, s_py_ytd)
-    rate_py_total = safe_rate(dp_py_total, s_py_total)
-    rate_fc = safe_rate(dp_fc, s_fc)
+    # ★ v1.5.2修正: 加重平均の分母を「薬価あり商品の売上のみ」に変更
+    s_with_dp_cur    = get_nullable_float(row, "sales_with_dp_fytd")
+    s_with_dp_py_ytd = get_nullable_float(row, "sales_with_dp_py_ytd")
+    s_with_dp_py_total = get_nullable_float(row, "sales_with_dp_py_total")
+    s_with_dp_fc     = project_value(s_with_dp_cur, s_with_dp_py_ytd, s_with_dp_py_total)
+
+    rate_cm      = safe_rate(dp_cm, s_cm)           # 当月は当月売上で割る（薬価なし分離困難）
+    rate_py_cm   = safe_rate(dp_py_cm, s_py_cm)
+    rate_cur     = safe_rate(dp_cur, s_with_dp_cur)
+    rate_py_ytd  = safe_rate(dp_py_ytd, s_with_dp_py_ytd)
+    rate_py_total = safe_rate(dp_py_total, s_with_dp_py_total)
+    rate_fc      = safe_rate(dp_fc, s_with_dp_fc)
 
     current_month_label = "⭐ 当月実績"
     if refresh_status == "CURRENT_MONTH_MISSING":
